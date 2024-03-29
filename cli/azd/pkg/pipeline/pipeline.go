@@ -5,12 +5,15 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 
+	"github.com/azure/azure-dev/cli/azd/pkg/graphsdk"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 )
 
 // subareaProvider defines the base behavior from any pipeline provider
@@ -86,6 +89,22 @@ type CiPipeline interface {
 	url() string
 }
 
+// configurePipelineOptions holds the configuration options for the configurePipeline method.
+type configurePipelineOptions struct {
+	// provisioningProvider provides the information about eh project infrastructure
+	provisioningProvider *provisioning.Options
+	// secrets are the key-value pairs to be set as secrets in the CI provider
+	secrets map[string]string
+	// variables are the key-value pairs to be set as variables in the CI provider
+	variables map[string]string
+	// projectVariables are the keys defined on the project (azure.yaml) to be collected form the env and set it as
+	// variables in the CI provider when their values are not empty.
+	projectVariables []string
+	// projectSecrets are the keys defined on the project (azure.yaml) to be collected form the env and set it as
+	// secrets in the CI provider when their values are not empty.
+	projectSecrets []string
+}
+
 // CiProvider defines the base behavior for a continuous integration provider.
 type CiProvider interface {
 	// compose the behavior from subareaProvider
@@ -94,7 +113,7 @@ type CiProvider interface {
 	configurePipeline(
 		ctx context.Context,
 		repoDetails *gitRepositoryDetails,
-		provisioningProvider provisioning.Options,
+		options *configurePipelineOptions,
 	) (CiPipeline, error)
 	// configureConnection use the credential to set up the connection from the pipeline
 	// to Azure
@@ -102,9 +121,41 @@ type CiProvider interface {
 		ctx context.Context,
 		gitRepo *gitRepositoryDetails,
 		provisioningProvider provisioning.Options,
-		credential json.RawMessage,
+		servicePrincipal *graphsdk.ServicePrincipal,
 		authType PipelineAuthType,
+		credentials *azcli.AzureCredentials,
 	) error
+	// Gets the credential options that should be configured for the provider
+	credentialOptions(
+		ctx context.Context,
+		repoDetails *gitRepositoryDetails,
+		infraOptions provisioning.Options,
+		authType PipelineAuthType,
+	) *CredentialOptions
+}
+
+// mergeProjectVariablesAndSecrets returns the list of variables and secrets to be used in the pipeline
+// The initial values reference azd known values, which are merged with the ones defined on azure.yaml by the user.
+func mergeProjectVariablesAndSecrets(
+	projectVariables, projectSecrets []string,
+	initialVariables, initialSecrets, env map[string]string) (variables, secrets map[string]string) {
+	variables = maps.Clone(initialVariables)
+	secrets = maps.Clone(initialSecrets)
+
+	for key, value := range env {
+		if value == "" {
+			// skip empty values
+			continue
+		}
+		if slices.Contains(projectVariables, key) {
+			variables[key] = value
+		}
+		if slices.Contains(projectSecrets, key) {
+			secrets[key] = value
+		}
+	}
+
+	return variables, secrets
 }
 
 func folderExists(folderPath string) bool {

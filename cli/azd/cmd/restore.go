@@ -26,7 +26,7 @@ type restoreFlags struct {
 	all         bool
 	global      *internal.GlobalCommandOptions
 	serviceName string
-	envFlag
+	internal.EnvFlag
 }
 
 func (r *restoreFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
@@ -50,7 +50,7 @@ func (r *restoreFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommand
 func newRestoreFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) *restoreFlags {
 	flags := &restoreFlags{}
 	flags.Bind(cmd.Flags(), global)
-	flags.envFlag.Bind(cmd.Flags(), global)
+	flags.EnvFlag.Bind(cmd.Flags(), global)
 	flags.global = global
 
 	return flags
@@ -75,6 +75,7 @@ type restoreAction struct {
 	env            *environment.Environment
 	projectConfig  *project.ProjectConfig
 	projectManager project.ProjectManager
+	importManager  *project.ImportManager
 	serviceManager project.ServiceManager
 	commandRunner  exec.CommandRunner
 }
@@ -91,6 +92,7 @@ func newRestoreAction(
 	projectManager project.ProjectManager,
 	serviceManager project.ServiceManager,
 	commandRunner exec.CommandRunner,
+	importManager *project.ImportManager,
 ) actions.Action {
 	return &restoreAction{
 		flags:          flags,
@@ -104,6 +106,7 @@ func newRestoreAction(
 		serviceManager: serviceManager,
 		env:            env,
 		commandRunner:  commandRunner,
+		importManager:  importManager,
 	}
 }
 
@@ -130,6 +133,7 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 	targetServiceName, err := getTargetServiceName(
 		ctx,
 		ra.projectManager,
+		ra.importManager,
 		ra.projectConfig,
 		string(project.ServiceEventRestore),
 		targetServiceName,
@@ -150,8 +154,12 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 	}
 
 	restoreResults := map[string]*project.ServiceRestoreResult{}
+	stableServices, err := ra.importManager.ServiceStable(ctx, ra.projectConfig)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, svc := range ra.projectConfig.GetServicesStable() {
+	for _, svc := range stableServices {
 		stepMessage := fmt.Sprintf("Restoring service %s", svc.Name)
 		ra.console.ShowSpinner(ctx, stepMessage, input.Step)
 

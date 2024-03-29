@@ -9,6 +9,9 @@ words:
   - nosec
   - Retryable
   - runcontext
+  - azcloud
+  - usgovcloudapi
+  - chinacloudapi
 languageSettings:
   - languageId: go
     ignoreRegExpList:
@@ -71,6 +74,9 @@ overrides:
       - keychain
       - crusername
       - azurecr
+  - filename: pkg/tools/dotnet/dotnet.go
+    words:
+      - PWORD
   - filename: pkg/tools/kubectl/kubectl.go
     words:
       - tmpl
@@ -89,6 +95,10 @@ overrides:
     words:
       - fcharp
       - CPYTHON
+  - filename: pkg/project/service_target_aks.go
+    words:
+      - kustomization
+      - templating
 ignorePaths:
   - "**/*_test.go"
   - "**/mock*.go"

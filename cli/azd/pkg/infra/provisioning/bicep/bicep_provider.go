@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,8 +34,10 @@ import (
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
 	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/keyvault"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	"github.com/azure/azure-dev/cli/azd/pkg/password"
 	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
@@ -44,7 +47,10 @@ import (
 	"golang.org/x/exp/maps"
 )
 
-const DefaultModule = "main"
+const (
+	defaultModule = "main"
+	defaultPath   = "infra"
+)
 
 type deploymentDetails struct {
 	CompiledBicep *compileBicepResult
@@ -69,6 +75,13 @@ type BicepProvider struct {
 	alphaFeatureManager   *alpha.FeatureManager
 	clock                 clock.Clock
 	ignoreDeploymentState bool
+	// compileBicepResult is cached to avoid recompiling the same bicep file multiple times in the same azd run.
+	compileBicepMemoryCache *compileBicepResult
+	// prevent resolving parameters multiple times in the same azd run.
+	ensureParamsInMemoryCache azure.ArmParameters
+	keyvaultService           keyvault.KeyVaultService
+
+	portalUrlBase string
 }
 
 var ErrResourceGroupScopeNotSupported = fmt.Errorf(
@@ -86,12 +99,14 @@ func (p *BicepProvider) RequiredExternalTools() []tools.ExternalTool {
 }
 
 func (p *BicepProvider) Initialize(ctx context.Context, projectPath string, options Options) error {
-	if strings.TrimSpace(options.Module) == "" {
-		options.Module = DefaultModule
-	}
-
 	p.projectPath = projectPath
 	p.options = options
+	if p.options.Module == "" {
+		p.options.Module = defaultModule
+	}
+	if p.options.Path == "" {
+		p.options.Path = defaultPath
+	}
 
 	requiredTools := p.RequiredExternalTools()
 	if err := tools.EnsureInstalled(ctx, requiredTools...); err != nil {
@@ -148,6 +163,10 @@ func (p *BicepProvider) EnsureEnv(ctx context.Context) error {
 		return nil
 	}
 
+	// prompt parameters during initialization and ignore any errors.
+	// This strategy takes advantage of the bicep compilation from initialization and allows prompting for required inputs
+	_, _ = p.ensureParameters(ctx, compileResult.Template)
+
 	scope, err := compileResult.Template.TargetScope()
 	if err != nil {
 		return err
@@ -174,6 +193,21 @@ func (p *BicepProvider) EnsureEnv(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (p *BicepProvider) LastDeployment(ctx context.Context) (*armresources.DeploymentExtended, error) {
+	modulePath := p.modulePath()
+	compileResult, err := p.compileBicep(ctx, modulePath)
+	if err != nil {
+		return nil, fmt.Errorf("compiling bicep template: %w", err)
+	}
+
+	scope, err := p.scopeForTemplate(ctx, compileResult.Template)
+	if err != nil {
+		return nil, fmt.Errorf("computing deployment scope: %w", err)
+	}
+
+	return p.latestDeploymentResult(ctx, scope)
 }
 
 func (p *BicepProvider) State(ctx context.Context, options *StateOptions) (*StateResult, error) {
@@ -226,7 +260,7 @@ func (p *BicepProvider) State(ctx context.Context, options *StateOptions) (*Stat
 
 	var deployment *armresources.DeploymentExtended
 
-	deployments, err := p.findCompletedDeployments(ctx, p.env.GetEnvName(), scope, options.Hint())
+	deployments, err := p.findCompletedDeployments(ctx, p.env.Name(), scope, options.Hint())
 	p.console.StopSpinner(ctx, "", input.StepDone)
 
 	if err != nil {
@@ -306,6 +340,7 @@ func (p *BicepProvider) createDeploymentFromArmDeployment(
 			p.env.GetSubscriptionId(),
 			p.env.Getenv(environment.ResourceGroupEnvVarName),
 			deploymentName,
+			p.portalUrlBase,
 		), nil
 	case *infra.SubscriptionScope:
 		return infra.NewSubscriptionDeployment(
@@ -314,6 +349,7 @@ func (p *BicepProvider) createDeploymentFromArmDeployment(
 			p.env.GetLocation(),
 			p.env.GetSubscriptionId(),
 			deploymentName,
+			p.portalUrlBase,
 		), nil
 	default:
 		return nil, errors.New("unsupported deployment scope")
@@ -346,12 +382,7 @@ func (p *BicepProvider) plan(ctx context.Context) (*deploymentDetails, error) {
 
 	// for .bicep, azd must load a parameters.json file and create the ArmParameters
 	if isBicepFile(modulePath) {
-		parameters, err := p.loadParameters(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("resolving bicep parameters file: %w", err)
-		}
-
-		configuredParameters, err := p.ensureParameters(ctx, compileResult.Template, parameters)
+		configuredParameters, err := p.ensureParameters(ctx, compileResult.Template)
 		if err != nil {
 			return nil, err
 		}
@@ -381,7 +412,8 @@ func (p *BicepProvider) deploymentScope(deploymentScope azure.DeploymentScope) (
 			p.deploymentOperations,
 			p.env.GetLocation(),
 			p.env.GetSubscriptionId(),
-			deploymentNameForEnv(p.env.GetEnvName(), p.clock),
+			deploymentNameForEnv(p.env.Name(), p.clock),
+			p.portalUrlBase,
 		), nil
 	} else if deploymentScope == azure.DeploymentScopeResourceGroup {
 		return infra.NewResourceGroupDeployment(
@@ -389,7 +421,8 @@ func (p *BicepProvider) deploymentScope(deploymentScope azure.DeploymentScope) (
 			p.deploymentOperations,
 			p.env.GetSubscriptionId(),
 			p.env.Getenv(environment.ResourceGroupEnvVarName),
-			deploymentNameForEnv(p.env.GetEnvName(), p.clock),
+			deploymentNameForEnv(p.env.Name(), p.clock),
+			p.portalUrlBase,
 		), nil
 	}
 	return nil, fmt.Errorf("unsupported scope: %s", deploymentScope)
@@ -448,12 +481,12 @@ func (p *BicepProvider) deploymentState(
 	return prevDeploymentResult, nil
 }
 
-// prevDeploymentResult looks and finds a previous deployment for the current azd project.
+// latestDeploymentResult looks and finds a previous deployment for the current azd project.
 func (p *BicepProvider) latestDeploymentResult(
 	ctx context.Context,
 	scope infra.Scope,
 ) (*armresources.DeploymentExtended, error) {
-	deployments, err := p.findCompletedDeployments(ctx, p.env.GetEnvName(), scope, "")
+	deployments, err := p.findCompletedDeployments(ctx, p.env.Name(), scope, "")
 	// findCompletedDeployments returns error if no deployments are found
 	// No need to check for empty list
 	if err != nil {
@@ -613,7 +646,7 @@ func (p *BicepProvider) Deploy(ctx context.Context) (*DeployResult, error) {
 	p.console.ShowSpinner(ctx, "Creating/Updating resources", input.Step)
 
 	deploymentTags := map[string]*string{
-		azure.TagKeyAzdEnvName: to.Ptr(p.env.GetEnvName()),
+		azure.TagKeyAzdEnvName: to.Ptr(p.env.Name()),
 	}
 	if parametersHashErr == nil {
 		deploymentTags[azure.TagKeyAzdDeploymentStateParamHashName] = to.Ptr(currentParamsHash)
@@ -792,7 +825,7 @@ func (p *BicepProvider) Destroy(ctx context.Context, options DestroyOptions) (*D
 	}
 
 	// TODO: Report progress, "Fetching resource groups"
-	deployments, err := p.findCompletedDeployments(ctx, p.env.GetEnvName(), scope, "")
+	deployments, err := p.findCompletedDeployments(ctx, p.env.Name(), scope, "")
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +960,7 @@ func (p *BicepProvider) Destroy(ctx context.Context, options DestroyOptions) (*D
 		emptyTemplate,
 		azure.ArmParameters{},
 		map[string]*string{
-			azure.TagKeyAzdEnvName: to.Ptr(p.env.GetEnvName()),
+			azure.TagKeyAzdEnvName: to.Ptr(p.env.Name()),
 			"azd-deploy-reason":    to.Ptr("down"),
 		}); err != nil {
 		log.Println("failed creating new empty deployment after destroy")
@@ -1012,7 +1045,7 @@ func (p *BicepProvider) findCompletedDeployments(
 	}
 
 	if len(matchingDeployments) == 0 {
-		return nil, fmt.Errorf("no deployments found for environment %s", envName)
+		return nil, fmt.Errorf("'%s': %w", envName, ErrDeploymentsNotFound)
 	}
 
 	return matchingDeployments, nil
@@ -1094,15 +1127,16 @@ func (p *BicepProvider) getAllResourcesToDelete(
 	return allResources, nil
 }
 
-func generateResourceGroupsToDelete(groupedResources map[string][]azcli.AzCliResource, subId string) []string {
+func (p *BicepProvider) generateResourceGroupsToDelete(groupedResources map[string][]azcli.AzCliResource) []string {
 	lines := []string{"Resource group(s) to be deleted:", ""}
 
 	for rg := range groupedResources {
 		lines = append(lines, fmt.Sprintf(
 			"  • %s: %s",
 			rg,
-			output.WithLinkFormat("https://portal.azure.com/#@/resource/subscriptions/%s/resourceGroups/%s/overview",
-				subId,
+			output.WithLinkFormat("%s/#@/resource/subscriptions/%s/resourceGroups/%s/overview",
+				p.portalUrlBase,
+				p.env.GetSubscriptionId(),
 				rg,
 			),
 		))
@@ -1119,7 +1153,7 @@ func (p *BicepProvider) destroyResourceGroups(
 ) error {
 	if !options.Force() {
 		p.console.MessageUxItem(ctx, &ux.MultilineMessage{
-			Lines: generateResourceGroupsToDelete(groupedResources, p.env.GetSubscriptionId())},
+			Lines: p.generateResourceGroupsToDelete(groupedResources)},
 		)
 		confirmDestroy, err := p.console.Confirm(ctx, input.ConsoleOptions{
 			Message: fmt.Sprintf(
@@ -1231,13 +1265,14 @@ func (p *BicepProvider) purgeItems(
 func (p *BicepProvider) getKeyVaults(
 	ctx context.Context,
 	groupedResources map[string][]azcli.AzCliResource,
-) ([]*azcli.AzCliKeyVault, error) {
-	vaults := []*azcli.AzCliKeyVault{}
+) ([]*keyvault.KeyVault, error) {
+	vaults := []*keyvault.KeyVault{}
 
 	for resourceGroup, groupResources := range groupedResources {
 		for _, resource := range groupResources {
 			if resource.Type == string(infra.AzureResourceTypeKeyVault) {
-				vault, err := p.azCli.GetKeyVault(ctx, azure.SubscriptionFromRID(resource.Id), resourceGroup, resource.Name)
+				vault, err := p.keyvaultService.GetKeyVault(
+					ctx, azure.SubscriptionFromRID(resource.Id), resourceGroup, resource.Name)
 				if err != nil {
 					return nil, fmt.Errorf("listing key vault %s properties: %w", resource.Name, err)
 				}
@@ -1252,13 +1287,13 @@ func (p *BicepProvider) getKeyVaults(
 func (p *BicepProvider) getKeyVaultsToPurge(
 	ctx context.Context,
 	groupedResources map[string][]azcli.AzCliResource,
-) ([]*azcli.AzCliKeyVault, error) {
+) ([]*keyvault.KeyVault, error) {
 	vaults, err := p.getKeyVaults(ctx, groupedResources)
 	if err != nil {
 		return nil, err
 	}
 
-	vaultsToPurge := []*azcli.AzCliKeyVault{}
+	vaultsToPurge := []*keyvault.KeyVault{}
 	for _, v := range vaults {
 		if v.Properties.EnableSoftDelete && !v.Properties.EnablePurgeProtection {
 			vaultsToPurge = append(vaultsToPurge, v)
@@ -1356,13 +1391,13 @@ func (p *BicepProvider) getCognitiveAccountsToPurge(
 //nolint:lll
 func (p *BicepProvider) purgeKeyVaults(
 	ctx context.Context,
-	keyVaults []*azcli.AzCliKeyVault,
+	keyVaults []*keyvault.KeyVault,
 	options DestroyOptions,
 	skip bool,
 ) error {
 	for _, keyVault := range keyVaults {
 		err := p.runPurgeAsStep(ctx, "Key Vault", keyVault.Name, func() error {
-			return p.azCli.PurgeKeyVault(
+			return p.keyvaultService.PurgeKeyVault(
 				ctx, azure.SubscriptionFromRID(keyVault.Id), keyVault.Name, keyVault.Location)
 		}, skip)
 		if err != nil {
@@ -1594,7 +1629,13 @@ func (p *BicepProvider) createOutputParameters(
 // doing environment and command substitutions, and returns the values.
 func (p *BicepProvider) loadParameters(ctx context.Context) (map[string]azure.ArmParameterValue, error) {
 	parametersFilename := fmt.Sprintf("%s.parameters.json", p.options.Module)
-	paramFilePath := filepath.Join(p.projectPath, p.options.Path, parametersFilename)
+	parametersRoot := p.options.Path
+
+	if !filepath.IsAbs(parametersRoot) {
+		parametersRoot = filepath.Join(p.projectPath, parametersRoot)
+	}
+
+	paramFilePath := filepath.Join(parametersRoot, parametersFilename)
 	parametersBytes, err := os.ReadFile(paramFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("reading parameters.json: %w", err)
@@ -1617,7 +1658,7 @@ func (p *BicepProvider) loadParameters(ctx context.Context) (map[string]azure.Ar
 	}
 
 	if cmdsubst.ContainsCommandInvocation(replaced, cmdsubst.SecretOrRandomPasswordCommandName) {
-		cmdExecutor := cmdsubst.NewSecretOrRandomPasswordExecutor(p.azCli, p.env.GetSubscriptionId())
+		cmdExecutor := cmdsubst.NewSecretOrRandomPasswordExecutor(p.keyvaultService, p.env.GetSubscriptionId())
 		replaced, err = cmdsubst.Eval(ctx, replaced, cmdExecutor)
 		if err != nil {
 			return nil, fmt.Errorf("substituting command output inside parameter file: %w", err)
@@ -1647,6 +1688,10 @@ type compileBicepResult struct {
 func (p *BicepProvider) compileBicep(
 	ctx context.Context, modulePath string,
 ) (*compileBicepResult, error) {
+	if p.compileBicepMemoryCache != nil {
+		return p.compileBicepMemoryCache, nil
+	}
+
 	var compiled string
 	var parameters azure.ArmParameters
 
@@ -1745,12 +1790,13 @@ func (p *BicepProvider) compileBicep(
 			}
 		}
 	}
-
-	return &compileBicepResult{
+	p.compileBicepMemoryCache = &compileBicepResult{
 		RawArmTemplate: rawTemplate,
 		Template:       template,
 		Parameters:     parameters,
-	}, nil
+	}
+
+	return p.compileBicepMemoryCache, nil
 }
 
 func combineMetadata(base map[string]json.RawMessage, override map[string]json.RawMessage) map[string]json.RawMessage {
@@ -1826,27 +1872,86 @@ func (p *BicepProvider) deployModule(
 
 // Gets the folder path to the specified module
 func (p *BicepProvider) modulePath() string {
-	infraPath := p.options.Path
+	infraRoot := p.options.Path
 	moduleName := p.options.Module
+
+	if !filepath.IsAbs(infraRoot) {
+		infraRoot = filepath.Join(p.projectPath, infraRoot)
+	}
 
 	// Check if there's a <moduleName>.bicepparam first. It will be preferred over a <moduleName>.bicep
 	moduleFilename := moduleName + bicepparamFileExtension
-	moduleFilePath := filepath.Join(p.projectPath, infraPath, moduleFilename)
+	moduleFilePath := filepath.Join(infraRoot, moduleFilename)
 	if _, err := os.Stat(moduleFilePath); err == nil {
 		return moduleFilePath
 	}
 
 	// fallback to .bicep
 	moduleFilename = moduleName + bicepFileExtension
-	return filepath.Join(p.projectPath, infraPath, moduleFilename)
+	return filepath.Join(infraRoot, moduleFilename)
+}
+
+// inputsParameter generates and updates input parameters for the Azure Resource Manager (ARM) template.
+// It takes an existingInputs map that contains the current input values for each resource, and an autoGenParameters map
+// that contains information about the input parameters to be generated.
+// The method iterates over the autoGenParameters map and checks if each input parameter already exists in the existingInputs
+// map.
+// If an input parameter does not exist, a new value is generated and added to the existingInputs map.
+// The method returns an azure.ArmParameterValue struct that contains the updated existingInputs map, a boolean indicating
+// whether new inputs were written, and an error if any occurred during the generation of input values.
+func inputsParameter(
+	existingInputs map[string]map[string]any, autoGenParameters map[string]map[string]azure.AutoGenInput) (
+	inputsParameter azure.ArmParameterValue, inputsUpdated bool, err error) {
+	wroteNewInput := false
+
+	for inputResource, inputResourceInfo := range autoGenParameters {
+		existingRecordsForResource := make(map[string]any)
+		if current, exists := existingInputs[inputResource]; exists {
+			existingRecordsForResource = current
+		}
+		for inputName, inputInfo := range inputResourceInfo {
+			if _, has := existingRecordsForResource[inputName]; !has {
+				val, err := password.Generate(password.GenerateConfig{
+					Length:     inputInfo.Length,
+					NoLower:    inputInfo.NoLower,
+					NoUpper:    inputInfo.NoUpper,
+					NoNumeric:  inputInfo.NoNumeric,
+					NoSpecial:  inputInfo.NoSpecial,
+					MinLower:   inputInfo.MinLower,
+					MinUpper:   inputInfo.MinUpper,
+					MinNumeric: inputInfo.MinNumeric,
+					MinSpecial: inputInfo.MinSpecial,
+				},
+				)
+				if err != nil {
+					return inputsParameter, inputsUpdated, fmt.Errorf("generating value for input %s: %w", inputName, err)
+				}
+				existingRecordsForResource[inputName] = val
+				wroteNewInput = true
+			}
+		}
+		existingInputs[inputResource] = existingRecordsForResource
+	}
+
+	return azure.ArmParameterValue{
+		Value: existingInputs,
+	}, wroteNewInput, nil
 }
 
 // Ensures the provisioning parameters are valid and prompts the user for input as needed
 func (p *BicepProvider) ensureParameters(
 	ctx context.Context,
 	template azure.ArmTemplate,
-	parameters azure.ArmParameters,
 ) (azure.ArmParameters, error) {
+	if p.ensureParamsInMemoryCache != nil {
+		return maps.Clone(p.ensureParamsInMemoryCache), nil
+	}
+
+	parameters, err := p.loadParameters(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolving bicep parameters file: %w", err)
+	}
+
 	if len(template.Parameters) == 0 {
 		return azure.ArmParameters{}, nil
 	}
@@ -1857,15 +1962,24 @@ func (p *BicepProvider) ensureParameters(
 
 	configModified := false
 
+	var parameterPrompts []struct {
+		key   string
+		param azure.ArmTemplateParameterDefinition
+	}
+
 	for _, key := range sortedKeys {
 		param := template.Parameters[key]
 
 		// If a value is explicitly configured via a parameters file, use it.
+		// unless the parameter value inference is nil/empty
 		if v, has := parameters[key]; has {
-			configuredParameters[key] = azure.ArmParameterValue{
-				Value: armParameterFileValue(p.mapBicepTypeToInterfaceType(param.Type), v.Value),
+			paramValue := armParameterFileValue(p.mapBicepTypeToInterfaceType(param.Type), v.Value, param.DefaultValue)
+			if paramValue != nil {
+				configuredParameters[key] = azure.ArmParameterValue{
+					Value: paramValue,
+				}
+				continue
 			}
-			continue
 		}
 
 		// If this parameter has a default, then there is no need for us to configure it.
@@ -1878,45 +1992,81 @@ func (p *BicepProvider) ensureParameters(
 		configKey := fmt.Sprintf("infra.parameters.%s", key)
 
 		if v, has := p.env.Config.Get(configKey); has {
-
-			if !isValueAssignableToParameterType(p.mapBicepTypeToInterfaceType(param.Type), v) {
+			if isValueAssignableToParameterType(p.mapBicepTypeToInterfaceType(param.Type), v) {
+				configuredParameters[key] = azure.ArmParameterValue{
+					Value: v,
+				}
+				continue
+			} else {
 				// The saved value is no longer valid (perhaps the user edited their template to change the type of a)
 				// parameter and then re-ran `azd provision`. Forget the saved value (if we can) and prompt for a new one.
 				_ = p.env.Config.Unset("infra.parameters.%s")
 			}
+		}
 
-			configuredParameters[key] = azure.ArmParameterValue{
-				Value: v,
+		// No saved value for this required parameter, we'll need to prompt for it.
+		parameterPrompts = append(parameterPrompts, struct {
+			key   string
+			param azure.ArmTemplateParameterDefinition
+		}{key: key, param: param})
+	}
+
+	if len(parameterPrompts) > 0 {
+		if p.console.SupportsPromptDialog() {
+
+			dialog := input.PromptDialog{
+				Title: "Configure required deployment parameters",
+				Description: "The following parameters are required for deployment. " +
+					"Provide values for each parameter. They will be saved for future deployments.",
 			}
-			continue
-		}
 
-		// Otherwise, prompt for the value.
-		value, err := p.promptForParameter(ctx, key, param)
-		if err != nil {
-			return nil, fmt.Errorf("prompting for value: %w", err)
-		}
+			for _, prompt := range parameterPrompts {
+				dialog.Prompts = append(dialog.Prompts, p.promptDialogItemForParameter(prompt.key, prompt.param))
+			}
 
-		if !param.Secure() {
-			saveParameter, err := p.console.Confirm(ctx, input.ConsoleOptions{
-				Message: "Save the value in the environment for future use",
-			})
-
+			values, err := p.console.PromptDialog(ctx, dialog)
 			if err != nil {
-				return nil, fmt.Errorf("prompting to save deployment parameter: %w", err)
+				return nil, fmt.Errorf("prompting for values: %w", err)
 			}
 
-			if saveParameter {
+			for _, prompt := range parameterPrompts {
+				configKey := fmt.Sprintf("infra.parameters.%s", prompt.key)
+				value := values[prompt.key]
+
 				if err := p.env.Config.Set(configKey, value); err == nil {
 					configModified = true
 				} else {
-					p.console.Message(ctx, fmt.Sprintf("warning: failed to set value: %v", err))
+					// errors from config.Set are panics, so we can't recover from them
+					// For example, the value is not serializable to JSON
+					log.Panicf(fmt.Sprintf("warning: failed to set value: %v", err))
+				}
+
+				configuredParameters[prompt.key] = azure.ArmParameterValue{
+					Value: value,
 				}
 			}
-		}
+		} else {
+			for _, prompt := range parameterPrompts {
+				configKey := fmt.Sprintf("infra.parameters.%s", prompt.key)
 
-		configuredParameters[key] = azure.ArmParameterValue{
-			Value: value,
+				// Otherwise, prompt for the value.
+				value, err := p.promptForParameter(ctx, prompt.key, prompt.param)
+				if err != nil {
+					return nil, fmt.Errorf("prompting for value: %w", err)
+				}
+
+				if err := p.env.Config.Set(configKey, value); err == nil {
+					configModified = true
+				} else {
+					// errors from config.Set are panics, so we can't recover from them
+					// For example, the value is not serializable to JSON
+					log.Panicf(fmt.Sprintf("warning: failed to set value: %v", err))
+				}
+
+				configuredParameters[prompt.key] = azure.ArmParameterValue{
+					Value: value,
+				}
+			}
 		}
 	}
 
@@ -1925,12 +2075,17 @@ func (p *BicepProvider) ensureParameters(
 			p.console.Message(ctx, fmt.Sprintf("warning: failed to save configured values: %v", err))
 		}
 	}
-
+	p.ensureParamsInMemoryCache = maps.Clone(configuredParameters)
 	return configuredParameters, nil
 }
 
 // Convert the ARM parameters file value into a value suitable for deployment
-func armParameterFileValue(paramType ParameterType, value any) any {
+func armParameterFileValue(paramType ParameterType, value any, defaultValue any) any {
+	// Quick return if the value being converted is not a string
+	if value == nil || reflect.TypeOf(value).Kind() != reflect.String {
+		return value
+	}
+
 	// Relax the handling of bool and number types to accept convertible strings
 	switch paramType {
 	case ParameterTypeBoolean:
@@ -1945,9 +2100,25 @@ func armParameterFileValue(paramType ParameterType, value any) any {
 				return intVal
 			}
 		}
+	case ParameterTypeString:
+		// Use Cases
+		// 1. Non-empty input value, return input value (no prompt)
+		// 2. Empty input value and no default - return nil (prompt user)
+		// 3. Empty input value and non-empty default - return empty input string (no prompt)
+		paramVal, paramValid := value.(string)
+		if paramValid && paramVal != "" {
+			return paramVal
+		}
+
+		defaultVal, hasDefault := defaultValue.(string)
+		if hasDefault && paramValid && paramVal != defaultVal {
+			return paramVal
+		}
+	default:
+		return value
 	}
 
-	return value
+	return nil
 }
 
 func isValueAssignableToParameterType(paramType ParameterType, value any) bool {
@@ -1998,6 +2169,8 @@ func NewBicepProvider(
 	curPrincipal CurrentPrincipalIdProvider,
 	alphaFeatureManager *alpha.FeatureManager,
 	clock clock.Clock,
+	keyvaultService keyvault.KeyVaultService,
+	portalUrlBase string,
 ) Provider {
 	return &BicepProvider{
 		envManager:           envManager,
@@ -2011,5 +2184,7 @@ func NewBicepProvider(
 		curPrincipal:         curPrincipal,
 		alphaFeatureManager:  alphaFeatureManager,
 		clock:                clock,
+		keyvaultService:      keyvaultService,
+		portalUrlBase:        portalUrlBase,
 	}
 }

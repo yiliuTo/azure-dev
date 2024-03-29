@@ -7,23 +7,34 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/AlecAivazis/survey/v2"
+	"github.com/AlecAivazis/survey/v2/terminal"
 	"github.com/azure/azure-dev/cli/azd/internal/tracing"
 	"github.com/azure/azure-dev/cli/azd/internal/tracing/resource"
 	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/convert"
+	"github.com/azure/azure-dev/cli/azd/pkg/httputil"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
+	tm "github.com/buger/goterm"
 	"github.com/mattn/go-isatty"
 	"github.com/nathan-fiscaletti/consolesize-go"
 	"github.com/theckman/yacspin"
+	"go.uber.org/atomic"
 )
 
 type SpinnerUxType int
@@ -53,6 +64,27 @@ type ShowPreviewerOptions struct {
 	Title        string
 }
 
+type PromptDialog struct {
+	Title       string
+	Description string
+	Prompts     []PromptDialogItem
+}
+
+type PromptDialogItem struct {
+	ID           string
+	Kind         string
+	DisplayName  string
+	Description  *string
+	DefaultValue *string
+	Required     bool
+	Choices      []PromptDialogChoice
+}
+
+type PromptDialogChoice struct {
+	Value       string
+	Description string
+}
+
 type Console interface {
 	// Prints out a message to the underlying console write
 	Message(ctx context.Context, message string)
@@ -71,17 +103,23 @@ type Console interface {
 	// Use the returned io.Writer to produce the output within the previewer
 	ShowPreviewer(ctx context.Context, options *ShowPreviewerOptions) io.Writer
 	// Finalize the preview mode from console.
-	StopPreviewer(ctx context.Context)
+	StopPreviewer(ctx context.Context, keepLogs bool)
 	// Determines if there is a current spinner running.
 	IsSpinnerRunning(ctx context.Context) bool
 	// Determines if the current spinner is an interactive spinner, where messages are updated periodically.
 	// If false, the spinner is non-interactive, which means messages are rendered as a new console message on each
 	// call to ShowSpinner, even when the title is unchanged.
 	IsSpinnerInteractive() bool
+	SupportsPromptDialog() bool
+	PromptDialog(ctx context.Context, dialog PromptDialog) (map[string]any, error)
 	// Prompts the user for a single value
 	Prompt(ctx context.Context, options ConsoleOptions) (string, error)
-	// Prompts the user to select from a set of values
+	// Prompts the user for a directory path.
+	PromptDir(ctx context.Context, options ConsoleOptions) (string, error)
+	// Prompts the user to select a single value from a set of values
 	Select(ctx context.Context, options ConsoleOptions) (int, error)
+	// Prompts the user to select zero or more values from a set of values
+	MultiSelect(ctx context.Context, options ConsoleOptions) ([]string, error)
 	// Prompts the user to confirm an operation
 	Confirm(ctx context.Context, options ConsoleOptions) (bool, error)
 	// block terminal until the next enter
@@ -107,35 +145,38 @@ type AskerConsole struct {
 	formatter  output.Formatter
 	isTerminal bool
 	noPrompt   bool
+	// when non nil, use this client instead of prompting ourselves on the console.
+	promptClient *externalPromptClient
 
-	spinner                 *yacspin.Spinner
-	spinnerTerminalMode     yacspin.TerminalMode
-	spinnerTerminalModeOnce sync.Once
+	showProgressMu sync.Mutex // ensures atomicity when swapping the current progress renderer (spinner or previewer)
 
-	currentIndent         string
-	consoleWidth          int
-	previewer             *progressLog
-	initialWriter         io.Writer
-	currentSpinnerMessage string
-	// writeControlMutex ensures no race conditions happen while methods are writing to the terminal.
-	// AskerConsole can be used as a singleton, hence, more than one component can invoke its methods at the same time.
-	// A method should lock this mutex if no other writing to he terminal should occur at the same time.
-	writeControlMutex sync.Mutex
+	spinner             *yacspin.Spinner
+	spinnerLineMu       sync.Mutex // secures spinnerCurrentTitle and the line of spinner text
+	spinnerTerminalMode yacspin.TerminalMode
+	spinnerCurrentTitle string
+
+	previewer *progressLog
+
+	currentIndent *atomic.String
+	// consoleWidth is the width of the underlying console window. The value is updated as the window resized. Nil when
+	// isTerminal is false.
+	consoleWidth *atomic.Int32
 	// holds the last 2 bytes written by message or messageUX. This is used to detect when there is already an empty
 	// line (\n\n)
 	last2Byte [2]byte
 }
 
 type ConsoleOptions struct {
-	Message      string
-	Help         string
-	Options      []string
-	DefaultValue any
+	Message string
+	Help    string
+	Options []string
+
+	// OptionDetails is an optional field that can be used to provide additional information about the options.
+	OptionDetails []string
+	DefaultValue  any
 
 	// Prompt-only options
-
 	IsPassword bool
-	Suggest    func(input string) (completions []string)
 }
 
 type ConsoleHandles struct {
@@ -226,14 +267,14 @@ func (c *AskerConsole) MessageUxItem(ctx context.Context, item ux.UxItem) {
 		return
 	}
 
-	msg := item.ToString(c.currentIndent)
+	msg := item.ToString(c.currentIndent.Load())
 	c.println(ctx, msg)
 	// Adding "\n" b/c calling Fprintln is adding one new line at the end to the msg
 	c.updateLastBytes(msg + "\n")
 }
 
 func (c *AskerConsole) println(ctx context.Context, msg string) {
-	if c.spinner != nil && c.spinner.Status() == yacspin.SpinnerRunning {
+	if c.IsSpinnerInteractive() && c.spinner.Status() == yacspin.SpinnerRunning {
 		c.StopSpinner(ctx, "", Step)
 		// default non-format
 		fmt.Fprintln(c.writer, msg)
@@ -250,20 +291,18 @@ func defaultShowPreviewerOptions() *ShowPreviewerOptions {
 }
 
 func (c *AskerConsole) ShowPreviewer(ctx context.Context, options *ShowPreviewerOptions) io.Writer {
-	c.writeControlMutex.Lock()
-	defer c.writeControlMutex.Unlock()
+	c.showProgressMu.Lock()
+	defer c.showProgressMu.Unlock()
 
 	// Pause any active spinner
-	currentMsg := c.currentSpinnerMessage
-	if c.spinner != nil {
-		_ = c.spinner.Pause()
-	}
+	currentMsg := c.spinnerCurrentTitle
+	_ = c.spinner.Pause()
 
 	if options == nil {
 		options = defaultShowPreviewerOptions()
 	}
 
-	c.previewer = NewProgressLog(options.MaxLineCount, options.Prefix, options.Title, c.currentIndent+currentMsg)
+	c.previewer = NewProgressLog(options.MaxLineCount, options.Prefix, options.Title, c.currentIndent.Load()+currentMsg)
 	c.previewer.Start()
 	c.writer = c.previewer
 	return &consolePreviewerWriter{
@@ -271,112 +310,105 @@ func (c *AskerConsole) ShowPreviewer(ctx context.Context, options *ShowPreviewer
 	}
 }
 
-func (c *AskerConsole) StopPreviewer(ctx context.Context) {
-	c.previewer.Stop()
+func (c *AskerConsole) StopPreviewer(ctx context.Context, keepLogs bool) {
+	c.previewer.Stop(keepLogs)
 	c.previewer = nil
-	c.writer = c.initialWriter
+	c.writer = c.defaultWriter
 
-	if c.spinner != nil {
-		_ = c.spinner.Unpause()
-	}
+	_ = c.spinner.Unpause()
 }
 
 const cPostfix = "..."
 
-func (c *AskerConsole) spinnerText(title, charset string) string {
+// The line of text for the spinner, displayed in the format of: <prefix><spinner> <message>
+type spinnerLine struct {
+	// The prefix before the spinner.
+	Prefix string
 
-	spinnerLen := len(charset) + 1 // adding one for the empty space before the message
+	// Charset that is used to animate the spinner.
+	CharSet []string
 
-	if len(title)+spinnerLen >= c.consoleWidth {
-		return fmt.Sprintf("%s%s", title[:c.consoleWidth-spinnerLen-len(cPostfix)], cPostfix)
+	// The message to be displayed.
+	Message string
+}
+
+func (c *AskerConsole) spinnerLine(title string, indent string) spinnerLine {
+	if !c.isTerminal {
+		return spinnerLine{
+			Prefix:  indent,
+			CharSet: spinnerNoTerminalCharSet,
+			Message: title,
+		}
 	}
-	return title
+
+	spinnerLen := len(indent) + len(spinnerCharSet[0]) + 1 // adding one for the empty space before the message
+	width := int(c.consoleWidth.Load())
+
+	switch {
+	case width <= 3: // show number of dots up to 3
+		return spinnerLine{
+			CharSet: spinnerShortCharSet[:width],
+		}
+	case width <= spinnerLen+len(cPostfix): // show number of dots
+		return spinnerLine{
+			CharSet: spinnerShortCharSet,
+		}
+	case width <= spinnerLen+len(title): // truncate title
+		return spinnerLine{
+			Prefix:  indent,
+			CharSet: spinnerCharSet,
+			Message: title[:width-spinnerLen-len(cPostfix)] + cPostfix,
+		}
+	default:
+		return spinnerLine{
+			Prefix:  indent,
+			CharSet: spinnerCharSet,
+			Message: title,
+		}
+	}
 }
 
 func (c *AskerConsole) ShowSpinner(ctx context.Context, title string, format SpinnerUxType) {
-	c.writeControlMutex.Lock()
-	defer c.writeControlMutex.Unlock()
+	c.showProgressMu.Lock()
+	defer c.showProgressMu.Unlock()
 
 	if c.formatter != nil && c.formatter.Kind() == output.JsonFormat {
 		// Spinner is disabled when using json format.
 		return
 	}
 
-	if c.consoleWidth <= cMinConsoleWidth {
-		// no spinner for consoles with width <= cMinConsoleWidth
-		c.Message(ctx, title)
-		return
-	}
-
 	if c.previewer != nil {
 		// spinner is not compatible with previewer.
-		c.previewer.Header(c.currentIndent + title)
+		c.previewer.Header(c.currentIndent.Load() + title)
 		return
 	}
 
-	// mutating an existing spinner brings issues on how the messages are formatted
-	// so, instead of mutating, we stop any current spinner and replaced it for a new one
-	if c.spinner != nil {
-		_ = c.spinner.Stop()
+	c.spinnerLineMu.Lock()
+	c.spinnerCurrentTitle = title
+
+	indentPrefix := c.getIndent(format)
+	line := c.spinnerLine(title, indentPrefix)
+
+	_ = c.spinner.Pause()
+	c.spinner.Message(line.Message)
+	_ = c.spinner.CharSet(line.CharSet)
+	c.spinner.Prefix(line.Prefix)
+	_ = c.spinner.Unpause()
+
+	if c.spinner.Status() == yacspin.SpinnerStopped {
+		// While it is indeed safe to call Start regardless of whether the spinner is running,
+		// calling Start may result in an additional line of output being written in non-tty scenarios
+		_ = c.spinner.Start()
 	}
-
-	charSet := c.getCharset(format)
-	c.currentSpinnerMessage = title
-
-	// determine the terminal mode once
-	c.spinnerTerminalModeOnce.Do(func() {
-		c.spinnerTerminalMode = GetSpinnerTerminalMode(&c.isTerminal)
-	})
-
-	spinnerConfig := yacspin.Config{
-		Frequency:       200 * time.Millisecond,
-		Writer:          c.writer,
-		Suffix:          " ",
-		SuffixAutoColon: true,
-		Message:         c.spinnerText(title, charSet[0]),
-		CharSet:         charSet,
-	}
-	spinnerConfig.TerminalMode = c.spinnerTerminalMode
-
-	c.spinner, _ = yacspin.New(spinnerConfig)
-
-	_ = c.spinner.Start()
+	c.spinnerLineMu.Unlock()
 }
 
-// GetSpinnerTerminalMode gets the appropriate terminal mode for the spinner based on the current environment,
-// taking into account of environment variables that can control the terminal mode behavior.
-func GetSpinnerTerminalMode(isTerminal *bool) yacspin.TerminalMode {
+// spinnerTerminalMode determines the appropriate terminal mode.
+func spinnerTerminalMode(isTerminal bool) yacspin.TerminalMode {
 	nonInteractiveMode := yacspin.ForceNoTTYMode | yacspin.ForceDumbTerminalMode
-	if isTerminal != nil && !*isTerminal {
+	if !isTerminal {
 		return nonInteractiveMode
 	}
-
-	// isTerminal not provided, determine it ourselves
-	if isTerminal == nil && !isatty.IsTerminal(os.Stdout.Fd()) {
-		return nonInteractiveMode
-	}
-
-	// User override to force non-TTY behavior
-	if os.Getenv("AZD_DEBUG_FORCE_NO_TTY") == "1" {
-		return nonInteractiveMode
-	}
-
-	// By default, detect if we are running on CI and force no TTY mode if we are.
-	// Allow for an override if this is not desired.
-	shouldDetectCI := true
-	if strVal, has := os.LookupEnv("AZD_TERM_SKIP_CI_DETECT"); has {
-		skip, err := strconv.ParseBool(strVal)
-		if err != nil {
-			log.Println("AZD_TERM_SKIP_CI_DETECT is not a valid boolean value")
-		} else if skip {
-			shouldDetectCI = false
-		}
-	}
-
-	if shouldDetectCI && resource.IsRunningOnCI() {
-		return nonInteractiveMode
-	}
-
 	termMode := yacspin.ForceTTYMode
 	if os.Getenv("TERM") == "dumb" {
 		termMode |= yacspin.ForceDumbTerminalMode
@@ -386,18 +418,14 @@ func GetSpinnerTerminalMode(isTerminal *bool) yacspin.TerminalMode {
 	return termMode
 }
 
-var customCharSet []string = []string{
+var spinnerCharSet []string = []string{
 	"|       |", "|=      |", "|==     |", "|===    |", "|====   |", "|=====  |", "|====== |",
 	"|=======|", "| ======|", "|  =====|", "|   ====|", "|    ===|", "|     ==|", "|      =|",
 }
 
-func (c *AskerConsole) getCharset(format SpinnerUxType) []string {
-	newCharSet := make([]string, len(customCharSet))
-	for i, value := range customCharSet {
-		newCharSet[i] = fmt.Sprintf("%s%s", c.getIndent(format), value)
-	}
-	return newCharSet
-}
+var spinnerShortCharSet []string = []string{".", "..", "..."}
+
+var spinnerNoTerminalCharSet []string = []string{""}
 
 func setIndentation(spaces int) string {
 	bytes := make([]byte, spaces)
@@ -409,42 +437,41 @@ func setIndentation(spaces int) string {
 
 func (c *AskerConsole) getIndent(format SpinnerUxType) string {
 	requiredSize := 2
-	if requiredSize != len(c.currentIndent) {
-		c.currentIndent = setIndentation(requiredSize)
+	if requiredSize != len(c.currentIndent.Load()) {
+		c.currentIndent.Store(setIndentation(requiredSize))
 	}
-	return c.currentIndent
+	return c.currentIndent.Load()
 }
 
 func (c *AskerConsole) StopSpinner(ctx context.Context, lastMessage string, format SpinnerUxType) {
-	c.currentSpinnerMessage = ""
 	if c.formatter != nil && c.formatter.Kind() == output.JsonFormat {
 		// Spinner is disabled when using json format.
 		return
 	}
 
-	// calling stop for non existing spinner
-	if c.spinner == nil {
-		return
-	}
 	// Do nothing when it is already stopped
 	if c.spinner.Status() == yacspin.SpinnerStopped {
 		return
 	}
 
+	c.spinnerLineMu.Lock()
+	c.spinnerCurrentTitle = ""
 	// Update style according to MessageUxType
-	if lastMessage == "" {
-		c.spinner.StopCharacter("")
-	} else {
-		c.spinner.StopCharacter(c.getStopChar(format))
+	if lastMessage != "" {
+		lastMessage = c.getStopChar(format) + " " + lastMessage
 	}
 
-	_ = c.spinner.Pause()
-	c.spinner.StopMessage(lastMessage)
 	_ = c.spinner.Stop()
+	if lastMessage != "" {
+		// Avoid using StopMessage() as it may result in an extra Message line print in non-tty scenarios
+		fmt.Fprintln(c.writer, lastMessage)
+	}
+
+	c.spinnerLineMu.Unlock()
 }
 
 func (c *AskerConsole) IsSpinnerRunning(ctx context.Context) bool {
-	return c.spinner != nil && c.spinner.Status() != yacspin.SpinnerStopped
+	return c.spinner.Status() != yacspin.SpinnerStopped
 }
 
 func (c *AskerConsole) IsSpinnerInteractive() bool {
@@ -470,8 +497,15 @@ func (c *AskerConsole) getStopChar(format SpinnerUxType) string {
 
 func promptFromOptions(options ConsoleOptions) survey.Prompt {
 	if options.IsPassword {
+		// different than survey.Input, survey.Password doest not reset the line before rendering the question
+		// see password implementation: https://github.com/AlecAivazis/survey/blob/master/password.go#L51
+		// and input: https://github.com/AlecAivazis/survey/blob/master/input.go#L141
+		// by calling .Render(), the line is reset, cleaning any current message or spinner.
+		tm.Print(tm.ResetLine(""))
+		tm.Flush()
 		return &survey.Password{
 			Message: options.Message,
+			Help:    options.Help,
 		}
 	}
 
@@ -483,7 +517,6 @@ func promptFromOptions(options ConsoleOptions) survey.Prompt {
 		Message: options.Message,
 		Default: defaultValue,
 		Help:    options.Help,
-		Suggest: options.Suggest,
 	}
 }
 
@@ -492,9 +525,78 @@ func promptFromOptions(options ConsoleOptions) survey.Prompt {
 // 0 in the sentinel), followed by a new line.
 const cAfterIO = "0\n"
 
+func (c *AskerConsole) SupportsPromptDialog() bool {
+	return c.promptClient != nil
+}
+
+// PromptDialog prompts for multiple values using a single dialog. When successful, it returns a map of prompt IDs to their
+// values.
+func (c *AskerConsole) PromptDialog(ctx context.Context, dialog PromptDialog) (map[string]any, error) {
+
+	request := externalPromptDialogRequest{
+		Title:       dialog.Title,
+		Description: dialog.Description,
+		Prompts:     make([]externalPromptDialogPrompt, len(dialog.Prompts)),
+	}
+
+	for i, prompt := range dialog.Prompts {
+		request.Prompts[i] = externalPromptDialogPrompt{
+			ID:           prompt.ID,
+			Kind:         prompt.Kind,
+			DisplayName:  prompt.DisplayName,
+			Description:  prompt.Description,
+			DefaultValue: prompt.DefaultValue,
+			Required:     prompt.Required,
+		}
+	}
+
+	resp, err := c.promptClient.PromptDialog(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := make(map[string]any, len(*resp.Inputs))
+	for _, v := range *resp.Inputs {
+		ret[v.ID] = v.Value
+	}
+
+	return ret, nil
+}
+
 // Prompts the user for a single value
 func (c *AskerConsole) Prompt(ctx context.Context, options ConsoleOptions) (string, error) {
 	var response string
+
+	if c.promptClient != nil {
+		opts := promptOptions{
+			Type: "string",
+			Options: promptOptionsOptions{
+				Message: options.Message,
+				Help:    options.Help,
+			},
+		}
+
+		if options.IsPassword {
+			opts.Type = "password"
+		}
+
+		if value, ok := options.DefaultValue.(string); ok {
+			opts.Options.DefaultValue = convert.RefOf[any](value)
+		}
+
+		result, err := c.promptClient.Prompt(ctx, opts)
+		if errors.Is(err, promptCancelledErr) {
+			return "", terminal.InterruptErr
+		} else if err != nil {
+			return "", err
+		}
+
+		if err := json.Unmarshal(result, &response); err != nil {
+			return "", fmt.Errorf("unmarshalling response: %w", err)
+		}
+
+		return response, nil
+	}
 
 	err := c.doInteraction(func(c *AskerConsole) error {
 		return c.asker(promptFromOptions(options), &response)
@@ -506,11 +608,122 @@ func (c *AskerConsole) Prompt(ctx context.Context, options ConsoleOptions) (stri
 	return response, nil
 }
 
+// Prompts the user for a single value
+func (c *AskerConsole) PromptDir(ctx context.Context, options ConsoleOptions) (string, error) {
+	var response string
+
+	if c.promptClient != nil {
+		opts := promptOptions{
+			Type: "directory",
+			Options: promptOptionsOptions{
+				Message: options.Message,
+				Help:    options.Help,
+			},
+		}
+
+		if value, ok := options.DefaultValue.(string); ok {
+			opts.Options.DefaultValue = convert.RefOf[any](value)
+		}
+
+		result, err := c.promptClient.Prompt(ctx, opts)
+		if errors.Is(err, promptCancelledErr) {
+			return "", terminal.InterruptErr
+		} else if err != nil {
+			return "", err
+		}
+
+		if err := json.Unmarshal(result, &response); err != nil {
+			return "", fmt.Errorf("unmarshalling response: %w", err)
+		}
+
+		return response, nil
+	}
+
+	err := c.doInteraction(func(c *AskerConsole) error {
+		prompt := &survey.Input{
+			Message: options.Message,
+			Help:    options.Help,
+			Suggest: dirSuggestions,
+		}
+
+		return c.asker(prompt, &response)
+	})
+	if err != nil {
+		return response, err
+	}
+	c.updateLastBytes(cAfterIO)
+	return response, nil
+}
+
+func choicesFromOptions(options ConsoleOptions) []promptChoice {
+	choices := make([]promptChoice, len(options.Options))
+	for i, option := range options.Options {
+		choices[i] = promptChoice{
+			Value: option,
+		}
+
+		if i < len(options.OptionDetails) && options.OptionDetails[i] != "" {
+			choices[i].Detail = &options.OptionDetails[i]
+		}
+	}
+	return choices
+
+}
+
 // Prompts the user to select from a set of values
 func (c *AskerConsole) Select(ctx context.Context, options ConsoleOptions) (int, error) {
+	if c.promptClient != nil {
+		opts := promptOptions{
+			Type: "select",
+			Options: promptOptionsOptions{
+				Message: options.Message,
+				Help:    options.Help,
+				Choices: convert.RefOf(choicesFromOptions(options)),
+			},
+		}
+
+		if value, ok := options.DefaultValue.(string); ok {
+			opts.Options.DefaultValue = convert.RefOf[any](value)
+		}
+
+		result, err := c.promptClient.Prompt(ctx, opts)
+		if errors.Is(err, promptCancelledErr) {
+			return -1, terminal.InterruptErr
+		} else if err != nil {
+			return -1, err
+		}
+
+		var choice string
+
+		if err := json.Unmarshal(result, &choice); err != nil {
+			return -1, fmt.Errorf("unmarshalling response: %w", err)
+		}
+
+		res := slices.Index(options.Options, choice)
+		if res == -1 {
+			return -1, fmt.Errorf("invalid choice: %s", choice)
+		}
+
+		return res, nil
+	}
+
+	surveyOptions := make([]string, len(options.Options))
+	for i, option := range options.Options {
+		surveyOptions[i] = option
+
+		if c.IsSpinnerInteractive() && i < len(options.OptionDetails) {
+			if options.OptionDetails[i] != "" {
+				detailString := output.WithGrayFormat("(%s)", options.OptionDetails[i])
+				surveyOptions[i] += fmt.Sprintf("\n  %s\n", detailString)
+			} else {
+				surveyOptions[i] += "\n"
+			}
+		}
+	}
+
 	survey := &survey.Select{
 		Message: options.Message,
-		Options: options.Options,
+		Options: surveyOptions,
 		Default: options.DefaultValue,
 		Help:    options.Help,
 	}
@@ -528,8 +741,103 @@ func (c *AskerConsole) Select(ctx context.Context, options ConsoleOptions) (int,
 	return response, nil
 }
 
+func (c *AskerConsole) MultiSelect(ctx context.Context, options ConsoleOptions) ([]string, error) {
+	var response []string
+
+	if c.promptClient != nil {
+		opts := promptOptions{
+			Type: "multiSelect",
+			Options: promptOptionsOptions{
+				Message: options.Message,
+				Help:    options.Help,
+				Choices: convert.RefOf(choicesFromOptions(options)),
+			},
+		}
+
+		if value, ok := options.DefaultValue.([]string); ok {
+			opts.Options.DefaultValue = convert.RefOf[any](value)
+		}
+
+		result, err := c.promptClient.Prompt(ctx, opts)
+		if errors.Is(err, promptCancelledErr) {
+			return nil, terminal.InterruptErr
+		} else if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(result, &response); err != nil {
+			return nil, fmt.Errorf("unmarshalling response: %w", err)
+		}
+
+		return response, nil
+	}
+
+	surveyOptions := make([]string, len(options.Options))
+	for i, option := range options.Options {
+		surveyOptions[i] = option
+
+		if c.IsSpinnerInteractive() && i < len(options.OptionDetails) {
+			detailString := output.WithGrayFormat("%s", options.OptionDetails[i])
+			surveyOptions[i] += fmt.Sprintf("\n  %s\n", detailString)
+		}
+	}
+
+	survey := &survey.MultiSelect{
+		Message: options.Message,
+		Options: surveyOptions,
+		Default: options.DefaultValue,
+		Help:    options.Help,
+	}
+
+	err := c.doInteraction(func(c *AskerConsole) error {
+		return c.asker(survey, &response)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
 // Prompts the user to confirm an operation
 func (c *AskerConsole) Confirm(ctx context.Context, options ConsoleOptions) (bool, error) {
+	if c.promptClient != nil {
+		opts := promptOptions{
+			Type: "confirm",
+			Options: promptOptionsOptions{
+				Message: options.Message,
+				Help:    options.Help,
+			},
+		}
+
+		if value, ok := options.DefaultValue.(bool); ok {
+			opts.Options.DefaultValue = convert.RefOf[any](value)
+		}
+
+		result, err := c.promptClient.Prompt(ctx, opts)
+		if errors.Is(err, promptCancelledErr) {
+			return false, terminal.InterruptErr
+		} else if err != nil {
+			return false, err
+		}
+
+		var response string
+
+		if err := json.Unmarshal(result, &response); err != nil {
+			return false, fmt.Errorf("unmarshalling response: %w", err)
+		}
+
+		switch response {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		default:
+			return false, fmt.Errorf("invalid response: %s", response)
+
+		}
+	}
+
 	var defaultValue bool
 	if value, ok := options.DefaultValue.(bool); ok {
 		defaultValue = value
@@ -591,31 +899,159 @@ func (c *AskerConsole) Handles() ConsoleHandles {
 	return c.handles
 }
 
-const cMinConsoleWidth int = 40
-
-func getConsoleWidth() int {
+// consoleWidth the number of columns in the active console window
+func consoleWidth() int {
 	width, _ := consolesize.GetConsoleSize()
-	if width < cMinConsoleWidth {
-		return cMinConsoleWidth
-	}
 	return width
 }
 
-// Creates a new console with the specified writer, handles and formatter.
-func NewConsole(noPrompt bool, isTerminal bool, w io.Writer, handles ConsoleHandles, formatter output.Formatter) Console {
+func (c *AskerConsole) handleResize(width int) {
+	c.consoleWidth.Store(int32(width))
+
+	c.spinnerLineMu.Lock()
+	if c.spinner.Status() == yacspin.SpinnerRunning {
+		line := c.spinnerLine(c.spinnerCurrentTitle, c.currentIndent.Load())
+		c.spinner.Message(line.Message)
+		_ = c.spinner.CharSet(line.CharSet)
+		c.spinner.Prefix(line.Prefix)
+	}
+	c.spinnerLineMu.Unlock()
+}
+
+func watchTerminalResize(c *AskerConsole) {
+	if runtime.GOOS == "windows" {
+		go func() {
+			prevWidth := consoleWidth()
+			for {
+				time.Sleep(time.Millisecond * 250)
+				width := consoleWidth()
+
+				if prevWidth != width {
+					c.handleResize(width)
+				}
+				prevWidth = width
+			}
+		}()
+	} else {
+		// avoid taking a dependency on syscall.SIGWINCH (unix-only constant) directly
+		const SIGWINCH = syscall.Signal(0x1c)
+		signalChan := make(chan os.Signal, 1)
+		signal.Notify(signalChan, SIGWINCH)
+		go func() {
+			for range signalChan {
+				c.handleResize(consoleWidth())
+			}
+		}()
+	}
+}
+
+func watchTerminalInterrupt(c *AskerConsole) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+	go func() {
+		<-signalChan
+
+		// unhide the cursor if applicable
+		_ = c.spinner.Stop()
+
+		os.Exit(1)
+	}()
+}
+
+// Writers that back the underlying console.
+type Writers struct {
+	// The writer to write output to.
+	Output io.Writer
+
+	// The writer to write spinner output to. If nil, the spinner will write to Output.
+	Spinner io.Writer
+}
+
+// ExternalPromptConfiguration allows configuring the console to delegate prompts to an external service.
+type ExternalPromptConfiguration struct {
+	Endpoint string
+	Key      string
+	Client   httputil.HttpClient
+}
+
+// Creates a new console with the specified writers, handles and formatter. When externalPromptCfg is non nil, it is used
+// instead of prompting on the console.
+func NewConsole(
+	noPrompt bool,
+	isTerminal bool,
+	writers Writers,
+	handles ConsoleHandles,
+	formatter output.Formatter,
+	externalPromptCfg *ExternalPromptConfiguration) Console {
 	asker := NewAsker(noPrompt, isTerminal, handles.Stdout, handles.Stdin)
 
-	return &AskerConsole{
+	c := &AskerConsole{
 		asker:         asker,
 		handles:       handles,
-		defaultWriter: w,
-		writer:        w,
+		defaultWriter: writers.Output,
+		writer:        writers.Output,
 		formatter:     formatter,
 		isTerminal:    isTerminal,
-		consoleWidth:  getConsoleWidth(),
-		initialWriter: w,
+		currentIndent: atomic.NewString(""),
 		noPrompt:      noPrompt,
 	}
+
+	if writers.Spinner == nil {
+		writers.Spinner = writers.Output
+	}
+
+	if externalPromptCfg != nil {
+		c.promptClient = newExternalPromptClient(externalPromptCfg.Endpoint, externalPromptCfg.Key, externalPromptCfg.Client)
+	}
+
+	spinnerConfig := yacspin.Config{
+		Frequency:    200 * time.Millisecond,
+		Writer:       writers.Spinner,
+		Suffix:       " ",
+		TerminalMode: spinnerTerminalMode(isTerminal),
+	}
+	if isTerminal {
+		spinnerConfig.CharSet = spinnerCharSet
+	} else {
+		spinnerConfig.CharSet = spinnerNoTerminalCharSet
+	}
+
+	c.spinner, _ = yacspin.New(spinnerConfig)
+	c.spinnerTerminalMode = spinnerConfig.TerminalMode
+	if isTerminal {
+		c.consoleWidth = atomic.NewInt32(int32(consoleWidth()))
+		watchTerminalResize(c)
+		watchTerminalInterrupt(c)
+	}
+
+	return c
+}
+
+// IsTerminal returns true if the given file descriptors are attached to a terminal,
+// taking into account of environment variables that force TTY behavior.
+func IsTerminal(stdoutFd uintptr, stdinFd uintptr) bool {
+	// User override to force non-TTY behavior
+	if ok, _ := strconv.ParseBool(os.Getenv("AZD_DEBUG_FORCE_NO_TTY")); ok {
+		return false
+	}
+
+	// By default, detect if we are running on CI and force no TTY mode if we are.
+	// Allow for an override if this is not desired.
+	shouldDetectCI := true
+	if strVal, has := os.LookupEnv("AZD_TERM_SKIP_CI_DETECT"); has {
+		skip, err := strconv.ParseBool(strVal)
+		if err != nil {
+			log.Println("AZD_TERM_SKIP_CI_DETECT is not a valid boolean value")
+		} else if skip {
+			shouldDetectCI = false
+		}
+	}
+
+	if shouldDetectCI && resource.IsRunningOnCI() {
+		return false
+	}
+
+	return isatty.IsTerminal(stdoutFd) && isatty.IsTerminal(stdinFd)
 }
 
 func GetStepResultFormat(result error) SpinnerUxType {
@@ -626,9 +1062,21 @@ func GetStepResultFormat(result error) SpinnerUxType {
 	return formatResult
 }
 
+// dirSuggestions provides suggestion completions for directories given the current input directory.
+func dirSuggestions(input string) []string {
+	completions := []string{}
+	matches, _ := filepath.Glob(input + "*")
+	for _, match := range matches {
+		if fs, err := os.Stat(match); err == nil && fs.IsDir() {
+			completions = append(completions, match)
+		}
+	}
+	return completions
+}
+
 // Handle doing interactive calls. It checks if there's a spinner running to pause it before doing interactive actions.
 func (c *AskerConsole) doInteraction(promptFn func(c *AskerConsole) error) error {
-	if c.spinner != nil && c.spinner.Status() == yacspin.SpinnerRunning {
+	if c.spinner.Status() == yacspin.SpinnerRunning {
 		_ = c.spinner.Pause()
 
 		// Ensure the spinner is always resumed

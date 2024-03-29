@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
@@ -87,7 +88,7 @@ func TestTerraformState(t *testing.T) {
 	require.NotNil(t, getStateResult.State)
 
 	require.Equal(t, infraProvider.env.Dotenv()["AZURE_LOCATION"], getStateResult.State.Outputs["AZURE_LOCATION"].Value)
-	require.Equal(t, fmt.Sprintf("rg-%s", infraProvider.env.GetEnvName()), getStateResult.State.Outputs["RG_NAME"].Value)
+	require.Equal(t, fmt.Sprintf("rg-%s", infraProvider.env.Name()), getStateResult.State.Outputs["RG_NAME"].Value)
 	require.Len(t, getStateResult.State.Resources, 1)
 	require.Regexp(
 		t,
@@ -133,7 +134,7 @@ func createTerraformProvider(t *testing.T, mockContext *mocks.MockContext) *Terr
 		env,
 		mockContext.Console,
 		&mockCurrentPrincipal{},
-		prompt.NewDefaultPrompter(env, mockContext.Console, accountManager, azCli),
+		prompt.NewDefaultPrompter(env, mockContext.Console, accountManager, azCli, cloud.AzurePublic().PortalUrlBase),
 	)
 
 	err := provider.Initialize(*mockContext.Context, projectDir, options)

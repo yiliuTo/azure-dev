@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,12 +13,15 @@ import (
 	"github.com/azure/azure-dev/cli/azd/cmd/actions"
 	"github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/contracts"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/lazy"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
+	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
 	"github.com/azure/azure-dev/cli/azd/pkg/project"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 	"github.com/spf13/cobra"
@@ -26,11 +30,11 @@ import (
 
 type showFlags struct {
 	global *internal.GlobalCommandOptions
-	envFlag
+	internal.EnvFlag
 }
 
 func (s *showFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
-	s.envFlag.Bind(local, global)
+	s.EnvFlag.Bind(local, global)
 	s.global = global
 }
 
@@ -43,9 +47,7 @@ func newShowFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) *sh
 
 func newShowCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "show --output json",
-		Short:  "Display information about your app and its resources.",
-		Hidden: true,
+		Short: "Display information about your app and its resources.",
 	}
 
 	return cmd
@@ -53,6 +55,7 @@ func newShowCmd() *cobra.Command {
 
 type showAction struct {
 	projectConfig        *project.ProjectConfig
+	importManager        *project.ImportManager
 	console              input.Console
 	formatter            output.Formatter
 	writer               io.Writer
@@ -61,6 +64,9 @@ type showAction struct {
 	deploymentOperations azapi.DeploymentOperations
 	azdCtx               *azdcontext.AzdContext
 	flags                *showFlags
+	lazyServiceManager   *lazy.Lazy[project.ServiceManager]
+	lazyResourceManager  *lazy.Lazy[project.ResourceManager]
+	portalUrlBase        string
 }
 
 func newShowAction(
@@ -71,11 +77,16 @@ func newShowAction(
 	envManager environment.Manager,
 	deploymentOperations azapi.DeploymentOperations,
 	projectConfig *project.ProjectConfig,
+	importManager *project.ImportManager,
 	azdCtx *azdcontext.AzdContext,
 	flags *showFlags,
+	lazyServiceManager *lazy.Lazy[project.ServiceManager],
+	lazyResourceManager *lazy.Lazy[project.ResourceManager],
+	portalUrlBase cloud.PortalUrlBase,
 ) actions.Action {
 	return &showAction{
 		projectConfig:        projectConfig,
+		importManager:        importManager,
 		console:              console,
 		formatter:            formatter,
 		writer:               writer,
@@ -84,16 +95,28 @@ func newShowAction(
 		deploymentOperations: deploymentOperations,
 		azdCtx:               azdCtx,
 		flags:                flags,
+		lazyServiceManager:   lazyServiceManager,
+		lazyResourceManager:  lazyResourceManager,
+		portalUrlBase:        string(portalUrlBase),
 	}
 }
 
 func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
+
+	s.console.ShowSpinner(ctx, "Gathering information about your app and its resources...", input.Step)
+	defer s.console.StopSpinner(ctx, "", input.Step)
+
 	res := contracts.ShowResult{
 		Name:     s.projectConfig.Name,
-		Services: make(map[string]contracts.ShowService, len(s.projectConfig.Services)),
+		Services: make(map[string]contracts.ShowService),
 	}
 
-	for name, svc := range s.projectConfig.Services {
+	stableServices, err := s.importManager.ServiceStable(ctx, s.projectConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, svc := range stableServices {
 		path, err := getFullPathToProjectForService(svc)
 		if err != nil {
 			return nil, err
@@ -106,7 +129,7 @@ func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 			},
 		}
 
-		res.Services[name] = showSvc
+		res.Services[svc.Name] = showSvc
 	}
 
 	// Add information about the target of each service, if we can determine it (if the infrastructure has
@@ -116,7 +139,7 @@ func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 	// having an environment injected into us so we can handle cases where the current environment doesn't exist (if we
 	// injected an environment, we'd prompt the user to see if they want to created one and we'd prefer not to have show
 	// interact with the user).
-	environmentName := s.flags.environmentName
+	environmentName := s.flags.EnvironmentName
 
 	if environmentName == "" {
 		var err error
@@ -126,20 +149,26 @@ func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 		}
 
 	}
-
+	var subId, rgName string
 	if env, err := s.envManager.Get(ctx, environmentName); err != nil {
+		if errors.Is(err, environment.ErrNotFound) && s.flags.EnvironmentName != "" {
+			return nil, fmt.Errorf(
+				`"environment '%s' does not exist. You can create it with "azd env new"`, environmentName,
+			)
+		}
 		log.Printf("could not load environment: %s, resource ids will not be available", err)
 	} else {
-		if subId := env.GetSubscriptionId(); subId == "" {
+		if subId = env.GetSubscriptionId(); subId == "" {
 			log.Printf("provision has not been run, resource ids will not be available")
 		} else {
 			azureResourceManager := infra.NewAzureResourceManager(s.azCli, s.deploymentOperations)
 			resourceManager := project.NewResourceManager(env, s.azCli, s.deploymentOperations)
-			envName := env.GetEnvName()
+			envName := env.Name()
 
-			rgName, err := azureResourceManager.FindResourceGroupForEnvironment(ctx, subId, envName)
+			rgName, err = azureResourceManager.FindResourceGroupForEnvironment(ctx, subId, envName)
 			if err == nil {
-				for svcName, serviceConfig := range s.projectConfig.Services {
+				for _, serviceConfig := range stableServices {
+					svcName := serviceConfig.Name
 					resources, err := resourceManager.GetServiceResources(ctx, subId, rgName, serviceConfig)
 					if err == nil {
 						resourceIds := make([]string, len(resources))
@@ -151,6 +180,7 @@ func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 						resSvc.Target = &contracts.ShowTargetArm{
 							ResourceIds: resourceIds,
 						}
+						resSvc.IngresUrl = s.serviceEndpoint(ctx, subId, serviceConfig, env)
 						res.Services[svcName] = resSvc
 					} else {
 						log.Printf("ignoring error determining resource id for service %s: %v", svcName, err)
@@ -159,13 +189,88 @@ func (s *showAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 			} else {
 				log.Printf(
 					"ignoring error determining resource group for environment %s, resource ids will not be available: %v",
-					env.GetEnvName(),
+					env.Name(),
 					err)
 			}
 		}
 	}
 
-	return nil, s.formatter.Format(res, s.writer, nil)
+	if s.formatter.Kind() == output.JsonFormat {
+		return nil, s.formatter.Format(res, s.writer, nil)
+	}
+
+	appEnvironments, err := s.envManager.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	uxEnvironments := make([]*ux.ShowEnvironment, len(appEnvironments))
+	for index, environment := range appEnvironments {
+		uxEnvironments[index] = &ux.ShowEnvironment{
+			Name:      environment.Name,
+			IsCurrent: environment.Name == environmentName,
+			IsRemote:  !environment.HasLocal && environment.HasRemote,
+		}
+	}
+
+	uxServices := make([]*ux.ShowService, len(res.Services))
+	var index int
+	for serviceName, service := range res.Services {
+		uxServices[index] = &ux.ShowService{
+			Name:      serviceName,
+			IngresUrl: service.IngresUrl,
+		}
+		index++
+	}
+
+	s.console.MessageUxItem(ctx, &ux.Show{
+		AppName:         s.azdCtx.GetDefaultProjectName(),
+		Services:        uxServices,
+		Environments:    uxEnvironments,
+		AzurePortalLink: azurePortalLink(s.portalUrlBase, subId, rgName),
+	})
+
+	return nil, nil
+}
+
+func (s *showAction) serviceEndpoint(
+	ctx context.Context, subId string, serviceConfig *project.ServiceConfig, env *environment.Environment) string {
+	resourceManager, err := s.lazyResourceManager.GetValue()
+	if err != nil {
+		log.Printf("error: getting lazy target-resource. Endpoints will be empty: %v", err)
+		return ""
+	}
+	targetResource, err := resourceManager.GetTargetResource(ctx, subId, serviceConfig)
+	if err != nil {
+		log.Printf("error: getting target-resource. Endpoints will be empty: %v", err)
+		return ""
+	}
+
+	serviceManager, err := s.lazyServiceManager.GetValue()
+	if err != nil {
+		log.Printf("error: getting lazy service manager. Endpoints will be empty: %v", err)
+		return ""
+	}
+	st, err := serviceManager.GetServiceTarget(ctx, serviceConfig)
+	if err != nil {
+		log.Printf("error: getting service target. Endpoints will be empty: %v", err)
+		return ""
+	}
+	endpoints, err := st.Endpoints(ctx, serviceConfig, targetResource)
+	if err != nil {
+		log.Printf("error: getting service endpoints. Endpoints might be empty: %v", err)
+	}
+
+	overriddenEndpoints := project.OverriddenEndpoints(ctx, serviceConfig, env)
+	if len(overriddenEndpoints) > 0 {
+		endpoints = overriddenEndpoints
+	}
+
+	if len(endpoints) == 0 {
+		return ""
+	}
+
+	return endpoints[0]
 }
 
 func showTypeFromLanguage(language project.ServiceLanguageKind) contracts.ShowType {

@@ -53,7 +53,8 @@ type initFlags struct {
 	subscription   string
 	location       string
 	global         *internal.GlobalCommandOptions
-	envFlag
+	fromCode       bool
+	internal.EnvFlag
 }
 
 func (i *initFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
@@ -63,7 +64,7 @@ func (i *initFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOpt
 		"t",
 		"",
 		//nolint:lll
-		"The template to use when you initialize the project. You can use Full URI, <owner>/<repository>, or <repository> if it's part of the azure-samples organization.",
+		"Initializes a new application from a template. You can use Full URI, <owner>/<repository>, or <repository> if it's part of the azure-samples organization.",
 	)
 	local.StringVarP(
 		&i.templateBranch,
@@ -78,8 +79,15 @@ func (i *initFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOpt
 		"",
 		"Name or ID of an Azure subscription to use for the new environment",
 	)
+	local.BoolVarP(
+		&i.fromCode,
+		"from-code",
+		"",
+		false,
+		"Initializes a new application from your existing code.",
+	)
 	local.StringVarP(&i.location, "location", "l", "", "Azure location for the new environment")
-	i.envFlag.Bind(local, global)
+	i.EnvFlag.Bind(local, global)
 
 	i.global = global
 }
@@ -125,11 +133,8 @@ func (i *initAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 		return nil, fmt.Errorf("getting cwd: %w", err)
 	}
 
-	azdCtx, err := i.lazyAzdCtx.GetValue()
-	if err != nil {
-		azdCtx = azdcontext.NewAzdContextWithDirectory(wd)
-		i.lazyAzdCtx.SetValue(azdCtx)
-	}
+	azdCtx := azdcontext.NewAzdContextWithDirectory(wd)
+	i.lazyAzdCtx.SetValue(azdCtx)
 
 	if i.flags.templateBranch != "" && i.flags.templatePath == "" {
 		return nil,
@@ -162,19 +167,22 @@ func (i *initAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 		initTypeSelect = initAppTemplate
 	}
 
-	if i.flags.templatePath == "" && existingProject {
-		// no explicit --template, and azure.yaml exists, only initialize environment
+	if i.flags.fromCode {
+		if i.flags.templatePath != "" {
+			return nil, errors.New("only one of init modes: --template, or --from-code should be set")
+		}
+		initTypeSelect = initFromApp
+	}
+
+	if i.flags.templatePath == "" && !i.flags.fromCode && existingProject {
+		// only initialize environment when no mode is set explicitly
 		initTypeSelect = initEnvironment
 	}
 
 	if initTypeSelect == initUnknown {
-		if i.featuresManager.IsEnabled(alpha.EasyInit) {
-			initTypeSelect, err = promptInitType(i.console, ctx)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			initTypeSelect = initAppTemplate
+		initTypeSelect, err = promptInitType(i.console, ctx)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -188,13 +196,17 @@ func (i *initAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 	switch initTypeSelect {
 	case initAppTemplate:
 		tracing.SetUsageAttributes(fields.InitMethod.String("template"))
-		err := i.initializeTemplate(ctx, azdCtx)
+		template, err := i.initializeTemplate(ctx, azdCtx)
 		if err != nil {
 			return nil, err
 		}
 
-		err = i.initializeEnv(ctx, azdCtx)
-		if err != nil {
+		var templateMetadata *templates.Metadata
+		if template != nil {
+			templateMetadata = &template.Metadata
+		}
+
+		if _, err := i.initializeEnv(ctx, azdCtx, templateMetadata); err != nil {
 			return nil, err
 		}
 	case initFromApp:
@@ -219,14 +231,14 @@ func (i *initAction) Run(ctx context.Context) (*actions.ActionResult, error) {
 			}
 		}
 
-		err = i.repoInitializer.InitFromApp(ctx, azdCtx, func() error {
-			return i.initializeEnv(ctx, azdCtx)
+		err = i.repoInitializer.InitFromApp(ctx, azdCtx, func() (*environment.Environment, error) {
+			return i.initializeEnv(ctx, azdCtx, nil)
 		})
 		if err != nil {
 			return nil, err
 		}
 	case initEnvironment:
-		err = i.initializeEnv(ctx, azdCtx)
+		_, err = i.initializeEnv(ctx, azdCtx, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -275,16 +287,18 @@ func promptInitType(console input.Console, ctx context.Context) (initType, error
 
 func (i *initAction) initializeTemplate(
 	ctx context.Context,
-	azdCtx *azdcontext.AzdContext) error {
+	azdCtx *azdcontext.AzdContext) (*templates.Template, error) {
 	err := i.repoInitializer.PromptIfNonEmpty(ctx, azdCtx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var template *templates.Template
+
 	if i.flags.templatePath == "" {
-		template, err := templates.PromptTemplate(ctx, "Select a project template:", i.templateManager, i.console)
+		template, err = templates.PromptTemplate(ctx, "Select a project template:", i.templateManager, i.console)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		if template != nil {
@@ -293,35 +307,37 @@ func (i *initAction) initializeTemplate(
 	}
 
 	if i.flags.templatePath != "" {
-		gitUri, err := templates.Absolute(i.flags.templatePath)
-		if err != nil {
-			return err
+		if template == nil {
+			template = &templates.Template{
+				RepositoryPath: i.flags.templatePath,
+			}
 		}
 
-		err = i.repoInitializer.Initialize(ctx, azdCtx, gitUri, i.flags.templateBranch)
+		err = i.repoInitializer.Initialize(ctx, azdCtx, template, i.flags.templateBranch)
 		if err != nil {
-			return fmt.Errorf("init from template repository: %w", err)
+			return nil, fmt.Errorf("init from template repository: %w", err)
 		}
 	} else {
 		err := i.repoInitializer.InitializeMinimal(ctx, azdCtx)
 		if err != nil {
-			return fmt.Errorf("init empty repository: %w", err)
+			return nil, fmt.Errorf("init empty repository: %w", err)
 		}
 	}
 
-	return nil
+	return template, nil
 }
 
 func (i *initAction) initializeEnv(
 	ctx context.Context,
-	azdCtx *azdcontext.AzdContext) error {
+	azdCtx *azdcontext.AzdContext,
+	templateMetadata *templates.Metadata) (*environment.Environment, error) {
 	envName, err := azdCtx.GetDefaultEnvironmentName()
 	if err != nil {
-		return fmt.Errorf("retrieving default environment name: %w", err)
+		return nil, fmt.Errorf("retrieving default environment name: %w", err)
 	}
 
 	if envName != "" {
-		return environment.NewEnvironmentInitError(envName)
+		return nil, environment.NewEnvironmentInitError(envName)
 	}
 
 	base := filepath.Base(azdCtx.ProjectDirectory())
@@ -340,11 +356,11 @@ func (i *initAction) initializeEnv(
 	// it here after the template is hydrated and the context is available
 	envManager, err := i.lazyEnvManager.GetValue()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	envSpec := environment.Spec{
-		Name:         i.flags.environmentName,
+		Name:         i.flags.EnvironmentName,
 		Subscription: i.flags.subscription,
 		Location:     i.flags.location,
 		Examples:     examples,
@@ -352,22 +368,39 @@ func (i *initAction) initializeEnv(
 
 	env, err := envManager.Create(ctx, envSpec)
 	if err != nil {
-		return fmt.Errorf("loading environment: %w", err)
+		return nil, fmt.Errorf("loading environment: %w", err)
 	}
 
-	if err := azdCtx.SetDefaultEnvironmentName(env.GetEnvName()); err != nil {
-		return fmt.Errorf("saving default environment: %w", err)
+	if err := azdCtx.SetDefaultEnvironmentName(env.Name()); err != nil {
+		return nil, fmt.Errorf("saving default environment: %w", err)
 	}
 
-	return nil
+	// If the template includes any metadata values, set them in the environment
+	if templateMetadata != nil {
+		for key, value := range templateMetadata.Variables {
+			env.DotenvSet(key, value)
+		}
+
+		for key, value := range templateMetadata.Config {
+			if err := env.Config.Set(key, value); err != nil {
+				return nil, fmt.Errorf("setting environment config: %w", err)
+			}
+		}
+
+		if err := envManager.Save(ctx, env); err != nil {
+			return nil, fmt.Errorf("saving environment: %w", err)
+		}
+	}
+
+	return env, nil
 }
 
 func getCmdInitHelpDescription(*cobra.Command) string {
 	return generateCmdHelpDescription("Initialize a new application in your current directory.",
 		[]string{
 			formatHelpNote(
-				fmt.Sprintf("Running %s without a template will prompt "+
-					"you to start with a minimal template or select from a curated list of presets.",
+				fmt.Sprintf("Running %s without flags specified will prompt "+
+					"you to initialize using your existing code, or from a template.",
 					output.WithHighLightFormat("init"),
 				)),
 			formatHelpNote(

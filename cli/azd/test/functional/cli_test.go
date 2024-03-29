@@ -26,16 +26,20 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
 	"github.com/azure/azure-dev/cli/azd/internal/tracing"
 	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/devcenter"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
 	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 	"github.com/azure/azure-dev/cli/azd/test/azdcli"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockaccount"
@@ -67,8 +71,12 @@ type cliConfig struct {
 	// The tenant ID to use for live Azure tests.
 	TenantID string
 	// The Azure subscription ID to use for live Azure tests.
+	// In non-CI environments with no additional environment variables set,
+	// the azd user config 'defaults.subscription' value is used.
 	SubscriptionID string
 	// The Azure location to use for live Azure tests.
+	// In non-CI environments with no additional environment variables set,
+	// the azd user config 'defaults.location' value is used.
 	Location string
 }
 
@@ -79,6 +87,24 @@ func (c *cliConfig) init() {
 	c.TenantID = os.Getenv("AZD_TEST_TENANT_ID")
 	c.SubscriptionID = os.Getenv("AZD_TEST_AZURE_SUBSCRIPTION_ID")
 	c.Location = os.Getenv("AZD_TEST_AZURE_LOCATION")
+
+	if !c.CI && (c.SubscriptionID == "" || c.Location == "") {
+		userConfig := config.NewUserConfigManager(config.NewFileConfigManager(config.NewManager()))
+		cfg, err := userConfig.Load()
+		if err == nil {
+			if subId, ok := cfg.GetString("defaults.subscription"); ok && c.SubscriptionID == "" {
+				c.SubscriptionID = subId
+			}
+
+			if loc, ok := cfg.GetString("defaults.location"); ok && c.Location == "" {
+				c.Location = loc
+			}
+		}
+
+		if err != nil {
+			log.Printf("could not load user config to provide default test values: %v", err)
+		}
+	}
 }
 
 func TestMain(m *testing.M) {
@@ -92,6 +118,75 @@ func TestMain(m *testing.M) {
 
 	exitVal := m.Run()
 	os.Exit(exitVal)
+}
+
+func Test_CLI_DevCenter_Init_Up_Down(t *testing.T) {
+	// running this test in parallel is ok as it uses a t.TempDir()
+	t.Parallel()
+	ctx, cancel := newTestContext(t)
+	defer cancel()
+
+	dir := tempDirWithDiagnostics(t)
+	t.Logf("DIR: %s", dir)
+
+	session := recording.Start(t)
+	envName := randomOrStoredEnvName(session)
+
+	t.Logf("AZURE_ENV_NAME: %s", envName)
+
+	cli := azdcli.NewCLI(t, azdcli.WithSession(session))
+	cli.WorkingDirectory = dir
+	cli.Env = append(cli.Env, os.Environ()...)
+	cli.Env = append(cli.Env, fmt.Sprintf("%s=devcenter", environment.PlatformTypeEnvVarName))
+	cli.Env = append(cli.Env, fmt.Sprintf("%s=wbreza", devcenter.DevCenterCatalogEnvName))
+
+	initStdIn := strings.Join(
+		[]string{
+			"Select a template",
+			"HelloWorld",
+			envName,
+			"Project-1",
+		},
+		"\n",
+	)
+
+	// azd init
+	_, err := cli.RunCommandWithStdIn(ctx, initStdIn, "init")
+	require.NoError(t, err)
+
+	// evaluate the project and environment configuration
+	azdCtx := azdcontext.NewAzdContextWithDirectory(dir)
+	projectConfig, err := project.Load(ctx, azdCtx.ProjectPath())
+	require.NoError(t, err)
+
+	require.Equal(t, "dc-wabrez-od3kzvk4mwe72", projectConfig.Platform.Config["name"])
+	require.Equal(t, "wbreza", projectConfig.Platform.Config["catalog"])
+	require.Equal(t, "HelloWorld", projectConfig.Platform.Config["environmentDefinition"])
+
+	env, err := envFromAzdRoot(ctx, dir, envName)
+	require.NoError(t, err)
+
+	require.Equal(t, envName, env.Name())
+	projectName, _ := env.Config.Get(devcenter.DevCenterProjectPath)
+	repoUrl, _ := env.Config.Get("provision.parameters.repoUrl")
+	require.Equal(t, "Project-1", projectName)
+	require.Equal(t, "https://github.com/wbreza/azd-hello-world", repoUrl)
+
+	// azd up
+	upStdIn := strings.Join([]string{"Dev"}, "\n")
+	_, err = cli.RunCommandWithStdIn(ctx, upStdIn, "up")
+	require.NoError(t, err)
+
+	// re-evaluate the environment configuration
+	env, err = envFromAzdRoot(ctx, dir, envName)
+	require.NoError(t, err)
+
+	envTypeName, _ := env.Config.Get(devcenter.DevCenterEnvTypePath)
+	require.Equal(t, "Dev", envTypeName)
+
+	// azd down
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
+	require.NoError(t, err)
 }
 
 func Test_CLI_InfraCreateAndDelete(t *testing.T) {
@@ -134,14 +229,7 @@ func Test_CLI_InfraCreateAndDelete(t *testing.T) {
 	assertEnvValuesStored(t, env)
 
 	if session != nil {
-		if session.Playback {
-			// This is currently required because azd doesn't store
-			// AZURE_SUBSCRIPTION_ID in the .env file
-			// See #2423
-			env.SetSubscriptionId(session.Variables[recording.SubscriptionIdKey])
-		} else {
-			session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
-		}
+		session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
 	}
 
 	// GetResourceGroupsForEnvironment requires a credential since it is using the SDK now
@@ -157,22 +245,31 @@ func Test_CLI_InfraCreateAndDelete(t *testing.T) {
 		client = http.DefaultClient
 	}
 
+	armClientOptions := &arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: client,
+			Cloud:     cloud.AzurePublic().Configuration,
+		},
+	}
 	azCli := azcli.NewAzCli(mockaccount.SubscriptionCredentialProviderFunc(
 		func(_ context.Context, _ string) (azcore.TokenCredential, error) {
 			return cred, nil
 		}),
 		client,
-		azcli.NewAzCliArgs{})
+		azcli.NewAzCliArgs{},
+		armClientOptions,
+	)
 	deploymentOperations := azapi.NewDeploymentOperations(
 		mockaccount.SubscriptionCredentialProviderFunc(
 			func(_ context.Context, _ string) (azcore.TokenCredential, error) {
 				return cred, nil
 			}),
-		client)
+		armClientOptions,
+	)
 
 	// Verify that resource groups are created with tag
 	resourceManager := infra.NewAzureResourceManager(azCli, deploymentOperations)
-	rgs, err := resourceManager.GetResourceGroupsForEnvironment(ctx, env.GetSubscriptionId(), env.GetEnvName())
+	rgs, err := resourceManager.GetResourceGroupsForEnvironment(ctx, env.GetSubscriptionId(), env.Name())
 	require.NoError(t, err)
 	require.NotNil(t, rgs)
 
@@ -181,7 +278,8 @@ func Test_CLI_InfraCreateAndDelete(t *testing.T) {
 }
 
 func Test_CLI_ProvisionState(t *testing.T) {
-	t.Setenv("AZURE_RECORD_MODE", "live")
+	t.Parallel()
+
 	ctx, cancel := newTestContext(t)
 	defer cancel()
 
@@ -231,12 +329,20 @@ func Test_CLI_ProvisionState(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, flagProvisionOutput.Stdout, expectedOutputContains)
 
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	if session != nil {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+	}
+
 	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
 	require.NoError(t, err)
 }
 
 func Test_CLI_ProvisionStateWithDown(t *testing.T) {
-	t.Setenv("AZURE_RECORD_MODE", "live")
+	t.Parallel()
+
 	ctx, cancel := newTestContext(t)
 	defer cancel()
 
@@ -278,6 +384,13 @@ func Test_CLI_ProvisionStateWithDown(t *testing.T) {
 	reProvisionAfterDown, err := cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
 	require.NoError(t, err)
 	require.NotContains(t, reProvisionAfterDown.Stdout, expectedOutputContains)
+
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	if session != nil {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+	}
 
 	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
 	require.NoError(t, err)
@@ -334,14 +447,7 @@ func Test_CLI_InfraCreateAndDeleteUpperCase(t *testing.T) {
 	assertEnvValuesStored(t, env)
 
 	if session != nil {
-		if session.Playback {
-			// This is currently required because azd doesn't store
-			// AZURE_SUBSCRIPTION_ID in the .env file
-			// See #2423
-			env.SetSubscriptionId(session.Variables[recording.SubscriptionIdKey])
-		} else {
-			session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
-		}
+		session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
 	}
 
 	// GetResourceGroupsForEnvironment requires a credential since it is using the SDK now
@@ -355,23 +461,32 @@ func Test_CLI_InfraCreateAndDeleteUpperCase(t *testing.T) {
 	if err != nil {
 		t.Fatal("could not create credential")
 	}
+	armClientOptions := &arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: client,
+			Cloud:     cloud.AzurePublic().Configuration,
+		},
+	}
 
 	azCli := azcli.NewAzCli(mockaccount.SubscriptionCredentialProviderFunc(
 		func(_ context.Context, _ string) (azcore.TokenCredential, error) {
 			return cred, nil
 		}),
 		client,
-		azcli.NewAzCliArgs{})
+		azcli.NewAzCliArgs{},
+		armClientOptions,
+	)
 	deploymentOperations := azapi.NewDeploymentOperations(
 		mockaccount.SubscriptionCredentialProviderFunc(
 			func(_ context.Context, _ string) (azcore.TokenCredential, error) {
 				return cred, nil
 			}),
-		client)
+		armClientOptions,
+	)
 
 	// Verify that resource groups are created with tag
 	resourceManager := infra.NewAzureResourceManager(azCli, deploymentOperations)
-	rgs, err := resourceManager.GetResourceGroupsForEnvironment(ctx, env.GetSubscriptionId(), env.GetEnvName())
+	rgs, err := resourceManager.GetResourceGroupsForEnvironment(ctx, env.GetSubscriptionId(), env.Name())
 	require.NoError(t, err)
 	require.NotNil(t, rgs)
 
@@ -530,14 +645,7 @@ func Test_CLI_InfraBicepParam(t *testing.T) {
 	assertEnvValuesStored(t, env)
 
 	if session != nil {
-		if session.Playback {
-			// This is currently required because azd doesn't store
-			// AZURE_SUBSCRIPTION_ID in the .env file
-			// See #2423
-			env.SetSubscriptionId(session.Variables[recording.SubscriptionIdKey])
-		} else {
-			session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
-		}
+		session.Variables[recording.SubscriptionIdKey] = env.GetSubscriptionId()
 	}
 
 	// Delete
@@ -559,7 +667,7 @@ func Test_CLI_NoDebugSpewWhenHelpPassedWithoutDebug(t *testing.T) {
 	assert.Equal(t, "", result.Stderr, "no output should be written to stderr when --help is passed")
 }
 
-//go:embed testdata/samples/*
+//go:embed all:testdata/samples/*
 var samples embed.FS
 
 func samplePath(paths ...string) string {
@@ -604,6 +712,21 @@ func randomOrStoredEnvName(session *recording.Session) string {
 	}
 
 	return randName
+}
+
+func cfgOrStoredSubscription(session *recording.Session) string {
+	if session != nil && session.Playback {
+		if _, ok := session.Variables[recording.SubscriptionIdKey]; ok {
+			return session.Variables[recording.SubscriptionIdKey]
+		}
+	}
+
+	subID := cfg.SubscriptionID
+	if session != nil {
+		session.Variables[recording.SubscriptionIdKey] = subID
+	}
+
+	return subID
 }
 
 func randomEnvName() string {

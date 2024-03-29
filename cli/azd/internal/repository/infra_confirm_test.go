@@ -35,7 +35,7 @@ func TestInitializer_infraSpecFromDetect(t *testing.T) {
 				Services: []scaffold.ServiceSpec{
 					{
 						Name:    "dotnet",
-						Port:    8080,
+						Port:    80,
 						Backend: &scaffold.Backend{},
 					},
 				},
@@ -59,7 +59,7 @@ func TestInitializer_infraSpecFromDetect(t *testing.T) {
 				Services: []scaffold.ServiceSpec{
 					{
 						Name:     "js",
-						Port:     8080,
+						Port:     80,
 						Frontend: &scaffold.Frontend{},
 					},
 				},
@@ -126,7 +126,7 @@ func TestInitializer_infraSpecFromDetect(t *testing.T) {
 					},
 					{
 						Name: "js",
-						Port: 8080,
+						Port: 80,
 						Frontend: &scaffold.Frontend{
 							Backends: []scaffold.ServiceReference{
 								{
@@ -185,7 +185,7 @@ func TestInitializer_infraSpecFromDetect(t *testing.T) {
 					},
 					{
 						Name: "js",
-						Port: 8080,
+						Port: 80,
 						Frontend: &scaffold.Frontend{
 							Backends: []scaffold.ServiceReference{
 								{
@@ -204,12 +204,13 @@ func TestInitializer_infraSpecFromDetect(t *testing.T) {
 				console: input.NewConsole(
 					false,
 					false,
-					os.Stdout,
+					input.Writers{Output: os.Stdout},
 					input.ConsoleHandles{
 						Stderr: os.Stderr,
 						Stdin:  strings.NewReader(strings.Join(tt.interactions, "\n") + "\n"),
 						Stdout: os.Stdout,
 					},
+					nil,
 					nil),
 			}
 

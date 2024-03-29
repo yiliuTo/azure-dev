@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/apimanagement/armapimanagement"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appconfiguration/armappconfiguration"
@@ -24,12 +25,14 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
 	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/convert"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
 	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/keyvault"
 	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/bicep"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
@@ -57,7 +60,7 @@ func TestBicepPlan(t *testing.T) {
 	require.Equal(t, infraProvider.env.GetLocation(), configuredParameters["location"].Value)
 	require.Equal(
 		t,
-		infraProvider.env.GetEnvName(),
+		infraProvider.env.Name(),
 		configuredParameters["environmentName"].Value,
 	)
 }
@@ -346,6 +349,7 @@ func createBicepProvider(t *testing.T, mockContext *mocks.MockContext) *BicepPro
 	env := environment.NewWithValues("test-env", map[string]string{
 		environment.LocationEnvVarName:       "westus2",
 		environment.SubscriptionIdEnvVarName: "SUBSCRIPTION_ID",
+		environment.EnvNameEnvVarName:        "test-env",
 	})
 
 	envManager := &mockenv.MockEnvManager{}
@@ -380,10 +384,19 @@ func createBicepProvider(t *testing.T, mockContext *mocks.MockContext) *BicepPro
 		envManager,
 		env,
 		mockContext.Console,
-		prompt.NewDefaultPrompter(env, mockContext.Console, accountManager, azCli),
+		prompt.NewDefaultPrompter(env, mockContext.Console, accountManager, azCli, cloud.AzurePublic().PortalUrlBase),
 		&mockCurrentPrincipal{},
 		mockContext.AlphaFeaturesManager,
 		clock.NewMock(),
+		keyvault.NewKeyVaultService(
+			mockaccount.SubscriptionCredentialProviderFunc(
+				func(_ context.Context, _ string) (azcore.TokenCredential, error) {
+					return mockContext.Credentials, nil
+				}),
+			mockContext.ArmClientOptions,
+			mockContext.CoreClientOptions,
+		),
+		cloud.AzurePublic().PortalUrlBase,
 	)
 
 	err = provider.Initialize(*mockContext.Context, projectDir, options)
@@ -918,10 +931,19 @@ func TestUserDefinedTypes(t *testing.T) {
 		&mockenv.MockEnvManager{},
 		env,
 		mockContext.Console,
-		prompt.NewDefaultPrompter(env, mockContext.Console, nil, nil),
+		prompt.NewDefaultPrompter(env, mockContext.Console, nil, nil, cloud.AzurePublic().PortalUrlBase),
 		&mockCurrentPrincipal{},
 		mockContext.AlphaFeaturesManager,
 		clock.NewMock(),
+		keyvault.NewKeyVaultService(
+			mockaccount.SubscriptionCredentialProviderFunc(
+				func(_ context.Context, _ string) (azcore.TokenCredential, error) {
+					return mockContext.Credentials, nil
+				}),
+			mockContext.ArmClientOptions,
+			mockContext.CoreClientOptions,
+		),
+		cloud.AzurePublic().PortalUrlBase,
 	)
 	bicepProvider, gooCast := provider.(*BicepProvider)
 	require.True(t, gooCast)
@@ -1020,6 +1042,77 @@ func TestUserDefinedTypes(t *testing.T) {
 	require.Equal(t, map[string]interface{}{
 		"foo": "bar",
 	}, customOutput.Metadata)
+}
+
+func Test_armParameterFileValue(t *testing.T) {
+	t.Run("NilValue", func(t *testing.T) {
+		actual := armParameterFileValue(ParameterTypeString, nil, nil)
+		require.Nil(t, actual)
+	})
+
+	t.Run("StringWithValue", func(t *testing.T) {
+		expected := "value"
+		actual := armParameterFileValue(ParameterTypeString, expected, nil)
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("EmptyString", func(t *testing.T) {
+		input := ""
+		actual := armParameterFileValue(ParameterTypeString, input, nil)
+		require.Nil(t, actual)
+	})
+
+	t.Run("EmptyStringWithNonEmptyDefault", func(t *testing.T) {
+		expected := ""
+		actual := armParameterFileValue(ParameterTypeString, expected, "not-empty")
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("EmptyStringWithEmptyDefault", func(t *testing.T) {
+		input := ""
+		actual := armParameterFileValue(ParameterTypeString, input, "")
+		require.Nil(t, actual)
+	})
+
+	t.Run("ValidBool", func(t *testing.T) {
+		expected := true
+		actual := armParameterFileValue(ParameterTypeBoolean, expected, nil)
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("ActualBool", func(t *testing.T) {
+		expected := true
+		actual := armParameterFileValue(ParameterTypeBoolean, "true", nil)
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("InvalidBool", func(t *testing.T) {
+		actual := armParameterFileValue(ParameterTypeBoolean, "NotABool", nil)
+		require.Nil(t, actual)
+	})
+
+	t.Run("ValidInt", func(t *testing.T) {
+		var expected int64 = 42
+		actual := armParameterFileValue(ParameterTypeNumber, "42", nil)
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("ActualInt", func(t *testing.T) {
+		var expected int64 = 42
+		actual := armParameterFileValue(ParameterTypeNumber, expected, nil)
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("InvalidInt", func(t *testing.T) {
+		actual := armParameterFileValue(ParameterTypeNumber, "NotAnInt", nil)
+		require.Nil(t, actual)
+	})
+
+	t.Run("Array", func(t *testing.T) {
+		expected := []string{"a", "b", "c"}
+		actual := armParameterFileValue(ParameterTypeArray, expected, nil)
+		require.Equal(t, expected, actual)
+	})
 }
 
 const userDefinedParamsSample = `{
@@ -1140,3 +1233,70 @@ const userDefinedParamsSample = `{
 		}
 	}
 }`
+
+func TestInputsParameter(t *testing.T) {
+	existingInputs := map[string]map[string]interface{}{
+		"resource1": {
+			"input1": "value1",
+		},
+		"resource2": {
+			"input2": "value2",
+		},
+	}
+
+	autoGenParameters := map[string]map[string]azure.AutoGenInput{
+		"resource1": {
+			"input1": {
+				Length: 10,
+			},
+			"input3": {
+				Length: 8,
+			},
+		},
+		"resource2": {
+			"input2": {
+				Length: 12,
+			},
+		},
+		"resource3": {
+			"input4": {
+				Length: 6,
+			},
+		},
+	}
+
+	expectedInputsParameter := map[string]map[string]interface{}{
+		"resource1": {
+			"input1": "value1",
+			"input3": "to-be-gen-with-len-8",
+		},
+		"resource2": {
+			"input2": "value2",
+		},
+		"resource3": {
+			"input4": "to-be-gen-with-len-6",
+		},
+	}
+
+	expectedInputsUpdated := true
+
+	inputsParameter, inputsUpdated, err := inputsParameter(existingInputs, autoGenParameters)
+
+	require.NoError(t, err)
+	result, parse := inputsParameter.Value.(map[string]map[string]interface{})
+	require.True(t, parse)
+
+	require.Equal(
+		t, expectedInputsParameter["resource1"]["input1"], result["resource1"]["input1"])
+	// generated - only check length
+	require.Equal(
+		t, autoGenParameters["resource1"]["input3"].Length, uint(len(result["resource1"]["input3"].(string))))
+
+	require.Equal(t, expectedInputsParameter["resource2"], result["resource2"])
+
+	// generated - only check length
+	require.Equal(
+		t, autoGenParameters["resource3"]["input4"].Length, uint(len(result["resource3"]["input4"].(string))))
+
+	require.Equal(t, expectedInputsUpdated, inputsUpdated)
+}

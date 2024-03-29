@@ -83,10 +83,17 @@ const (
 	ProjectNameKey = attribute.Key("project.name")
 	// The collection of hashed service hosts in the project.
 	ProjectServiceHostsKey = attribute.Key("project.service.hosts")
+	// The collection of service targets (resolved service hosts) in the project.
+	ProjectServiceTargetsKey = attribute.Key("project.service.targets")
 	// The collection of hashed service languages in the project.
 	ProjectServiceLanguagesKey = attribute.Key("project.service.languages")
 	// The service language being executed.
 	ProjectServiceLanguageKey = attribute.Key("project.service.language")
+)
+
+// Platform related attributes for integrations like devcenter / ADE
+const (
+	PlatformTypeKey = attribute.Key("platform.type")
 )
 
 // Environment related attributes
@@ -243,4 +250,18 @@ const (
 
 	// The last step recorded during the app init process.
 	AppInitLastStep = attribute.Key("appinit.lastStep")
+)
+
+// JSON-RPC related fields
+const (
+	// Logical name of the method from the RPC interface
+	// perspective, which can be different from the name of any implementing
+	// method/function. See semconv.RPCMethodKey.
+	RpcMethod = semconv.RPCMethodKey
+
+	// `id` property of JSON-RPC request or response.
+	JsonRpcId = semconv.RPCJsonrpcRequestIDKey
+
+	// `error_code` property of JSON-RPC request or response. Type: int.
+	JsonRpcErrorCode = semconv.RPCJsonrpcErrorCodeKey
 )

@@ -31,6 +31,12 @@ param webAppExists bool = false
 @description('Flag to use Azure API Management to mediate the calls between the Web frontend and the backend API')
 param useAPIM bool = false
 
+@description('Hostname suffix for container registry. Set when deploying to sovereign clouds')
+param containerRegistryHostSuffix string = 'azurecr.io'
+
+@description('API Management SKU to use if APIM is enabled')
+param apimSku string = 'Consumption'
+
 @description('Id of the user or app to assign application roles')
 param principalId string = ''
 
@@ -60,6 +66,13 @@ module containerApps '../../../../../../common/infra/bicep/core/host/container-a
     tags: tags
     containerAppsEnvironmentName: !empty(containerAppsEnvironmentName) ? containerAppsEnvironmentName : '${abbrs.appManagedEnvironments}${resourceToken}'
     containerRegistryName: !empty(containerRegistryName) ? containerRegistryName : '${abbrs.containerRegistryRegistries}${resourceToken}'
+    // Work around Azure/azure-dev#3157 (the root cause of which is Azure/acr#723) by explicitly enabling the admin user to allow users which
+    // don't have the `Owner` role granted (and instead are classic administrators) to access the registry to push even if AAD authentication fails.
+    //
+    // This addresses the following error during deploy:
+    //
+    // failed getting ACR token: POST https://<some-random-name>.azurecr.io/oauth2/exchange 401 Unauthorized
+    containerRegistryAdminUserEnabled: true
     logAnalyticsWorkspaceName: monitoring.outputs.logAnalyticsWorkspaceName
     applicationInsightsName: monitoring.outputs.applicationInsightsName
   }
@@ -74,10 +87,9 @@ module web '../../../../../common/infra/bicep/app/web-container-app.bicep' = {
     location: location
     tags: tags
     identityName: '${abbrs.managedIdentityUserAssignedIdentities}web-${resourceToken}'
-    apiBaseUrl: !empty(webApiBaseUrl) ? webApiBaseUrl : api.outputs.SERVICE_API_URI
-    applicationInsightsName: monitoring.outputs.applicationInsightsName
     containerAppsEnvironmentName: containerApps.outputs.environmentName
     containerRegistryName: containerApps.outputs.registryName
+    containerRegistryHostSuffix: containerRegistryHostSuffix
     exists: webAppExists
   }
 }
@@ -94,6 +106,7 @@ module api '../../../../../common/infra/bicep/app/api-container-app.bicep' = {
     applicationInsightsName: monitoring.outputs.applicationInsightsName
     containerAppsEnvironmentName: containerApps.outputs.environmentName
     containerRegistryName: containerApps.outputs.registryName
+    containerRegistryHostSuffix: containerRegistryHostSuffix
     keyVaultName: keyVault.outputs.name
     corsAcaUrl: corsAcaUrl
     exists: apiAppExists
@@ -144,6 +157,7 @@ module apim '../../../../../../common/infra/bicep/core/gateway/apim.bicep' = if 
   scope: rg
   params: {
     name: !empty(apimServiceName) ? apimServiceName : '${abbrs.apiManagementService}${resourceToken}'
+    sku: apimSku
     location: location
     tags: tags
     applicationInsightsName: monitoring.outputs.applicationInsightsName
@@ -180,8 +194,7 @@ output AZURE_KEY_VAULT_ENDPOINT string = keyVault.outputs.endpoint
 output AZURE_KEY_VAULT_NAME string = keyVault.outputs.name
 output AZURE_LOCATION string = location
 output AZURE_TENANT_ID string = tenant().tenantId
-output REACT_APP_API_BASE_URL string = useAPIM ? apimApi.outputs.SERVICE_API_URI : api.outputs.SERVICE_API_URI
-output REACT_APP_APPLICATIONINSIGHTS_CONNECTION_STRING string = monitoring.outputs.applicationInsightsConnectionString
+output API_BASE_URL string = useAPIM ? apimApi.outputs.SERVICE_API_URI : api.outputs.SERVICE_API_URI
 output REACT_APP_WEB_BASE_URL string = web.outputs.SERVICE_WEB_URI
 output SERVICE_API_NAME string = api.outputs.SERVICE_API_NAME
 output SERVICE_WEB_NAME string = web.outputs.SERVICE_WEB_NAME

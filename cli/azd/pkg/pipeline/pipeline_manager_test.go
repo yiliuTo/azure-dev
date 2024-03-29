@@ -13,7 +13,9 @@ import (
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
 	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/project"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/git"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/github"
@@ -49,7 +51,7 @@ func Test_PipelineManager_Initialize(t *testing.T) {
 		manager, err := createPipelineManager(t, mockContext, azdContext, nil, nil)
 		assert.Nil(t, manager)
 		assert.ErrorContains(
-			t, err, "finding pipeline provider: reading project file:")
+			t, err, "Loading project configuration: reading project file:")
 		os.Remove(ghFolder)
 	})
 
@@ -96,7 +98,14 @@ func Test_PipelineManager_Initialize(t *testing.T) {
 		err := os.MkdirAll(azdoFolder, osutil.PermissionDirectory)
 		assert.NoError(t, err)
 
-		file, err := os.Create(filepath.Join(tempDir, azdoYml))
+		infraFolder := filepath.Join(tempDir, "infra")
+		err = os.MkdirAll(infraFolder, osutil.PermissionDirectory)
+		assert.NoError(t, err)
+		file, err := os.Create(filepath.Join(infraFolder, "main.foo"))
+		file.Close()
+		assert.NoError(t, err)
+
+		file, err = os.Create(filepath.Join(tempDir, azdoYml))
 		file.Close()
 		assert.NoError(t, err)
 
@@ -105,9 +114,9 @@ func Test_PipelineManager_Initialize(t *testing.T) {
 		env := environment.NewWithValues("test-env", envValues)
 
 		manager, err := createPipelineManager(t, mockContext, azdContext, env, nil)
+		assert.NoError(t, err)
 		assert.IsType(t, &AzdoScmProvider{}, manager.scmProvider)
 		assert.IsType(t, &AzdoCiProvider{}, manager.ciProvider)
-		assert.NoError(t, err)
 
 		os.Remove(azdoFolder)
 	})
@@ -403,16 +412,24 @@ func createPipelineManager(
 	envManager := &mockenv.MockEnvManager{}
 	envManager.On("Save", mock.Anything, env).Return(nil)
 
+	adService := azcli.NewAdService(
+		mockContext.SubscriptionCredentialProvider,
+		mockContext.ArmClientOptions,
+		mockContext.CoreClientOptions,
+	)
+
 	// Singletons
-	mockContext.Container.RegisterSingleton(func() context.Context { return *mockContext.Context })
-	mockContext.Container.RegisterSingleton(func() *azdcontext.AzdContext { return azdContext })
-	mockContext.Container.RegisterSingleton(func() environment.Manager { return envManager })
-	mockContext.Container.RegisterSingleton(func() *environment.Environment { return env })
-	mockContext.Container.RegisterSingleton(github.NewGitHubCli)
-	mockContext.Container.RegisterSingleton(git.NewGitCli)
-	mockContext.Container.RegisterSingleton(func() account.SubscriptionCredentialProvider {
-		return mockContext.SubscriptionCredentialProvider
-	})
+	ioc.RegisterInstance(mockContext.Container, *mockContext.Context)
+	ioc.RegisterInstance(mockContext.Container, azdContext)
+	ioc.RegisterInstance[environment.Manager](mockContext.Container, envManager)
+	ioc.RegisterInstance(mockContext.Container, env)
+	ioc.RegisterInstance(mockContext.Container, adService)
+	ioc.RegisterInstance[account.SubscriptionCredentialProvider](
+		mockContext.Container,
+		mockContext.SubscriptionCredentialProvider,
+	)
+	mockContext.Container.MustRegisterSingleton(github.NewGitHubCli)
+	mockContext.Container.MustRegisterSingleton(git.NewGitCli)
 
 	// Pipeline providers
 	pipelineProviderMap := map[string]any{
@@ -423,19 +440,19 @@ func createPipelineManager(
 	}
 
 	for provider, constructor := range pipelineProviderMap {
-		err := mockContext.Container.RegisterNamedSingleton(string(provider), constructor)
-		assert.NoError(t, err)
+		mockContext.Container.MustRegisterNamedSingleton(string(provider), constructor)
 	}
 
 	return NewPipelineManager(
 		*mockContext.Context,
 		envManager,
-		azcli.NewAdService(mockContext.SubscriptionCredentialProvider, mockContext.HttpClient),
+		adService,
 		git.NewGitCli(mockContext.CommandRunner),
 		azdContext,
 		env,
 		mockContext.Console,
 		args,
 		mockContext.Container,
+		project.NewImportManager(nil),
 	)
 }

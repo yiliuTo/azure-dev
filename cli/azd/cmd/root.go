@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,9 +15,12 @@ import (
 
 	// Importing for infrastructure provider plugin registrations
 
+	"github.com/azure/azure-dev/cli/azd/pkg/azd"
 	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/platform"
 
 	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/cmd"
 	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/spf13/cobra"
@@ -25,7 +29,13 @@ import (
 // Creates the root Cobra command for AZD.
 // staticHelp - False, except for running for doc generation
 // middlewareChain - nil, except for running unit tests
-func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistration) *cobra.Command {
+// rootContainer - The IoC container to use for registering and resolving dependencies. If nil is provided, a new
+// container empty will be created.
+func NewRootCmd(
+	staticHelp bool,
+	middlewareChain []*actions.MiddlewareRegistration,
+	rootContainer *ioc.NestedContainer,
+) *cobra.Command {
 	prevDir := ""
 	opts := &internal.GlobalCommandOptions{GenerateStaticHelp: staticHelp}
 	opts.EnableTelemetry = telemetry.IsTelemetryEnabled()
@@ -39,6 +49,12 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 		Use:   "azd",
 		Short: fmt.Sprintf("%s is an open-source tool that helps onboard and manage your application on Azure", productName),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// If there was a platform configuration error report it to the user until it is resolved
+			// Using fmt.Printf directly here since we can't leverage our IoC container to resolve a console instance
+			if errors.Is(platform.Error, platform.ErrPlatformNotSupported) {
+				fmt.Print(output.WithWarningFormat("WARNING: %s\n\n", platform.Error.Error()))
+			}
+
 			if opts.Cwd != "" {
 				current, err := os.Getwd()
 
@@ -124,12 +140,23 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 		},
 	})
 
+	root.Add("vs-server", &actions.ActionDescriptorOptions{
+		Command:        newVsServerCmd(),
+		FlagsResolver:  newVsServerFlags,
+		ActionResolver: newVsServerAction,
+		OutputFormats:  []output.Format{output.NoneFormat},
+		DefaultFormat:  output.NoneFormat,
+	})
+
 	root.Add("show", &actions.ActionDescriptorOptions{
 		Command:        newShowCmd(),
 		FlagsResolver:  newShowFlags,
 		ActionResolver: newShowAction,
-		OutputFormats:  []output.Format{output.JsonFormat},
+		OutputFormats:  []output.Format{output.JsonFormat, output.NoneFormat},
 		DefaultFormat:  output.NoneFormat,
+		GroupingOptions: actions.CommandGroupOptions{
+			RootLevelHelp: actions.CmdGroupMonitor,
+		},
 	})
 
 	//deprecate:cmd hide login
@@ -162,7 +189,7 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 		GroupingOptions: actions.CommandGroupOptions{
 			RootLevelHelp: actions.CmdGroupConfig,
 		},
-	}).AddFlagCompletion("template", templateNameCompletion)
+	})
 
 	root.
 		Add("restore", &actions.ActionDescriptorOptions{
@@ -193,13 +220,13 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 
 	root.
 		Add("provision", &actions.ActionDescriptorOptions{
-			Command:        newProvisionCmd(),
-			FlagsResolver:  newProvisionFlags,
-			ActionResolver: newProvisionAction,
+			Command:        cmd.NewProvisionCmd(),
+			FlagsResolver:  cmd.NewProvisionFlags,
+			ActionResolver: cmd.NewProvisionAction,
 			OutputFormats:  []output.Format{output.JsonFormat, output.NoneFormat},
 			DefaultFormat:  output.NoneFormat,
 			HelpOptions: actions.ActionHelpOptions{
-				Description: getCmdProvisionHelpDescription,
+				Description: cmd.GetCmdProvisionHelpDescription,
 				Footer:      getCmdHelpDefaultFooter,
 			},
 			GroupingOptions: actions.CommandGroupOptions{
@@ -233,14 +260,14 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 
 	root.
 		Add("deploy", &actions.ActionDescriptorOptions{
-			Command:        newDeployCmd(),
-			FlagsResolver:  newDeployFlags,
-			ActionResolver: newDeployAction,
+			Command:        cmd.NewDeployCmd(),
+			FlagsResolver:  cmd.NewDeployFlags,
+			ActionResolver: cmd.NewDeployAction,
 			OutputFormats:  []output.Format{output.JsonFormat, output.NoneFormat},
 			DefaultFormat:  output.NoneFormat,
 			HelpOptions: actions.ActionHelpOptions{
-				Description: getCmdDeployHelpDescription,
-				Footer:      getCmdDeployHelpFooter,
+				Description: cmd.GetCmdDeployHelpDescription,
+				Footer:      cmd.GetCmdDeployHelpFooter,
 			},
 			GroupingOptions: actions.CommandGroupOptions{
 				RootLevelHelp: actions.CmdGroupManage,
@@ -309,10 +336,26 @@ func NewRootCmd(staticHelp bool, middlewareChain []*actions.MiddlewareRegistrati
 			return !descriptor.Options.DisableTelemetry
 		})
 
-	registerCommonDependencies(ioc.Global)
-	cobraBuilder := NewCobraBuilder(ioc.Global)
+	// Register common dependencies for the IoC rootContainer
+	if rootContainer == nil {
+		rootContainer = ioc.NewNestedContainer(nil)
+	}
+	ioc.RegisterNamedInstance(rootContainer, "root-cmd", rootCmd)
+	registerCommonDependencies(rootContainer)
+
+	// Initialize the platform specific components for the IoC container
+	// Only container resolution errors will return an error
+	// Invalid configurations will fall back to default platform
+	if _, err := platform.Initialize(rootContainer, azd.PlatformKindDefault); err != nil {
+		panic(err)
+	}
 
 	// Compose the hierarchy of action descriptions into cobra commands
+	var cobraBuilder *CobraBuilder
+	if err := rootContainer.Resolve(&cobraBuilder); err != nil {
+		panic(err)
+	}
+
 	cmd, err := cobraBuilder.BuildCommand(root)
 
 	if err != nil {

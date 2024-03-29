@@ -2,15 +2,17 @@ package containerapps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appcontainers/armappcontainers/v2"
 	azdinternal "github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
-	"github.com/azure/azure-dev/cli/azd/pkg/azsdk"
 	"github.com/azure/azure-dev/cli/azd/pkg/convert"
 	"github.com/azure/azure-dev/cli/azd/pkg/httputil"
 	"github.com/benbjohnson/clock"
+	"gopkg.in/yaml.v3"
 )
 
 // ContainerAppService exposes operations for managing Azure Container Apps
@@ -22,6 +24,13 @@ type ContainerAppService interface {
 		resourceGroup,
 		appName string,
 	) (*ContainerAppIngressConfiguration, error)
+	DeployYaml(
+		ctx context.Context,
+		subscriptionId string,
+		resourceGroupName string,
+		appName string,
+		containerAppYaml []byte,
+	) error
 	// Adds and activates a new revision to the specified container app
 	AddRevision(
 		ctx context.Context,
@@ -30,6 +39,11 @@ type ContainerAppService interface {
 		appName string,
 		imageName string,
 	) error
+	ListSecrets(ctx context.Context,
+		subscriptionId string,
+		resourceGroupName string,
+		appName string,
+	) ([]*armappcontainers.ContainerAppSecret, error)
 }
 
 // NewContainerAppService creates a new ContainerAppService
@@ -37,12 +51,14 @@ func NewContainerAppService(
 	credentialProvider account.SubscriptionCredentialProvider,
 	httpClient httputil.HttpClient,
 	clock clock.Clock,
+	armClientOptions *arm.ClientOptions,
 ) ContainerAppService {
 	return &containerAppService{
 		credentialProvider: credentialProvider,
 		httpClient:         httpClient,
 		userAgent:          azdinternal.UserAgent(),
 		clock:              clock,
+		armClientOptions:   armClientOptions,
 	}
 }
 
@@ -51,6 +67,7 @@ type containerAppService struct {
 	httpClient         httputil.HttpClient
 	userAgent          string
 	clock              clock.Clock
+	armClientOptions   *arm.ClientOptions
 }
 
 type ContainerAppIngressConfiguration struct {
@@ -82,6 +99,46 @@ func (cas *containerAppService) GetIngressConfiguration(
 	return &ContainerAppIngressConfiguration{
 		HostNames: hostNames,
 	}, nil
+}
+
+func (cas *containerAppService) DeployYaml(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	appName string,
+	containerAppYaml []byte,
+) error {
+	appClient, err := cas.createContainerAppsClient(ctx, subscriptionId)
+	if err != nil {
+		return err
+	}
+
+	var obj map[string]any
+	if err := yaml.Unmarshal(containerAppYaml, &obj); err != nil {
+		return fmt.Errorf("decoding yaml: %w", err)
+	}
+
+	containerAppJson, err := json.Marshal(obj)
+	if err != nil {
+		panic("should not have failed")
+	}
+
+	var containerApp armappcontainers.ContainerApp
+	if err := json.Unmarshal(containerAppJson, &containerApp); err != nil {
+		return fmt.Errorf("converting to container app type: %w", err)
+	}
+
+	poller, err := appClient.BeginCreateOrUpdate(ctx, resourceGroupName, appName, containerApp, nil)
+	if err != nil {
+		return fmt.Errorf("applying manifest: %w", err)
+	}
+
+	_, err = poller.PollUntilDone(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("polling for container app update completion: %w", err)
+	}
+
+	return nil
 }
 
 // Adds and activates a new revision to the specified container app
@@ -137,6 +194,25 @@ func (cas *containerAppService) AddRevision(
 	}
 
 	return nil
+}
+
+func (cas *containerAppService) ListSecrets(
+	ctx context.Context,
+	subscriptionId string,
+	resourceGroupName string,
+	appName string,
+) ([]*armappcontainers.ContainerAppSecret, error) {
+	appClient, err := cas.createContainerAppsClient(ctx, subscriptionId)
+	if err != nil {
+		return nil, err
+	}
+
+	secretsResponse, err := appClient.ListSecrets(ctx, resourceGroupName, appName, nil)
+	if err != nil {
+		return nil, fmt.Errorf("listing secrets: %w", err)
+	}
+
+	return secretsResponse.Value, nil
 }
 
 func (cas *containerAppService) syncSecrets(
@@ -253,8 +329,7 @@ func (cas *containerAppService) createContainerAppsClient(
 		return nil, err
 	}
 
-	options := azsdk.DefaultClientOptionsBuilder(ctx, cas.httpClient, cas.userAgent).BuildArmClientOptions()
-	client, err := armappcontainers.NewContainerAppsClient(subscriptionId, credential, options)
+	client, err := armappcontainers.NewContainerAppsClient(subscriptionId, credential, cas.armClientOptions)
 	if err != nil {
 		return nil, fmt.Errorf("creating ContainerApps client: %w", err)
 	}
@@ -271,8 +346,7 @@ func (cas *containerAppService) createRevisionsClient(
 		return nil, err
 	}
 
-	options := azsdk.DefaultClientOptionsBuilder(ctx, cas.httpClient, cas.userAgent).BuildArmClientOptions()
-	client, err := armappcontainers.NewContainerAppsRevisionsClient(subscriptionId, credential, options)
+	client, err := armappcontainers.NewContainerAppsRevisionsClient(subscriptionId, credential, cas.armClientOptions)
 	if err != nil {
 		return nil, fmt.Errorf("creating ContainerApps client: %w", err)
 	}

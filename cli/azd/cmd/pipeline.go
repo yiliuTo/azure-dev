@@ -26,7 +26,7 @@ import (
 type pipelineConfigFlags struct {
 	pipeline.PipelineManagerArgs
 	global *internal.GlobalCommandOptions
-	envFlag
+	internal.EnvFlag
 }
 
 func (pc *pipelineConfigFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
@@ -66,7 +66,7 @@ func (pc *pipelineConfigFlags) Bind(local *pflag.FlagSet, global *internal.Globa
 	// there no customer input using --provider
 	local.StringVar(&pc.PipelineProvider, "provider", "",
 		"The pipeline provider to use (github for Github Actions and azdo for Azure Pipelines).")
-	pc.envFlag.Bind(local, global)
+	pc.EnvFlag.Bind(local, global)
 	pc.global = global
 }
 
@@ -123,6 +123,7 @@ type pipelineConfigAction struct {
 	console             input.Console
 	prompters           prompt.Prompter
 	projectConfig       *project.ProjectConfig
+	importManager       *project.ImportManager
 }
 
 func newPipelineConfigAction(
@@ -133,6 +134,7 @@ func newPipelineConfigAction(
 	prompters prompt.Prompter,
 	manager *pipeline.PipelineManager,
 	provisioningManager *provisioning.Manager,
+	importManager *project.ImportManager,
 	projectConfig *project.ProjectConfig,
 ) actions.Action {
 	pca := &pipelineConfigAction{
@@ -142,6 +144,7 @@ func newPipelineConfigAction(
 		console:             console,
 		prompters:           prompters,
 		provisioningManager: provisioningManager,
+		importManager:       importManager,
 		projectConfig:       projectConfig,
 	}
 
@@ -150,7 +153,13 @@ func newPipelineConfigAction(
 
 // Run implements action interface
 func (p *pipelineConfigAction) Run(ctx context.Context) (*actions.ActionResult, error) {
-	err := p.provisioningManager.Initialize(ctx, p.projectConfig.Path, p.projectConfig.Infra)
+	infra, err := p.importManager.ProjectInfrastructure(ctx, p.projectConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = infra.Cleanup() }()
+
+	err = p.provisioningManager.Initialize(ctx, p.projectConfig.Path, infra.Options)
 	if err != nil {
 		return nil, err
 	}
