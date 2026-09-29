@@ -159,7 +159,7 @@ To demonstrate fail-fast behavior, first run with the sandbox label missing.
 The error identifies the cluster, the failed property, the observed state and
 the expected state, with remediation. No prerequisite mutation or Foundry
 deployment is submitted. Correct the label on the Kata pool, then rerun the same
-`azd provision` command to demonstrate preparation followed by Foundry creation.
+`azd provision` command to exercise preparation and attempt Foundry creation.
 
 **Boundaries:** this demo supports only new accounts using the embedded
 `microsoft.foundry` template. Deploying BYO AKS with ejected Bicep is rejected;
@@ -171,10 +171,37 @@ of preflight across Portal, other CLIs or direct ARM callers.
 The checks do not prove storage data-plane reachability, available subnet
 capacity, or that a new role assignment is already effective. RBAC propagation
 can cause the immediate Foundry request to fail even after preparation succeeds.
-The service error is preserved; retry `azd provision` after propagation rather
-than relying on a fixed sleep. Successful preparation is retained after later
-failures and is reused on retry. `azd down` does not undo these changes to
-customer-owned identities, AKS, storage or the agent subnet.
+The service error is preserved. Diagnose persistent authorization failures
+rather than repeatedly retrying or assuming a fixed sleep proves readiness.
+Successful preparation is retained after later failures and is reused on retry.
+`azd down` does not undo these changes to customer-owned identities, AKS, storage
+or the agent subnet.
+
+**Live validation results (2026-09-29, West US 2):**
+
+| Scenario | Observed result |
+|---|---|
+| Missing sandbox label | Native `azd provision` failed preflight. Cloud checks confirmed no role assignments, subnet delegation or Foundry resources were created. |
+| Corrected sandbox label | Native `azd provision` created the six resource-scoped roles listed above and the agent subnet delegation before submitting the Foundry deployment. |
+| Repeated provisioning | Existing roles and delegation were reused. All six assignment IDs, creation/update timestamps and the subnet ETag remained unchanged across the first two attempts. |
+| Foundry account and project | The account reached `Failed` with a service-side Trusted Access authorization error (403), and the project list was empty. End-to-end account/project success remains unverified. |
+
+Three native provisioning attempts returned the same error:
+
+> The hosting-management identity is not authorized to manage Trusted Access bindings on the configured AKS cluster.
+
+The final attempt started 24 minutes after the initial role assignments. Neither
+elapsed time nor visible assignments proves that authorization is effective.
+Likewise, an account appearing in a resource list does not mean its provisioning
+state is `Succeeded`. This error alone does not establish RBAC propagation or
+preview enrollment as the cause.
+
+For reproduction and diagnosis, retain the sanitized nested deployment error,
+failure time in UTC, and azd/extension versions. Obtain the original provider
+`ErrorCode`, denied action and scope, and request/correlation IDs for the failing
+operation. If only the wrapped error is exposed, request those details from the
+service owner through an approved support channel before changing permissions.
+Do not broaden role scopes or bypass service checks based on this message alone.
 
 To reconcile deployments, connections, or a pending container registry on an existing project, set the project's full ARM resource ID in the active azd environment:
 
