@@ -20,6 +20,8 @@ const (
 	CodeOnDiskParametersInvalid  = "ondisk_parameters_invalid"
 	CodeOnDiskTemplateMissing    = "ondisk_template_missing"
 	CodeArmWhatIfFailed          = "arm_what_if_failed"
+	CodeBYOAKSPreflightFailed    = "byo_aks_preflight_failed"
+	CodeBYOAKSUnsupported        = "byo_aks_unsupported"
 )
 
 // Error codes commonly used for dependency errors.
@@ -53,4 +55,6 @@ const (
 	OpCognitiveDeploymentDelete = "cognitive_deployment_delete"
 	OpProjectConnectionDelete   = "project_connection_delete"
 	OpProjectConnectionGet      = "project_connection_get"
+	OpBYOAKSPreflight           = "byo_aks_preflight"
+	OpBYOAKSPrepare             = "byo_aks_prepare"
 )

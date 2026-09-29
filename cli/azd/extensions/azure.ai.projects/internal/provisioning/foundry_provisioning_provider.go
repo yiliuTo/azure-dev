@@ -88,6 +88,7 @@ type FoundryProvisioningProvider struct {
 	foundryName                 string
 	principalID                 string
 	credential                  azcore.TokenCredential
+	armClientOptions            *arm.ClientOptions
 	tenantID                    string          // resolved lazily by ensureCredential; surfaced as AZURE_TENANT_ID
 	armTemplate                 map[string]any  // embedded ARM JSON; nil when onDiskSource is set
 	onDiskSource                *templateSource // non-nil when configured on-disk Bicep exists
@@ -1220,6 +1221,10 @@ func (p *FoundryProvisioningProvider) Deploy(
 		return nil, err
 	}
 
+	if err := p.prepareBYOAKS(ctx, src, progress); err != nil {
+		return nil, err
+	}
+
 	dep := armresources.Deployment{
 		Location: new(p.location),
 		Properties: &armresources.DeploymentProperties{
@@ -2144,7 +2149,7 @@ func (p *FoundryProvisioningProvider) deploymentsClient(ctx context.Context) (*a
 	if err := p.ensureCredential(ctx); err != nil {
 		return nil, err
 	}
-	factory, err := armresources.NewClientFactory(p.subID, p.credential, nil)
+	factory, err := armresources.NewClientFactory(p.subID, p.credential, p.armClientOptions)
 	if err != nil {
 		return nil, exterrors.Internal(
 			exterrors.CodeAzdClientFailed,
@@ -2391,7 +2396,7 @@ func (p *FoundryProvisioningProvider) lookupResourceGroupState(
 	if p.resourceGroupState != nil {
 		return p.resourceGroupState(ctx)
 	}
-	factory, err := armresources.NewClientFactory(p.subID, p.credential, nil)
+	factory, err := armresources.NewClientFactory(p.subID, p.credential, p.armClientOptions)
 	if err != nil {
 		return nil, false, exterrors.Internal(
 			exterrors.CodeAzdClientFailed,

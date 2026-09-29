@@ -89,6 +89,13 @@ For extensions that are still in development or preview, consider publishing to 
 - **Error handling** — Use `ServiceError` for Azure API errors and `LocalError` for client-side errors
 - **Telemetry** — Follow pattern-based classification (e.g., `ext.service.<errorCode>`)
 
+When a provisioning provider prepares customer-owned resources, keep its
+resource checks read-only and its mutations in Deploy, not Initialize, synthesis
+or Preview. Complete preflight before applying changes, surface required
+preparation failures, and show the exact identities and resource scopes being
+changed. The [Foundry BYO AKS demo](../../cli/azd/extensions/azure.ai.projects/README.md#automatic-preparation-in-this-demo-branch)
+illustrates this ordering and documents its provider-specific boundaries.
+
 ## Detailed Reference
 
 For comprehensive extension development documentation, see:
