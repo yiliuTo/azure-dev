@@ -22,6 +22,7 @@ import (
 const (
 	byoTestSubscription = "00000000-0000-0000-0000-000000000001"
 	byoTestScope        = "/subscriptions/" + byoTestSubscription + "/resourceGroups/customer"
+	byoTestFoundryRG    = "/subscriptions/" + byoTestSubscription + "/resourceGroups/foundry"
 	byoTestCluster      = byoTestScope + "/providers/Microsoft.ContainerService/managedClusters/aks"
 	byoTestVNet         = byoTestScope + "/providers/Microsoft.Network/virtualNetworks/vnet"
 	byoTestNodeSubnet   = byoTestVNet + "/subnets/nodes"

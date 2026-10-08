@@ -73,13 +73,15 @@ Projects without `agentHosting` keep their existing behavior.
 
 All requests use the identity logged in through `azd auth login`, not either
 managed identity. The caller needs read access to the referenced resources and
-their role assignments, `Microsoft.Authorization/roleAssignments/write` at the
-three resource scopes listed below, and
+`Microsoft.Authorization/roleAssignments/read` and
+`Microsoft.Authorization/roleAssignments/write` at the Foundry resource group,
+AKS cluster, workload UAMI and storage account scopes listed below, and
 `Microsoft.Network/virtualNetworks/subnets/write` on the agent subnet.
-The caller also needs the usual permission to provision the Foundry resource
-group and its resources. azd does not elevate the caller or grant either managed
-identity a network role. A denied read or required preparation operation stops
-provisioning; it is not a warning that allows Foundry creation to continue.
+The caller also needs permission to read and, when absent, create the Foundry
+resource group, plus the usual permission to provision its resources. azd does
+not elevate the caller or grant either managed identity a network role. A denied
+read or required preparation operation stops provisioning; it is not a warning
+that allows Foundry creation to continue.
 
 The preflight checks:
 
@@ -105,23 +107,33 @@ The preflight checks:
   requirement.
 
 The service chooses its hosting backend. To accommodate both the Kubernetes
-extension and Helm backends, this demo prepares the following **union of six
-resource-scoped roles**. This is not a claim that every backend requires all six.
+extension and Helm backends, this demo prepares the following **six role
+assignments across four scopes**. This is not a claim that every backend requires
+all six.
 
 | Identity | Scope | Role | Role definition ID |
 |---|---|---|---|
 | Hosting management UAMI | AKS resource | Azure Kubernetes Service Contributor Role | `ed7f3fbd-7b88-4dd4-9017-9adb7ce333f8` |
 | Hosting management UAMI | AKS resource | Azure Kubernetes Service RBAC Cluster Admin | `b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b` |
 | Hosting management UAMI | AKS resource | Kubernetes Extension Contributor | `85cb6faf-e071-4c9b-8136-154b5a04f717` |
-| Hosting management UAMI | AKS resource | Reader | `acdd72a7-3385-48ef-bd42-f606fba81ae7` |
+| Hosting management UAMI | Foundry resource group | Reader | `acdd72a7-3385-48ef-bd42-f606fba81ae7` |
 | Hosting management UAMI | Workload UAMI resource | Managed Identity Federated Identity Credential Contributor | `7e559ce2-48d7-4b27-9128-fa1b247f1308` |
 | Workload UAMI | Storage account resource | Storage Blob Data Contributor | `ba92f5b4-2d11-453d-a403-e96b0029c9fe` |
 
 azd reads the actual UAMI principal IDs before checking or assigning roles.
 Existing unconditional assignments of these roles at the target or an inherited
 scope are reused; a blob-container-only assignment does not satisfy the storage
-account scope. No role is newly assigned at resource-group or subscription scope.
-The workload identity receives no AKS management permission.
+account scope. No role is newly assigned at subscription scope. The workload
+identity receives no AKS management permission.
+
+The preflight finishes before azd creates or changes any resource. After it
+passes, azd reads the Foundry resource group. If the group is absent, azd creates
+it with the same location and tags used by the main Foundry template and records
+the group in the azd environment before preparing roles. If it already exists,
+azd does not update its tags. The main deployment then reuses the group rather
+than redeclaring it. A group created before a later preparation or service
+failure remains available for an idempotent retry and for normal `azd down`
+cleanup.
 
 If the agent subnet has no delegation, azd adds `Microsoft.App/environments`,
 retaining the other returned subnet properties, including NSG, route table, NAT
@@ -131,6 +143,11 @@ delegations. The planned scopes, principals and changes are displayed before
 preparation starts. Both the role assignments and delegation are idempotent.
 Federated identity credentials and trusted access are not pre-created; the
 Foundry service owns its workload federation setup.
+
+Upgrading from an earlier demo build is non-destructive. azd adds or reuses the
+Foundry resource-group Reader assignment but does not remove an existing Reader
+assignment from the AKS resource. Review and remove obsolete customer-owned role
+assignments separately only after confirming they are no longer required.
 
 After saving the `azure.yaml` above in a new project directory, supply the
 existing resource IDs and an explicit, dedicated Foundry resource group:
@@ -177,14 +194,15 @@ Successful preparation is retained after later failures and is reused on retry.
 `azd down` does not undo these changes to customer-owned identities, AKS, storage
 or the agent subnet.
 
-**Live validation results (2026-09-29, West US 2):**
+**Historical live validation results (2026-09-29 and 2026-09-30, West US 2):**
 
 | Scenario | Observed result |
 |---|---|
 | Missing sandbox label | Native `azd provision` failed preflight. Cloud checks confirmed no role assignments, subnet delegation or Foundry resources were created. |
-| Corrected sandbox label | Native `azd provision` created the six resource-scoped roles listed above and the agent subnet delegation before submitting the Foundry deployment. |
-| Repeated provisioning | Existing roles and delegation were reused. All six assignment IDs, creation/update timestamps and the subnet ETag remained unchanged across the first two attempts. |
-| Foundry account and project | The account reached `Failed` with a service-side Trusted Access authorization error (403), and the project list was empty. End-to-end account/project success remains unverified. |
+| Corrected sandbox label with the earlier build | Native `azd provision` created six assignments, including Reader on AKS instead of the Foundry resource group, and added the agent subnet delegation before submitting the Foundry deployment. |
+| Repeated provisioning with the earlier build | Existing assignments and delegation were reused. All six assignment IDs, creation/update timestamps and the subnet ETag remained unchanged across the first two attempts. |
+| Foundry account and project with the earlier build | Three attempts reached `Failed` with the Trusted Access authorization error below, and the project list remained empty. |
+| External Reader correction | After a user separately added Reader for the hosting management identity on the Foundry resource group, one subsequent native `azd provision` completed and the account, project and Trusted Access binding reached `Succeeded`. The original 403 did not expose its denied action or scope, so this sequence does not prove that Reader was the only changed input or the unique cause. |
 
 Three native provisioning attempts returned the same error:
 

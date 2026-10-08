@@ -91,7 +91,7 @@ First-party extensions live in `cli/azd/extensions/` and are registered in `cli/
 The `azure.ai.projects` extension owns the `microsoft.foundry` provisioning
 provider. In the [BYO AKS demo](../../cli/azd/extensions/azure.ai.projects/README.md#automatic-preparation-in-this-demo-branch),
 its Deploy path checks customer-owned resources using the current azd identity,
-then prepares resource-scoped permissions and an agent subnet before submitting
+then prepares the required permissions and an agent subnet before submitting
 the Foundry deployment. Initialize and Preview do not apply those changes.
 This client-side path is not a substitute for service-wide preflight across
 other creation surfaces.
