@@ -399,21 +399,22 @@ func TestBYOAKSObsoleteAssignmentsAreNotRemoved(t *testing.T) {
 
 func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		change func(*byoAKSTestAzure)
-		writes int
+		name               string
+		change             func(*byoAKSTestAzure)
+		writes             int
+		suggestionContains []string
 	}{
 		{"missing sandbox label", func(a *byoAKSTestAzure) {
 			a.state.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
-		}, 0},
+		}, 0, nil},
 		{"different pool has the label", func(a *byoAKSTestAzure) {
 			a.state.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
 			a.state.cluster.Properties.AgentPoolProfiles = append(a.state.cluster.Properties.AgentPoolProfiles,
 				&armcontainerservice.ManagedClusterAgentPoolProfile{
 					NodeLabels: map[string]*string{byoAKSSandboxLabel: new("true")}, VnetSubnetID: new(byoTestNodeSubnet),
 				})
-		}, 0},
-		{"native Kubernetes RBAC", func(a *byoAKSTestAzure) { a.state.cluster.Properties.AADProfile = nil }, 0},
+		}, 0, nil},
+		{"native Kubernetes RBAC", func(a *byoAKSTestAzure) { a.state.cluster.Properties.AADProfile = nil }, 0, nil},
 		{"role read denied", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/roleAssignments") {
@@ -421,7 +422,10 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 0},
+		}, 0, []string{
+			"AKS cluster", "hosting and workload identities", "storage account", "agent subnet",
+			"role assignments at the AKS cluster, workload identity, and storage account scopes",
+		}},
 		{"no implicit provider registration during preflight", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.URL.Path == byoTestCluster {
@@ -429,7 +433,7 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 0},
+		}, 0, nil},
 		{"role write denied", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/roleAssignments/") {
@@ -437,7 +441,10 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 1},
+		}, 1, []string{
+			"roleAssignments read/write at the AKS cluster, workload identity, and storage account scopes",
+			"write access to the agent subnet",
+		}},
 		{"unverified role exists conflict is not success", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/roleAssignments/") {
@@ -445,7 +452,7 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 1},
+		}, 1, nil},
 		{"subnet write denied", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.Method == http.MethodPut && r.URL.Path == byoTestAgentSubnet {
@@ -453,7 +460,10 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 5},
+		}, 5, []string{
+			"roleAssignments read/write at the AKS cluster, workload identity, and storage account scopes",
+			"write access to the agent subnet",
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			provider, azure := newBYOAKSTestProvider(t)
@@ -461,6 +471,14 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 			_, err := provider.Deploy(t.Context(), func(string) {})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), byoTestCluster)
+			if len(tt.suggestionContains) > 0 {
+				service, ok := errors.AsType[*azdext.ServiceError](err)
+				require.True(t, ok)
+				assert.NotContains(t, service.Suggestion, "Foundry resource group")
+				for _, expected := range tt.suggestionContains {
+					assert.Contains(t, service.Suggestion, expected)
+				}
+			}
 			assert.Len(t, azure.writes(), tt.writes)
 			for _, request := range azure.requests {
 				assert.NotContains(t, request.path, "/providers/Microsoft.Resources/deployments/")

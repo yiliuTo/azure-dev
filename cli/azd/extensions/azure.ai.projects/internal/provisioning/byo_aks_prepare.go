@@ -331,13 +331,14 @@ func (p *FoundryProvisioningProvider) delegateBYOAKSSubnet(
 func (c *byoAKSConfig) azureError(err error, operation string) error {
 	result := exterrors.ServiceFromAzure(err, operation)
 	message := fmt.Sprintf("BYO AKS preparation for cluster %q: %s", c.ClusterResourceID, err)
-	suggestion := "Verify the configured resources exist and the current azd identity can read the Foundry resource " +
-		"group, AKS cluster, workload identity, storage account, agent subnet, and their role assignments."
+	suggestion := "Verify the configured resources exist and the current azd identity can read the AKS cluster, " +
+		"hosting and workload identities, storage account, agent subnet, and role assignments at the AKS cluster, " +
+		"workload identity, and storage account scopes."
 	if operation == exterrors.OpBYOAKSPrepare {
-		suggestion = "The current azd identity needs roleAssignments read/write at the Foundry resource group, AKS " +
-			"cluster, workload identity, and storage account scopes, plus write access to the agent subnet. Obtain " +
-			"the required access from an administrator, then rerun 'azd provision'. Earlier successful preparation " +
-			"is retained; azd does not elevate the caller."
+		suggestion = "The current azd identity needs roleAssignments read/write at the AKS cluster, workload identity, " +
+			"and storage account scopes, plus write access to the agent subnet. Obtain the required access from an " +
+			"administrator, then rerun 'azd provision'. Earlier successful preparation is retained; azd does not " +
+			"elevate the caller."
 	}
 	switch classified := result.(type) {
 	case *azdext.ServiceError:
