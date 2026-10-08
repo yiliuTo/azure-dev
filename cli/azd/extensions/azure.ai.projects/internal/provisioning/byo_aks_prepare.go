@@ -6,7 +6,6 @@ package provisioning
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -36,7 +35,6 @@ type byoAKSPlan struct {
 	config          *byoAKSConfig
 	ids             *byoAKSResources
 	state           *byoAKSSnapshot
-	foundryRG       *arm.ResourceID
 	needsDelegation bool
 }
 
@@ -91,21 +89,13 @@ func (p *FoundryProvisioningProvider) planBYOAKS(
 	if err != nil {
 		return nil, err
 	}
-	foundryRG, err := arm.ParseResourceID(
-		fmt.Sprintf("/subscriptions/%s/resourceGroups/%s", p.subID, p.rgName))
-	if err != nil {
-		return nil, exterrors.Internal(
-			exterrors.CodeInvalidServiceConfig,
-			fmt.Sprintf("construct Foundry resource group ID: %s", err),
-		)
-	}
 	return &byoAKSPlan{
-		config: config, ids: ids, state: state, foundryRG: foundryRG, needsDelegation: needsDelegation,
+		config: config, ids: ids, state: state, needsDelegation: needsDelegation,
 	}, nil
 }
 
 func (p *FoundryProvisioningProvider) applyBYOAKS(
-	ctx context.Context, source *templateSource, plan *byoAKSPlan, progress grpcbroker.ProgressFunc,
+	ctx context.Context, plan *byoAKSPlan, progress grpcbroker.ProgressFunc,
 ) error {
 	if plan == nil {
 		return nil
@@ -115,11 +105,7 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 		options = *p.armClientOptions
 	}
 	options.DisableRPRegistration = true
-	if err := p.ensureBYOAKSFoundryResourceGroup(ctx, source, &options, progress); err != nil {
-		return plan.config.azureError(err, exterrors.OpBYOAKSPrepare)
-	}
-	source.parameters["createResourceGroup"] = map[string]any{"value": false}
-	roles := byoAKSRoles(plan.ids, plan.state, plan.foundryRG)
+	roles := byoAKSRoles(plan.ids, plan.state)
 	if err := p.inspectBYOAKSRoles(ctx, roles, &options); err != nil {
 		return plan.config.azureError(err, exterrors.OpBYOAKSPreflight)
 	}
@@ -154,74 +140,6 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 	}
 	progress("BYO AKS preparation complete. New role assignments may still be propagating.")
 	return nil
-}
-
-func (p *FoundryProvisioningProvider) ensureBYOAKSFoundryResourceGroup(
-	ctx context.Context, source *templateSource, options *arm.ClientOptions, progress grpcbroker.ProgressFunc,
-) error {
-	factory, err := armresources.NewClientFactory(p.subID, p.credential, options)
-	if err != nil {
-		return fmt.Errorf("create Foundry resource group client: %w", err)
-	}
-	client := factory.NewResourceGroupsClient()
-	if _, err := client.Get(ctx, p.rgName, nil); err == nil {
-		progress(fmt.Sprintf("Using existing Foundry resource group %q without changing its tags", p.rgName))
-		return nil
-	} else if !isNotFound(err) {
-		return fmt.Errorf("read Foundry resource group %q: %w", p.rgName, err)
-	}
-
-	resourceGroup, err := byoAKSResourceGroupFromParameters(source.parameters)
-	if err != nil {
-		return err
-	}
-	progress(fmt.Sprintf("Creating Foundry resource group %q before role preparation...", p.rgName))
-	if _, err := client.CreateOrUpdate(ctx, p.rgName, resourceGroup, nil); err != nil {
-		return fmt.Errorf("create Foundry resource group %q: %w", p.rgName, err)
-	}
-	if p.isLayer || !p.rgExplicit {
-		if err := p.persistCreatedResourceGroupOwnership(ctx); err != nil {
-			return fmt.Errorf("record ownership of Foundry resource group %q: %w", p.rgName, err)
-		}
-	}
-	return nil
-}
-
-func byoAKSResourceGroupFromParameters(parameters map[string]any) (armresources.ResourceGroup, error) {
-	location, err := byoAKSParameterValue[string](parameters, "location")
-	if err != nil {
-		return armresources.ResourceGroup{}, err
-	}
-	tags, err := byoAKSParameterValue[map[string]string](parameters, "tags")
-	if err != nil {
-		return armresources.ResourceGroup{}, err
-	}
-	resourceTags := make(map[string]*string, len(tags))
-	for key, value := range tags {
-		resourceTags[key] = new(value)
-	}
-	return armresources.ResourceGroup{Location: new(location), Tags: resourceTags}, nil
-}
-
-func byoAKSParameterValue[T any](parameters map[string]any, name string) (T, error) {
-	var zero T
-	envelope, ok := parameters[name].(map[string]any)
-	if !ok {
-		return zero, fmt.Errorf("Foundry template parameter %q is missing its ARM value envelope", name)
-	}
-	value, ok := envelope["value"]
-	if !ok {
-		return zero, fmt.Errorf("Foundry template parameter %q has no value", name)
-	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return zero, fmt.Errorf("encode Foundry template parameter %q: %w", name, err)
-	}
-	var result T
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return zero, fmt.Errorf("decode Foundry template parameter %q: %w", name, err)
-	}
-	return result, nil
 }
 
 func (p *FoundryProvisioningProvider) readBYOAKS(
@@ -276,27 +194,17 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 	}, nil
 }
 
-func byoAKSRoles(
-	ids *byoAKSResources, state *byoAKSSnapshot, foundryRG *arm.ResourceID,
-) []*byoAKSRole {
+func byoAKSRoles(ids *byoAKSResources, state *byoAKSSnapshot) []*byoAKSRole {
 	management := *state.management.Properties.PrincipalID
 	workload := *state.workload.Properties.PrincipalID
 	return []*byoAKSRole{
 		{
-			name: "Azure Kubernetes Service Contributor Role", definitionID: "ed7f3fbd-7b88-4dd4-9017-9adb7ce333f8",
-			principalID: management, scope: ids.cluster,
-		},
-		{
-			name: "Azure Kubernetes Service RBAC Cluster Admin", definitionID: "b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b",
+			name: "Reader", definitionID: "acdd72a7-3385-48ef-bd42-f606fba81ae7",
 			principalID: management, scope: ids.cluster,
 		},
 		{
 			name: "Kubernetes Extension Contributor", definitionID: "85cb6faf-e071-4c9b-8136-154b5a04f717",
 			principalID: management, scope: ids.cluster,
-		},
-		{
-			name: "Reader", definitionID: "acdd72a7-3385-48ef-bd42-f606fba81ae7",
-			principalID: management, scope: foundryRG,
 		},
 		{
 			name:         "Managed Identity Federated Identity Credential Contributor",

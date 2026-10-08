@@ -1226,7 +1226,7 @@ func (p *FoundryProvisioningProvider) Deploy(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.applyBYOAKS(ctx, src, byoAKS, progress); err != nil {
+	if err := p.applyBYOAKS(ctx, byoAKS, progress); err != nil {
 		return nil, err
 	}
 
@@ -2193,13 +2193,12 @@ func (p *FoundryProvisioningProvider) armParameters() map[string]any {
 		return p.existingProjectArmParameters()
 	}
 	out := map[string]any{
-		"location":            map[string]any{"value": p.location},
-		"resourceGroupName":   map[string]any{"value": p.rgName},
-		"createResourceGroup": map[string]any{"value": true},
-		"foundryProjectName":  map[string]any{"value": p.foundryName},
-		"resourceTokenSalt":   map[string]any{"value": p.envName},
-		"principalId":         map[string]any{"value": p.principalID},
-		"tags":                map[string]any{"value": map[string]string{"azd-env-name": p.envName}},
+		"location":           map[string]any{"value": p.location},
+		"resourceGroupName":  map[string]any{"value": p.rgName},
+		"foundryProjectName": map[string]any{"value": p.foundryName},
+		"resourceTokenSalt":  map[string]any{"value": p.envName},
+		"principalId":        map[string]any{"value": p.principalID},
+		"tags":               map[string]any{"value": map[string]string{"azd-env-name": p.envName}},
 	}
 	if p.synthResult == nil {
 		return out
@@ -2435,11 +2434,7 @@ func (p *FoundryProvisioningProvider) persistCreatedResourceGroupOwnership(ctx c
 	if err := verifyLayerResourceGroupTags(tags, p.envName, p.rgName); err != nil {
 		return err
 	}
-	resourceGroupKey := envKeyResourceGroup
-	if p.isLayer || p.brownfieldEndpoint != "" {
-		resourceGroupKey = envKeyFoundryRG
-	}
-	if err := p.setEnv(recoveryCtx, resourceGroupKey, p.rgName); err != nil {
+	if err := p.setEnv(recoveryCtx, envKeyFoundryRG, p.rgName); err != nil {
 		return err
 	}
 	p.rgExplicit = true

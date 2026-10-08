@@ -167,13 +167,6 @@
         "description": "Name of the resource group to create and deploy resources into."
       }
     },
-    "createResourceGroup": {
-      "type": "bool",
-      "defaultValue": true,
-      "metadata": {
-        "description": "Create the target resource group before deploying resources into it."
-      }
-    },
     "tags": {
       "type": "object",
       "defaultValue": {},
@@ -341,7 +334,6 @@
   },
   "resources": {
     "resourceGroup": {
-      "condition": "[parameters('createResourceGroup')]",
       "type": "Microsoft.Resources/resourceGroups",
       "apiVersion": "2021-04-01",
       "name": "[parameters('resourceGroupName')]",

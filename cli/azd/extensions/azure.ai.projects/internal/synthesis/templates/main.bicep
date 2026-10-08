@@ -70,9 +70,6 @@ param location string
 @maxLength(90)
 param resourceGroupName string
 
-@description('Create the target resource group before deploying resources into it.')
-param createResourceGroup bool = true
-
 @description('Tags applied to all resources.')
 param tags object = {}
 
@@ -156,7 +153,7 @@ param dnsZonesSubscription string = ''
 
 // Resources
 
-resource resourceGroup 'Microsoft.Resources/resourceGroups@2021-04-01' = if (createResourceGroup) {
+resource resourceGroup 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: resourceGroupName
   location: location
   tags: tags

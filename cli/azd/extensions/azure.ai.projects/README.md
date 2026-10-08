@@ -106,17 +106,13 @@ The preflight checks:
   impose a `/27` minimum, Kubernetes version, node count, VM SKU, OS or Ready-state
   requirement.
 
-The service chooses its hosting backend. To accommodate both the Kubernetes
-extension and Helm backends, this demo prepares the following **six role
-assignments across four scopes**. This is not a claim that every backend requires
-all six.
+The public-preview service contract requires the following **four role
+assignments across three resource scopes**:
 
 | Identity | Scope | Role | Role definition ID |
 |---|---|---|---|
-| Hosting management UAMI | AKS resource | Azure Kubernetes Service Contributor Role | `ed7f3fbd-7b88-4dd4-9017-9adb7ce333f8` |
-| Hosting management UAMI | AKS resource | Azure Kubernetes Service RBAC Cluster Admin | `b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b` |
+| Hosting management UAMI | AKS resource | Reader | `acdd72a7-3385-48ef-bd42-f606fba81ae7` |
 | Hosting management UAMI | AKS resource | Kubernetes Extension Contributor | `85cb6faf-e071-4c9b-8136-154b5a04f717` |
-| Hosting management UAMI | Foundry resource group | Reader | `acdd72a7-3385-48ef-bd42-f606fba81ae7` |
 | Hosting management UAMI | Workload UAMI resource | Managed Identity Federated Identity Credential Contributor | `7e559ce2-48d7-4b27-9128-fa1b247f1308` |
 | Workload UAMI | Storage account resource | Storage Blob Data Contributor | `ba92f5b4-2d11-453d-a403-e96b0029c9fe` |
 
@@ -126,14 +122,9 @@ scope are reused; a blob-container-only assignment does not satisfy the storage
 account scope. No role is newly assigned at subscription scope. The workload
 identity receives no AKS management permission.
 
-The preflight finishes before azd creates or changes any resource. After it
-passes, azd reads the Foundry resource group. If the group is absent, azd creates
-it with the same location and tags used by the main Foundry template and records
-the group in the azd environment before preparing roles. If it already exists,
-azd does not update its tags. The main deployment then reuses the group rather
-than redeclaring it. A group created before a later preparation or service
-failure remains available for an idempotent retry and for normal `azd down`
-cleanup.
+The preflight finishes before azd creates or changes any resource. The main
+Foundry provisioning deployment remains responsible for creating its resource
+group after role and subnet preparation succeeds.
 
 If the agent subnet has no delegation, azd adds `Microsoft.App/environments`,
 retaining the other returned subnet properties, including NSG, route table, NAT
@@ -144,10 +135,11 @@ preparation starts. Both the role assignments and delegation are idempotent.
 Federated identity credentials and trusted access are not pre-created; the
 Foundry service owns its workload federation setup.
 
-Upgrading from an earlier demo build is non-destructive. azd adds or reuses the
-Foundry resource-group Reader assignment but does not remove an existing Reader
-assignment from the AKS resource. Review and remove obsolete customer-owned role
-assignments separately only after confirming they are no longer required.
+Upgrading from an earlier demo build is non-destructive. azd stops checking and
+creating AKS Contributor, AKS RBAC Cluster Admin, and Foundry resource-group
+Reader assignments. It does not remove any existing customer-owned assignment.
+Review and remove obsolete assignments separately only after confirming they
+are no longer required.
 
 After saving the `azure.yaml` above in a new project directory, supply the
 existing resource IDs and an explicit, dedicated Foundry resource group:
@@ -194,7 +186,8 @@ Successful preparation is retained after later failures and is reused on retry.
 `azd down` does not undo these changes to customer-owned identities, AKS, storage
 or the agent subnet.
 
-**Historical live validation results (2026-09-29 and 2026-09-30, West US 2):**
+**Historical pre-public-preview validation results (2026-09-29 and 2026-09-30,
+West US 2):**
 
 | Scenario | Observed result |
 |---|---|
@@ -204,7 +197,7 @@ or the agent subnet.
 | Foundry account and project with the earlier build | Three attempts reached `Failed` with the Trusted Access authorization error below, and the project list remained empty. |
 | External Reader correction | After a user separately added Reader for the hosting management identity on the Foundry resource group, one subsequent native `azd provision` completed and the account, project and Trusted Access binding reached `Succeeded`. The original 403 did not expose its denied action or scope, so this sequence does not prove that Reader was the only changed input or the unique cause. |
 
-**Corrected-build live validation (2026-10-08, West US 2):**
+**Historical six-role corrected-build validation (2026-10-08, West US 2):**
 
 A fresh hosting management identity started with no role assignments, and the
 dedicated Foundry resource group did not exist. Native `azd provision` passed
@@ -231,6 +224,19 @@ elapsed time nor visible assignments proves that authorization is effective.
 Likewise, an account appearing in a resource list does not mean its provisioning
 state is `Succeeded`. This error alone does not establish RBAC propagation or
 preview enrollment as the cause.
+
+**Public-preview contract validation (2026-10-08, West Central US):**
+
+A fresh AKS 1.35 cluster with Azure CNI Overlay, OIDC, workload identity, Azure
+RBAC, and a labeled Kata pool was validated through native `azd provision`.
+With the sandbox label removed, preflight failed before creating assignments,
+subnet delegation, or the Foundry resource group. After restoring the label,
+azd created exactly the four assignments documented above, delegated the agent
+subnet, and the Foundry account, project, and Trusted Access binding all reached
+`Succeeded`. The hosting identity had neither AKS Contributor nor AKS RBAC
+Cluster Admin on the cluster and had no Reader assignment on the Foundry
+resource group. A second provision reused all assignment IDs and timestamps and
+left the subnet ETag unchanged.
 
 For reproduction and diagnosis, retain the sanitized nested deployment error,
 failure time in UTC, and azd/extension versions. Obtain the original provider

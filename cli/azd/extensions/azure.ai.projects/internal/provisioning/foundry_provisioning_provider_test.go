@@ -754,30 +754,6 @@ func TestPersistCreatedResourceGroupOwnership(t *testing.T) {
 	assert.Equal(t, want, env.set[envKeyFoundryRGOwner])
 }
 
-func TestPersistCreatedRootResourceGroupOwnership(t *testing.T) {
-	t.Parallel()
-	env := &resolveEnvStubEnvServer{envName: "dev", get: map[string]string{}}
-	client := newResolveEnvTestClient(t, env, &resolveEnvStubPromptServer{})
-	p := &FoundryProvisioningProvider{
-		azdClient:  client,
-		credential: &azidentity.AzureDeveloperCLICredential{},
-		envName:    "dev",
-		subID:      "sub",
-		rgName:     "rg-dev",
-		resourceGroupState: func(context.Context) (map[string]*string, bool, error) {
-			return map[string]*string{"azd-env-name": new("dev")}, true, nil
-		},
-	}
-
-	require.NoError(t, p.persistCreatedResourceGroupOwnership(t.Context()))
-	want := "/subscriptions/sub/resourceGroups/rg-dev"
-	assert.True(t, p.rgExplicit)
-	assert.Equal(t, "rg-dev", env.set[envKeyResourceGroup])
-	assert.NotContains(t, env.set, envKeyFoundryRG)
-	assert.Equal(t, want, p.foundryRGOwnerID)
-	assert.Equal(t, want, env.set[envKeyFoundryRGOwner])
-}
-
 func TestValidateFoundryProviderLayers(t *testing.T) {
 	require.NoError(t, validateFoundryProviderLayers([]byte(`infra:
   provider: bicep
