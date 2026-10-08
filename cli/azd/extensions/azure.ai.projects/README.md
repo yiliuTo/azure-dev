@@ -204,6 +204,24 @@ or the agent subnet.
 | Foundry account and project with the earlier build | Three attempts reached `Failed` with the Trusted Access authorization error below, and the project list remained empty. |
 | External Reader correction | After a user separately added Reader for the hosting management identity on the Foundry resource group, one subsequent native `azd provision` completed and the account, project and Trusted Access binding reached `Succeeded`. The original 403 did not expose its denied action or scope, so this sequence does not prove that Reader was the only changed input or the unique cause. |
 
+**Corrected-build live validation (2026-10-08, West US 2):**
+
+A fresh hosting management identity started with no role assignments, and the
+dedicated Foundry resource group did not exist. Native `azd provision` passed
+the read-only preflight, created the Foundry resource group, assigned the three
+AKS roles without assigning AKS Reader, assigned Foundry resource-group Reader
+and workload-UAMI FIC Contributor, and reused the existing storage role and
+subnet delegation. The subnet ETag remained unchanged.
+
+The Foundry deployment was then rejected during service validation because the
+reused AKS cluster was already bound to another Foundry account in the
+subscription. No Foundry resource was created in the new group. Reaching an
+independent corrected-build account/project/Trusted Access success would require
+either removing that existing binding or provisioning another qualified AKS
+cluster, so neither destructive workaround nor a second deterministic retry was
+performed. The corrected role scope and fresh-resource-group ordering are
+verified; corrected-build end-to-end Foundry success is not.
+
 Three native provisioning attempts returned the same error:
 
 > The hosting-management identity is not authorized to manage Trusted Access bindings on the configured AKS cluster.
