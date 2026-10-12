@@ -6,6 +6,7 @@ package provisioning
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -36,6 +37,7 @@ type byoAKSPlan struct {
 	ids             *byoAKSResources
 	state           *byoAKSSnapshot
 	needsDelegation bool
+	authorization   byoAKSAuthorization
 }
 
 func (p *FoundryProvisioningProvider) planBYOAKS(
@@ -85,12 +87,22 @@ func (p *FoundryProvisioningProvider) planBYOAKS(
 	if err != nil {
 		return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
 	}
-	needsDelegation, err := config.validate(ids, state, p.location)
+	validation, err := config.validate(ids, state, p.location)
 	if err != nil {
 		return nil, err
 	}
+	if validation.authorization == byoAKSAuthorizationNativeRBAC {
+		check := p.byoAKSNativeRBACCheck
+		if check == nil {
+			check = p.checkBYOAKSNativeRBAC
+		}
+		if err := check(ctx, ids, *state.management.Properties.PrincipalID, &options); err != nil {
+			return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
+		}
+	}
 	return &byoAKSPlan{
-		config: config, ids: ids, state: state, needsDelegation: needsDelegation,
+		config: config, ids: ids, state: state,
+		needsDelegation: validation.needsDelegation, authorization: validation.authorization,
 	}, nil
 }
 
@@ -105,10 +117,12 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 		options = *p.armClientOptions
 	}
 	options.DisableRPRegistration = true
-	roles := byoAKSRoles(plan.ids, plan.state)
+	roles := byoAKSRoles(plan.ids, plan.state, plan.authorization)
 	if err := p.inspectBYOAKSRoles(ctx, roles, &options); err != nil {
 		return plan.config.azureError(err, exterrors.OpBYOAKSPreflight)
 	}
+	progress("BYO AKS runtime preflight passed. Agent-image private trusted roots are validated later, " +
+		"when the image digest is known.")
 	progress("BYO AKS preflight passed. Preparing required Foundry hosting role assignments:")
 	for _, role := range roles {
 		action := "Assign"
@@ -153,6 +167,40 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 	if err != nil {
 		return nil, fmt.Errorf("read cluster %s: %w", ids.cluster, err)
 	}
+	poolClient, err := armcontainerservice.NewAgentPoolsClient(ids.cluster.SubscriptionID, p.credential, options)
+	if err != nil {
+		return nil, fmt.Errorf("create AKS agent pools client: %w", err)
+	}
+	resourceClient, err := armresources.NewClient(ids.cluster.SubscriptionID, p.credential, options)
+	if err != nil {
+		return nil, fmt.Errorf("create AKS agent pool resource client: %w", err)
+	}
+	var pools []*byoAKSAgentPool
+	pager := poolClient.NewListPager(ids.cluster.ResourceGroupName, ids.cluster.Name, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list AgentPool child resources for cluster %s: %w", ids.cluster, err)
+		}
+		for _, pool := range page.Value {
+			if pool == nil || pool.Name == nil {
+				return nil, fmt.Errorf("list AgentPool child resources for cluster %s: response contains an unnamed pool",
+					ids.cluster)
+			}
+			poolID := ids.cluster.String() + "/agentPools/" + *pool.Name
+			raw, err := resourceClient.GetByID(ctx, poolID, byoAKSAgentPoolAPIVersion, nil)
+			if err != nil {
+				return nil, fmt.Errorf("read AgentPool child resource %s: %w", poolID, err)
+			}
+			sshAccess, err := byoAKSAgentPoolSSHAccess(raw.Properties)
+			if err != nil {
+				return nil, fmt.Errorf("read AgentPool child resource %s security profile: %w", poolID, err)
+			}
+			pools = append(pools, &byoAKSAgentPool{
+				name: *pool.Name, properties: pool.Properties, sshAccess: sshAccess,
+			})
+		}
+	}
 	readIdentity := func(id *arm.ResourceID) (armmsi.Identity, error) {
 		client, err := armmsi.NewUserAssignedIdentitiesClient(id.SubscriptionID, p.credential, options)
 		if err != nil {
@@ -180,7 +228,7 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 	if err != nil {
 		return nil, fmt.Errorf("read agent subnet %s: %w", ids.subnet, err)
 	}
-	resourceClient, err := armresources.NewClient(ids.storage.SubscriptionID, p.credential, options)
+	resourceClient, err = armresources.NewClient(ids.storage.SubscriptionID, p.credential, options)
 	if err != nil {
 		return nil, fmt.Errorf("create storage resource client: %w", err)
 	}
@@ -189,15 +237,17 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 		return nil, fmt.Errorf("read storage account %s: %w", ids.storage, err)
 	}
 	return &byoAKSSnapshot{
-		cluster: cluster.ManagedCluster, management: management, workload: workload,
+		cluster: cluster.ManagedCluster, agentPools: pools, management: management, workload: workload,
 		subnet: subnet.Subnet, storage: storage.GenericResource,
 	}, nil
 }
 
-func byoAKSRoles(ids *byoAKSResources, state *byoAKSSnapshot) []*byoAKSRole {
+func byoAKSRoles(
+	ids *byoAKSResources, state *byoAKSSnapshot, authorization byoAKSAuthorization,
+) []*byoAKSRole {
 	management := *state.management.Properties.PrincipalID
 	workload := *state.workload.Properties.PrincipalID
-	return []*byoAKSRole{
+	roles := []*byoAKSRole{
 		{
 			name: "Reader", definitionID: "acdd72a7-3385-48ef-bd42-f606fba81ae7",
 			principalID: management, scope: ids.cluster,
@@ -216,6 +266,29 @@ func byoAKSRoles(ids *byoAKSResources, state *byoAKSSnapshot) []*byoAKSRole {
 			principalID: workload, scope: ids.storage,
 		},
 	}
+	if authorization == byoAKSAuthorizationAzureRBAC {
+		roles = append(roles, &byoAKSRole{
+			name: "Azure Kubernetes Service RBAC Cluster Admin", definitionID: byoAKSClusterAdminRoleID,
+			principalID: management, scope: ids.cluster,
+		})
+	}
+	return roles
+}
+
+func byoAKSAgentPoolSSHAccess(properties any) (string, error) {
+	encoded, err := json.Marshal(properties)
+	if err != nil {
+		return "", err
+	}
+	var value struct {
+		SecurityProfile struct {
+			SSHAccess string `json:"sshAccess"`
+		} `json:"securityProfile"`
+	}
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return "", err
+	}
+	return value.SecurityProfile.SSHAccess, nil
 }
 
 func (p *FoundryProvisioningProvider) inspectBYOAKSRoles(
@@ -332,8 +405,10 @@ func (c *byoAKSConfig) azureError(err error, operation string) error {
 	result := exterrors.ServiceFromAzure(err, operation)
 	message := fmt.Sprintf("BYO AKS preparation for cluster %q: %s", c.ClusterResourceID, err)
 	suggestion := "Verify the configured resources exist and the current azd identity can read the AKS cluster, " +
-		"hosting and workload identities, storage account, agent subnet, and role assignments at the AKS cluster, " +
-		"workload identity, and storage account scopes."
+		"its AgentPool child resources, hosting and workload identities, storage account, agent subnet, and role " +
+		"assignments at the AKS cluster, workload identity, and storage account scopes. Managed Entra clusters " +
+		"using native Kubernetes RBAC also require listClusterUserCredential/action and network/DNS connectivity " +
+		"to read ClusterRoleBindings from the Kubernetes API."
 	if operation == exterrors.OpBYOAKSPrepare {
 		suggestion = "The current azd identity needs roleAssignments read/write at the AKS cluster, workload identity, " +
 			"and storage account scopes, plus write access to the agent subnet. Obtain the required access from an " +

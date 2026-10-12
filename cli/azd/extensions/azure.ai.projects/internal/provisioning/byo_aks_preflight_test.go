@@ -46,25 +46,46 @@ func byoAKSTestSnapshot() *byoAKSSnapshot {
 	return &byoAKSSnapshot{
 		cluster: armcontainerservice.ManagedCluster{
 			ID: new(byoTestCluster), Location: new("eastus2"),
+			SKU: &armcontainerservice.ManagedClusterSKU{
+				Name: new(armcontainerservice.ManagedClusterSKUNameBase),
+				Tier: new(armcontainerservice.ManagedClusterSKUTierStandard),
+			},
+			Identity: &armcontainerservice.ManagedClusterIdentity{
+				Type: new(armcontainerservice.ResourceIdentityTypeSystemAssigned),
+			},
 			Properties: &armcontainerservice.ManagedClusterProperties{
+				KubernetesVersion: new("1.31.0"),
+				ProvisioningState: new("Succeeded"),
 				OidcIssuerProfile: &armcontainerservice.ManagedClusterOIDCIssuerProfile{
 					Enabled: new(true), IssuerURL: new("https://issuer.example/"),
 				},
 				SecurityProfile: &armcontainerservice.ManagedClusterSecurityProfile{
 					WorkloadIdentity: &armcontainerservice.ManagedClusterSecurityProfileWorkloadIdentity{Enabled: new(true)},
 				},
-				AADProfile: &armcontainerservice.ManagedClusterAADProfile{EnableAzureRBAC: new(true)},
+				EnableRBAC: new(true),
+				AddonProfiles: map[string]*armcontainerservice.ManagedClusterAddonProfile{
+					"azurepolicy": {Enabled: new(true)},
+				},
 				NetworkProfile: &armcontainerservice.NetworkProfile{
 					NetworkPlugin:     new(armcontainerservice.NetworkPluginAzure),
 					NetworkPluginMode: new(armcontainerservice.NetworkPluginModeOverlay),
 				},
-				AgentPoolProfiles: []*armcontainerservice.ManagedClusterAgentPoolProfile{{
-					Name: new("kata"), WorkloadRuntime: new(armcontainerservice.WorkloadRuntime("KataVmIsolation")),
-					VnetSubnetID: new(byoTestNodeSubnet),
-					NodeLabels:   map[string]*string{byoAKSSandboxLabel: new("true")},
-				}},
 			},
 		},
+		agentPools: []*byoAKSAgentPool{{
+			name: "kata", sshAccess: "Disabled",
+			properties: &armcontainerservice.ManagedClusterAgentPoolProfileProperties{
+				Mode:            new(armcontainerservice.AgentPoolModeUser),
+				OSType:          new(armcontainerservice.OSTypeLinux),
+				OSSKU:           new(armcontainerservice.OSSKUAzureLinux),
+				WorkloadRuntime: new(armcontainerservice.WorkloadRuntime("KataVmIsolation")),
+				Count:           new(int32(1)), VMSize: new("Standard_D4s_v3"),
+				VnetSubnetID:      new(byoTestNodeSubnet),
+				NodeLabels:        map[string]*string{byoAKSSandboxLabel: new("true")},
+				NodeImageVersion:  new(byoAKSMinimumNodeImage),
+				ProvisioningState: new("Succeeded"),
+			},
+		}},
 		management: armmsi.Identity{Properties: &armmsi.UserAssignedIdentityProperties{
 			PrincipalID: new(byoTestManagementID),
 		}},
@@ -100,27 +121,32 @@ func TestBYOAKSPreflight(t *testing.T) {
 		change   func(*byoAKSSnapshot)
 		property string
 	}{
-		{"valid overlay with a 10 prefix smaller than /27", func(*byoAKSSnapshot) {}, ""},
-		{"case insensitive location and runtime", func(s *byoAKSSnapshot) {
-			s.cluster.Location = new("EASTUS2")
-			s.storage.Location = new("EastUs2")
-			s.cluster.Properties.AgentPoolProfiles[0].WorkloadRuntime =
-				new(armcontainerservice.WorkloadRuntime("katavmisolation"))
+		{"valid non Entra", func(*byoAKSSnapshot) {}, ""},
+		{"managed Entra with Azure RBAC", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+				Managed: new(true), EnableAzureRBAC: new(true),
+			}
 		}, ""},
-		{"no invented version size or ready constraints", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.KubernetesVersion = nil
-			s.cluster.Properties.ProvisioningState = new("Updating")
-			s.cluster.Properties.AgentPoolProfiles[0].Count = nil
-			s.cluster.Properties.AgentPoolProfiles[0].VMSize = nil
+		{"Kubernetes 1.31 boundary", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.KubernetesVersion = new("1.31")
+		}, ""},
+		{"Kubernetes 1.36 recommendation is not mandatory", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.KubernetesVersion = new("1.35.7")
+		}, ""},
+		{"system and user assigned identity", func(s *byoAKSSnapshot) {
+			s.cluster.Identity.Type = new(armcontainerservice.ResourceIdentityType("SystemAssigned, UserAssigned"))
+		}, ""},
+		{"native Kubernetes RBAC", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+				Managed: new(true), EnableAzureRBAC: new(false),
+			}
 		}, ""},
 		{"non overlay all pools have pod subnets", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.NetworkProfile.NetworkPluginMode = nil
-			s.cluster.Properties.AgentPoolProfiles[0].PodSubnetID = new(byoTestVNet + "/subnets/pods")
-			s.cluster.Properties.AgentPoolProfiles = append(s.cluster.Properties.AgentPoolProfiles,
-				&armcontainerservice.ManagedClusterAgentPoolProfile{
-					Name: new("system"), VnetSubnetID: new(byoTestNodeSubnet),
-					PodSubnetID: new(byoTestVNet + "/subnets/pods2"),
-				})
+			s.agentPools[0].properties.PodSubnetID = new(byoTestVNet + "/subnets/pods")
+		}, ""},
+		{"missing issuer URL is allowed", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.OidcIssuerProfile.IssuerURL = nil
 		}, ""},
 		{"addressPrefixes fallback", func(s *byoAKSSnapshot) {
 			s.subnet.Properties.AddressPrefix = nil
@@ -131,43 +157,88 @@ func TestBYOAKSPreflight(t *testing.T) {
 			s.storage.Location = new("westus")
 		}, "storageAccountResourceId.location"},
 		{"missing AKS properties", func(s *byoAKSSnapshot) { s.cluster.Properties = nil }, "properties"},
+		{"Automatic SKU", func(s *byoAKSSnapshot) {
+			s.cluster.SKU.Name = new(armcontainerservice.ManagedClusterSKUNameAutomatic)
+		}, "sku"},
+		{"Free tier", func(s *byoAKSSnapshot) {
+			s.cluster.SKU.Tier = new(armcontainerservice.ManagedClusterSKUTierFree)
+		}, "sku"},
+		{"Kubernetes 1.30", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.KubernetesVersion = new("1.30.9")
+		}, "kubernetesVersion"},
+		{"missing Kubernetes version", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.KubernetesVersion = nil
+		}, "kubernetesVersion"},
+		{"cluster updating", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.ProvisioningState = new("Updating")
+		}, "provisioningState"},
+		{"service principal identity", func(s *byoAKSSnapshot) {
+			s.cluster.Identity.Type = new(armcontainerservice.ResourceIdentityTypeNone)
+		}, "identity.type"},
+		{"unknown combined identity", func(s *byoAKSSnapshot) {
+			s.cluster.Identity.Type = new(armcontainerservice.ResourceIdentityType("SystemAssigned, Alien"))
+		}, "identity.type"},
 		{"disabled OIDC", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.OidcIssuerProfile.Enabled = new(false)
 		}, "oidcIssuerProfile.enabled"},
-		{"missing OIDC issuer", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.OidcIssuerProfile.IssuerURL = nil
-		}, "oidcIssuerProfile.issuerURL"},
 		{"disabled workload identity", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.SecurityProfile.WorkloadIdentity.Enabled = new(false)
 		}, "securityProfile.workloadIdentity.enabled"},
-		{"native Kubernetes RBAC is a demo boundary", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AADProfile.EnableAzureRBAC = new(false)
-		}, "aadProfile.enableAzureRBAC"},
+		{"Azure Policy disabled", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.AddonProfiles["azurepolicy"].Enabled = new(false)
+		}, "addonProfiles.azurepolicy.enabled"},
+		{"legacy unmanaged Entra", func(s *byoAKSSnapshot) {
+			s.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+				Managed: new(false), EnableAzureRBAC: new(false),
+			}
+		}, "aadProfile.managed"},
 		{"kubenet", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.NetworkProfile.NetworkPlugin = new(armcontainerservice.NetworkPluginKubenet)
 		}, "networkProfile.networkPlugin"},
 		{"empty node pools", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles = nil
-		}, "agentPoolProfiles"},
-		{"non overlay missing pod subnet on second pool", func(s *byoAKSSnapshot) {
+			s.agentPools = nil
+		}, "agentPools"},
+		{"Azure CNI Node Subnet", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.NetworkProfile.NetworkPluginMode = nil
-			s.cluster.Properties.AgentPoolProfiles[0].PodSubnetID = new(byoTestVNet + "/subnets/pods")
-			s.cluster.Properties.AgentPoolProfiles = append(s.cluster.Properties.AgentPoolProfiles,
-				&armcontainerservice.ManagedClusterAgentPoolProfile{
-					Name: new("other"), VnetSubnetID: new(byoTestNodeSubnet),
-				})
-		}, "agentPoolProfiles[1].podSubnetID"},
-		{"Kata and label on different pools", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
-			s.cluster.Properties.AgentPoolProfiles = append(s.cluster.Properties.AgentPoolProfiles,
-				&armcontainerservice.ManagedClusterAgentPoolProfile{
-					Name: new("other"), VnetSubnetID: new(byoTestNodeSubnet),
-					NodeLabels: map[string]*string{byoAKSSandboxLabel: new("true")},
-				})
-		}, "agentPoolProfiles"},
+		}, "agentPools[0].podSubnetID"},
+		{"system pool", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.Mode = new(armcontainerservice.AgentPoolModeSystem)
+		}, "agentPools"},
+		{"Ubuntu pool", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.OSSKU = new(armcontainerservice.OSSKUUbuntu)
+		}, "agentPools"},
+		{"non Kata pool", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.WorkloadRuntime = new(armcontainerservice.WorkloadRuntimeOCIContainer)
+		}, "agentPools"},
+		{"zero nodes", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.Count = new(int32(0))
+		}, "agentPools"},
+		{"missing VM size", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.VMSize = nil
+		}, "agentPools"},
 		{"label value is case sensitive", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles[0].NodeLabels[byoAKSSandboxLabel] = new("True")
-		}, "agentPoolProfiles"},
+			s.agentPools[0].properties.NodeLabels[byoAKSSandboxLabel] = new("True")
+		}, "agentPools"},
+		{"wrong node image family", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.NodeImageVersion = new("AKSUbuntu-202608.14.0")
+		}, "agentPools"},
+		{"older node image", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.NodeImageVersion = new("AKSAzureLinux-V3katagen2-202608.13.99")
+		}, "agentPools"},
+		{"SSH enabled", func(s *byoAKSSnapshot) {
+			s.agentPools[0].sshAccess = "LocalUser"
+		}, "agentPools"},
+		{"pool updating", func(s *byoAKSSnapshot) {
+			s.agentPools[0].properties.ProvisioningState = new("Updating")
+		}, "agentPools"},
+		{"multiple pools only one qualifies", func(s *byoAKSSnapshot) {
+			bad := *s.agentPools[0]
+			badProperties := *bad.properties
+			bad.properties = &badProperties
+			bad.name = "bad"
+			bad.properties.NodeLabels = nil
+			s.agentPools = append([]*byoAKSAgentPool{&bad}, s.agentPools...)
+		}, ""},
 		{"missing management principal", func(s *byoAKSSnapshot) {
 			s.management.Properties.PrincipalID = nil
 		}, "hostingManagementIdentityResourceId.principalId"},
@@ -181,14 +252,14 @@ func TestBYOAKSPreflight(t *testing.T) {
 			s.workload.Properties.PrincipalID = new(byoTestManagementID)
 		}, "workloadIdentityResourceId.principalId"},
 		{"agent subnet is a node subnet", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles[0].VnetSubnetID = new(byoTestAgentSubnet)
+			s.agentPools[0].properties.VnetSubnetID = new(byoTestAgentSubnet)
 		}, "agentSubnetResourceId"},
 		{"agent subnet is a pod subnet", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles[0].PodSubnetID = new(byoTestAgentSubnet)
+			s.agentPools[0].properties.PodSubnetID = new(byoTestAgentSubnet)
 		}, "agentSubnetResourceId"},
 		{"different VNet is a demo boundary", func(s *byoAKSSnapshot) {
-			s.cluster.Properties.AgentPoolProfiles[0].VnetSubnetID = new(byoTestVNet + "-other/subnets/nodes")
-		}, "agentPoolProfiles[0].vnetSubnetID"},
+			s.agentPools[0].properties.VnetSubnetID = new(byoTestVNet + "-other/subnets/nodes")
+		}, "agentPools[0].vnetSubnetID"},
 		{"missing subnet properties", func(s *byoAKSSnapshot) {
 			s.subnet.Properties = nil
 		}, "agentSubnetResourceId.properties"},
@@ -209,10 +280,10 @@ func TestBYOAKSPreflight(t *testing.T) {
 			tt.change(state)
 			ids, err := config.resources(byoTestSubscription)
 			require.NoError(t, err)
-			needsDelegation, err := config.validate(ids, state, "eastus2")
+			validation, err := config.validate(ids, state, "eastus2")
 			if tt.property == "" {
 				require.NoError(t, err)
-				assert.True(t, needsDelegation)
+				assert.True(t, validation.needsDelegation)
 				return
 			}
 			require.Error(t, err)
@@ -245,12 +316,35 @@ func TestBYOAKSResourceConstraints(t *testing.T) {
 			c.WorkloadIdentityResourceID = strings.ToUpper(c.HostingManagementIdentityResourceID)
 		}},
 		{"wrong resource type", "clusterResourceId", func(c *byoAKSConfig) { c.ClusterResourceID = byoTestStorage }},
+		{"Arc connected cluster", "clusterResourceId", func(c *byoAKSConfig) {
+			c.ClusterResourceID = byoTestScope + "/providers/Microsoft.Kubernetes/connectedClusters/arc"
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			config := byoAKSTestConfig()
 			tt.change(config)
 			_, err := config.resources(byoTestSubscription)
 			require.ErrorContains(t, err, tt.property)
+		})
+	}
+}
+
+func TestBYOAKSNodeImageVersion(t *testing.T) {
+	for _, tt := range []struct {
+		name, version string
+		valid         bool
+	}{
+		{"minimum", byoAKSMinimumNodeImage, true},
+		{"later day", "AKSAzureLinux-V3katagen2-202608.15.0", true},
+		{"later release", "AKSAzureLinux-V3katagen2-202609.1.0", true},
+		{"later patch", "AKSAzureLinux-V3katagen2-202608.14.10", true},
+		{"older day", "AKSAzureLinux-V3katagen2-202608.13.99", false},
+		{"older release", "AKSAzureLinux-V3katagen2-202607.99.99", false},
+		{"wrong family", "AKSAzureLinux-V3-202608.14.0", false},
+		{"unparseable", "AKSAzureLinux-V3katagen2-latest", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, byoAKSNodeImageAtLeast(tt.version, byoAKSMinimumNodeImage))
 		})
 	}
 }

@@ -74,8 +74,8 @@ Projects without `agentHosting` keep their existing behavior.
 All requests use the identity logged in through `azd auth login`, not either
 managed identity. The caller needs read access to the referenced resources and
 `Microsoft.Authorization/roleAssignments/read` and
-`Microsoft.Authorization/roleAssignments/write` at the Foundry resource group,
-AKS cluster, workload UAMI and storage account scopes listed below, and
+`Microsoft.Authorization/roleAssignments/write` at the AKS cluster, workload
+UAMI and storage account scopes listed below, and
 `Microsoft.Network/virtualNetworks/subnets/write` on the agent subnet.
 The caller also needs permission to read and, when absent, create the Foundry
 resource group, plus the usual permission to provision its resources. azd does
@@ -87,26 +87,46 @@ The preflight checks:
 
 - Foundry, AKS and storage use the same subscription and region; region comparison
   is case-insensitive. The agent subnet is in that subscription too.
-- AKS has an enabled OIDC issuer with a non-empty issuer URL, and workload identity
-  is enabled.
-- The network plugin is Azure CNI, with overlay mode or a non-null `podSubnetID`
-  on **every** node pool.
-- **One and the same pool** has `workloadRuntime: KataVmIsolation`
-  (case-insensitive) and the label `agents.ai.azure.com/sandbox-node: "true"`
-  (case-sensitive). azd does not add this label or change the cluster.
+- The resource is an AKS Standard cluster (not AKS Automatic or Azure Arc-enabled
+  Kubernetes), runs Kubernetes 1.31 or later, uses a managed control-plane
+  identity, has provisioning state `Succeeded`, and has Azure Policy enabled.
+  Kubernetes 1.36.3 is the current recommendation, not an exact requirement.
+- AKS has OIDC issuer and workload identity enabled. A populated issuer URL is
+  not required as an additional preflight condition.
+- The network is Azure CNI Overlay or Azure CNI Pod Subnet. kubenet and Azure CNI
+  Node Subnet are rejected.
+- azd lists the AgentPool child ARM resources directly. **One and the same pool**
+  must be User mode, Linux with Azure Linux, `KataVmIsolation`, count at least
+  one, have a non-empty VM size, node image
+  `AKSAzureLinux-V3katagen2-202608.14.0` or later, exact label
+  `agents.ai.azure.com/sandbox-node: "true"`, disabled SSH access, and
+  provisioning state `Succeeded`. azd does not change the pool.
 - The two managed identities are different, both have resolved `principalId`
   values, and the workload identity also has `clientId` and `tenantId`.
 - The dedicated Foundry/Data Proxy subnet is different from every AKS node and pod
-  subnet. For this demo, it must be in the same VNet as the node subnets, and AKS
-  must have `aadProfile.enableAzureRBAC: true`. Cross-VNet preparation and native
-  Kubernetes RBAC bindings are **demo limitations**, not general BYO AKS product
-  restrictions.
+  subnet. For this demo, it must be in the same VNet as the node subnets.
 - The agent subnet has an IPv4 address prefix beginning with 10, 172 or 192,
   using `addressPrefix` or the first `addressPrefixes` entry. This demo does not
-  impose a `/27` minimum, Kubernetes version, node count, VM SKU, OS or Ready-state
-  requirement.
+  impose a `/27` minimum or a minimum VM SKU beyond a non-empty pool VM size.
 
-The public-preview service contract requires the following **four role
+Authorization follows the cluster's authentication configuration:
+
+- Managed Microsoft Entra plus Azure RBAC adds Azure Kubernetes Service RBAC
+  Cluster Admin (`b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b`) for the hosting
+  management identity at AKS scope, in addition to the four public-preview roles.
+- Managed Microsoft Entra plus native Kubernetes RBAC obtains an ephemeral
+  in-memory user kubeconfig, requests an in-memory bearer token, and reads
+  ClusterRoleBindings to verify that the hosting management identity's Entra
+  object ID is bound to ClusterRole `cluster-admin`. Nothing is written to the
+  cluster or disk, and credentials, CA data and tokens are not printed. The azd
+  caller needs `Microsoft.ContainerService/managedClusters/listClusterUserCredential/action`
+  and Kubernetes API authorization to list ClusterRoleBindings. Private clusters
+  also require working private DNS and network connectivity from the machine
+  running azd.
+- Non-Entra authentication needs no additional Kubernetes data-plane role for
+  this provisioning flow. Legacy unmanaged Entra configurations fail preflight.
+
+The public-preview service contract always requires the following **four role
 assignments across three resource scopes**:
 
 | Identity | Scope | Role | Role definition ID |
@@ -135,11 +155,18 @@ preparation starts. Both the role assignments and delegation are idempotent.
 Federated identity credentials and trusted access are not pre-created; the
 Foundry service owns its workload federation setup.
 
+Agent-image private trusted-root validation is intentionally outside this
+account/project preflight because the agent image digest is not yet known. It
+must be enforced later in the agent-image lifecycle when that digest is
+available; passing this preflight is not an attestation that private roots were
+validated.
+
 Upgrading from an earlier demo build is non-destructive. azd stops checking and
-creating AKS Contributor, AKS RBAC Cluster Admin, and Foundry resource-group
-Reader assignments. It does not remove any existing customer-owned assignment.
-Review and remove obsolete assignments separately only after confirming they
-are no longer required.
+creating AKS Contributor and Foundry resource-group Reader assignments. AKS RBAC
+Cluster Admin is now checked or created only for managed Entra clusters using
+Azure RBAC. azd does not remove any existing customer-owned assignment. Review
+and remove obsolete assignments separately only after confirming they are no
+longer required.
 
 After saving the `azure.yaml` above in a new project directory, supply the
 existing resource IDs and an explicit, dedicated Foundry resource group:

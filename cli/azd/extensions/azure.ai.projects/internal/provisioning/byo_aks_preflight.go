@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"azure.ai.projects/internal/exterrors"
@@ -20,9 +22,34 @@ import (
 )
 
 const (
-	byoAKSSandboxLabel = "agents.ai.azure.com/sandbox-node"
-	byoAKSDelegation   = "Microsoft.App/environments"
+	byoAKSSandboxLabel        = "agents.ai.azure.com/sandbox-node"
+	byoAKSDelegation          = "Microsoft.App/environments"
+	byoAKSClusterAdminRoleID  = "b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b"
+	byoAKSMinimumNodeImage    = "AKSAzureLinux-V3katagen2-202608.14.0"
+	byoAKSAgentPoolAPIVersion = "2025-08-01"
 )
+
+var byoAKSNodeImagePattern = regexp.MustCompile(
+	`^AKSAzureLinux-V3katagen2-([0-9]{6})\.([0-9]+)\.([0-9]+)$`)
+
+type byoAKSAuthorization int
+
+const (
+	byoAKSAuthorizationNonEntra byoAKSAuthorization = iota
+	byoAKSAuthorizationAzureRBAC
+	byoAKSAuthorizationNativeRBAC
+)
+
+type byoAKSAgentPool struct {
+	name       string
+	properties *armcontainerservice.ManagedClusterAgentPoolProfileProperties
+	sshAccess  string
+}
+
+type byoAKSValidation struct {
+	needsDelegation bool
+	authorization   byoAKSAuthorization
+}
 
 type byoAKSConfig struct {
 	Enabled                             bool   `json:"enabled"`
@@ -40,6 +67,7 @@ type byoAKSResources struct {
 
 type byoAKSSnapshot struct {
 	cluster              armcontainerservice.ManagedCluster
+	agentPools           []*byoAKSAgentPool
 	subnet               armnetwork.Subnet
 	management, workload armmsi.Identity
 	storage              armresources.GenericResource
@@ -120,17 +148,18 @@ func (c *byoAKSConfig) resources(subscriptionID string) (*byoAKSResources, error
 
 func (c *byoAKSConfig) validate(
 	ids *byoAKSResources, state *byoAKSSnapshot, location string,
-) (needsDelegation bool, err error) {
+) (*byoAKSValidation, error) {
 	if !strings.EqualFold(byoAKSString(state.cluster.Location), location) {
-		return false, c.invalid("location", byoAKSString(state.cluster.Location), location,
+		return nil, c.invalid("location", byoAKSString(state.cluster.Location), location,
 			"set AZURE_LOCATION to the AKS region, or select an AKS cluster in the Foundry region")
 	}
 	if !strings.EqualFold(byoAKSString(state.storage.Location), location) {
-		return false, c.invalid("storageAccountResourceId.location", byoAKSString(state.storage.Location), location,
+		return nil, c.invalid("storageAccountResourceId.location", byoAKSString(state.storage.Location), location,
 			"use a storage account in the AKS and Foundry region")
 	}
-	if err := c.validateCluster(state.cluster.Properties); err != nil {
-		return false, err
+	authorization, err := c.validateCluster(state.cluster, state.agentPools)
+	if err != nil {
+		return nil, err
 	}
 	for _, identity := range []struct {
 		name       string
@@ -141,45 +170,77 @@ func (c *byoAKSConfig) validate(
 		{"workloadIdentityResourceId", state.workload.Properties, true},
 	} {
 		if identity.properties == nil || strings.TrimSpace(byoAKSString(identity.properties.PrincipalID)) == "" {
-			return false, c.invalid(identity.name+".principalId", "missing", "a resolved Entra principal ID",
+			return nil, c.invalid(identity.name+".principalId", "missing", "a resolved Entra principal ID",
 				"verify the referenced user-assigned identity exists and has a principalId")
 		}
 		if identity.workload &&
 			(strings.TrimSpace(byoAKSString(identity.properties.ClientID)) == "" ||
 				strings.TrimSpace(byoAKSString(identity.properties.TenantID)) == "") {
-			return false, c.invalid(identity.name+".clientId/tenantId", "missing", "both clientId and tenantId",
+			return nil, c.invalid(identity.name+".clientId/tenantId", "missing", "both clientId and tenantId",
 				"use a fully provisioned workload user-assigned identity")
 		}
 	}
 	if strings.EqualFold(*state.management.Properties.PrincipalID, *state.workload.Properties.PrincipalID) {
-		return false, c.invalid("workloadIdentityResourceId.principalId", "the management principal",
+		return nil, c.invalid("workloadIdentityResourceId.principalId", "the management principal",
 			"a different principal", "provide separate hosting management and workload identities")
 	}
-	return c.validateSubnet(ids, state)
+	needsDelegation, err := c.validateSubnet(ids, state)
+	if err != nil {
+		return nil, err
+	}
+	return &byoAKSValidation{needsDelegation: needsDelegation, authorization: authorization}, nil
 }
 
-func (c *byoAKSConfig) validateCluster(properties *armcontainerservice.ManagedClusterProperties) error {
+func (c *byoAKSConfig) validateCluster(
+	cluster armcontainerservice.ManagedCluster, pools []*byoAKSAgentPool,
+) (byoAKSAuthorization, error) {
+	properties := cluster.Properties
 	if properties == nil {
-		return c.invalid("properties", "missing", "AKS cluster properties", "verify the AKS resource can be read")
+		return 0, c.invalid("properties", "missing", "AKS cluster properties", "verify the AKS resource can be read")
+	}
+	if cluster.SKU == nil ||
+		!strings.EqualFold(byoAKSString(cluster.SKU.Name), string(armcontainerservice.ManagedClusterSKUNameBase)) ||
+		!strings.EqualFold(byoAKSString(cluster.SKU.Tier), string(armcontainerservice.ManagedClusterSKUTierStandard)) {
+		return 0, c.invalid("sku", formatAKSSKU(cluster.SKU), "AKS Base SKU with Standard tier",
+			"use an AKS Standard cluster; AKS Automatic is unsupported")
+	}
+	version := byoAKSString(properties.CurrentKubernetesVersion)
+	if version == "" {
+		version = byoAKSString(properties.KubernetesVersion)
+	}
+	if !byoAKSKubernetesVersionAtLeast(version, 1, 31) {
+		return 0, c.invalid("kubernetesVersion", version, "Kubernetes 1.31 or later",
+			"upgrade the AKS cluster to Kubernetes 1.31 or later; 1.36.3 is currently recommended")
+	}
+	if !strings.EqualFold(byoAKSString(properties.ProvisioningState), "Succeeded") {
+		return 0, c.invalid("provisioningState", byoAKSString(properties.ProvisioningState), "Succeeded",
+			"wait for the AKS cluster provisioning state to become Succeeded")
+	}
+	if !byoAKSManagedIdentity(cluster.Identity) {
+		return 0, c.invalid("identity.type", clusterIdentityType(cluster.Identity),
+			"SystemAssigned or UserAssigned managed identity",
+			"migrate the AKS cluster from service-principal authentication to a managed identity")
 	}
 	oidc := properties.OidcIssuerProfile
 	if oidc == nil || oidc.Enabled == nil || !*oidc.Enabled {
-		return c.invalid("oidcIssuerProfile.enabled", "false or missing", "true", "enable the AKS OIDC issuer")
-	}
-	if strings.TrimSpace(byoAKSString(oidc.IssuerURL)) == "" {
-		return c.invalid("oidcIssuerProfile.issuerURL", "missing", "a non-empty issuer URL",
-			"wait for AKS to finish enabling its OIDC issuer, then retry")
+		return 0, c.invalid("oidcIssuerProfile.enabled", "false or missing", "true", "enable the AKS OIDC issuer")
 	}
 	security := properties.SecurityProfile
 	if security == nil || security.WorkloadIdentity == nil ||
 		security.WorkloadIdentity.Enabled == nil || !*security.WorkloadIdentity.Enabled {
-		return c.invalid("securityProfile.workloadIdentity.enabled", "false or missing", "true",
+		return 0, c.invalid("securityProfile.workloadIdentity.enabled", "false or missing", "true",
 			"enable AKS workload identity")
 	}
-	if properties.AADProfile == nil || properties.AADProfile.EnableAzureRBAC == nil ||
-		!*properties.AADProfile.EnableAzureRBAC {
-		return c.invalid("aadProfile.enableAzureRBAC", "false or missing", "true for this demo",
-			"use an Azure-RBAC-enabled AKS cluster; native Kubernetes RBAC preparation is outside this demo")
+	var policy *armcontainerservice.ManagedClusterAddonProfile
+	for name, profile := range properties.AddonProfiles {
+		if strings.EqualFold(name, "azurepolicy") {
+			policy = profile
+			break
+		}
+	}
+	if policy == nil || policy.Enabled == nil || !*policy.Enabled {
+		return 0, c.invalid("addonProfiles.azurepolicy.enabled", "false or missing", "true",
+			"enable the Azure Policy add-on on the AKS cluster")
 	}
 	network := properties.NetworkProfile
 	if network == nil || !strings.EqualFold(byoAKSString(network.NetworkPlugin), "azure") {
@@ -187,49 +248,116 @@ func (c *byoAKSConfig) validateCluster(properties *armcontainerservice.ManagedCl
 		if network != nil {
 			plugin = byoAKSString(network.NetworkPlugin)
 		}
-		return c.invalid("networkProfile.networkPlugin", plugin, "azure",
-			"use Azure CNI with overlay or a pod subnet configured on every node pool")
+		return 0, c.invalid("networkProfile.networkPlugin", plugin, "azure",
+			"use Azure CNI Overlay or Azure CNI Pod Subnet")
 	}
-	pools := properties.AgentPoolProfiles
 	if !strings.EqualFold(byoAKSString(network.NetworkPluginMode), "overlay") {
 		if len(pools) == 0 {
-			return c.invalid("agentPoolProfiles", "empty", "non-empty pools with podSubnetID on every pool",
-				"use Azure CNI overlay or configure pod subnets for all pools")
+			return 0, c.invalid("agentPools", "empty", "AgentPool child resources with podSubnetID",
+				"use Azure CNI Overlay or Azure CNI Pod Subnet")
 		}
 		for i, pool := range pools {
-			if pool == nil || pool.PodSubnetID == nil {
-				return c.invalid(fmt.Sprintf("agentPoolProfiles[%d].podSubnetID", i), "null", "non-null",
-					"use Azure CNI overlay or configure pod subnets for all pools")
+			if pool == nil || pool.properties == nil ||
+				strings.TrimSpace(byoAKSString(pool.properties.PodSubnetID)) == "" {
+				return 0, c.invalid(fmt.Sprintf("agentPools[%d].podSubnetID", i), "null", "non-null",
+					"use Azure CNI Pod Subnet; Azure CNI Node Subnet is unsupported")
 			}
 		}
 	}
-	for _, pool := range pools {
-		if pool != nil && strings.EqualFold(byoAKSString(pool.WorkloadRuntime), "KataVmIsolation") &&
-			byoAKSString(pool.NodeLabels[byoAKSSandboxLabel]) == "true" {
+	if err := c.validateDedicatedPool(pools); err != nil {
+		return 0, err
+	}
+	aad := properties.AADProfile
+	if aad == nil {
+		return byoAKSAuthorizationNonEntra, nil
+	}
+	if aad.Managed == nil || !*aad.Managed {
+		return 0, c.invalid("aadProfile.managed", "false or missing", "true or no aadProfile",
+			"use managed Microsoft Entra authentication, or a non-Entra AKS cluster")
+	}
+	if aad.EnableAzureRBAC != nil && *aad.EnableAzureRBAC {
+		return byoAKSAuthorizationAzureRBAC, nil
+	}
+	if properties.EnableRBAC == nil || !*properties.EnableRBAC {
+		return 0, c.invalid("enableRBAC", "false or missing", "true for managed Entra with native Kubernetes RBAC",
+			"enable Kubernetes RBAC, or enable Azure RBAC for Kubernetes authorization")
+	}
+	return byoAKSAuthorizationNativeRBAC, nil
+}
+
+func (c *byoAKSConfig) validateDedicatedPool(pools []*byoAKSAgentPool) error {
+	var failures []string
+	for i, pool := range pools {
+		if pool == nil || pool.properties == nil {
+			failures = append(failures, fmt.Sprintf("agentPools[%d] has missing properties", i))
+			continue
+		}
+		properties := pool.properties
+		name := pool.name
+		if name == "" {
+			name = fmt.Sprintf("[%d]", i)
+		}
+		checks := []struct {
+			valid    bool
+			property string
+			observed string
+			expected string
+		}{
+			{strings.EqualFold(byoAKSString(properties.Mode), "User"), "mode",
+				byoAKSString(properties.Mode), "User"},
+			{strings.EqualFold(byoAKSString(properties.OSType), "Linux") &&
+				strings.EqualFold(byoAKSString(properties.OSSKU), "AzureLinux"), "osType/osSKU",
+				byoAKSString(properties.OSType) + "/" + byoAKSString(properties.OSSKU), "Linux/AzureLinux"},
+			{strings.EqualFold(byoAKSString(properties.WorkloadRuntime), "KataVmIsolation"), "workloadRuntime",
+				byoAKSString(properties.WorkloadRuntime), "KataVmIsolation"},
+			{properties.Count != nil && *properties.Count >= 1, "count",
+				formatInt32(properties.Count), "at least 1"},
+			{strings.TrimSpace(byoAKSString(properties.VMSize)) != "", "vmSize",
+				byoAKSString(properties.VMSize), "non-empty"},
+			{byoAKSString(properties.NodeLabels[byoAKSSandboxLabel]) == "true", byoAKSSandboxLabel,
+				byoAKSString(properties.NodeLabels[byoAKSSandboxLabel]), "true"},
+			{byoAKSNodeImageAtLeast(byoAKSString(properties.NodeImageVersion), byoAKSMinimumNodeImage), "nodeImageVersion",
+				byoAKSString(properties.NodeImageVersion), byoAKSMinimumNodeImage + " or later"},
+			{strings.EqualFold(pool.sshAccess, "Disabled"), "securityProfile.sshAccess",
+				pool.sshAccess, "Disabled"},
+			{strings.EqualFold(byoAKSString(properties.ProvisioningState), "Succeeded"), "provisioningState",
+				byoAKSString(properties.ProvisioningState), "Succeeded"},
+		}
+		var poolFailures []string
+		for _, check := range checks {
+			if !check.valid {
+				poolFailures = append(poolFailures,
+					fmt.Sprintf("%s=%q (expected %s)", check.property, missingValue(check.observed), check.expected))
+			}
+		}
+		if len(poolFailures) == 0 {
 			return nil
 		}
+		failures = append(failures, fmt.Sprintf("%s: %s", name, strings.Join(poolFailures, ", ")))
 	}
-	return c.invalid("agentPoolProfiles", "no pool has both required settings",
-		"one pool with workloadRuntime=KataVmIsolation and "+byoAKSSandboxLabel+"=true",
-		"set the sandbox-node label to the exact value 'true' on a KataVmIsolation pool")
+	return c.invalid("agentPools", strings.Join(failures, "; "),
+		"one same User Azure Linux KataVmIsolation pool with count >= 1, non-empty VM size, node image "+
+			byoAKSMinimumNodeImage+" or later, "+byoAKSSandboxLabel+"=true, SSH disabled, and Succeeded state",
+		"create or update a dedicated agent pool that satisfies every requirement")
 }
 
 func (c *byoAKSConfig) validateSubnet(ids *byoAKSResources, state *byoAKSSnapshot) (bool, error) {
-	for i, pool := range state.cluster.Properties.AgentPoolProfiles {
-		if pool == nil {
-			return false, c.invalid(fmt.Sprintf("agentPoolProfiles[%d]", i), "null", "a node pool",
+	for i, pool := range state.agentPools {
+		if pool == nil || pool.properties == nil {
+			return false, c.invalid(fmt.Sprintf("agentPools[%d]", i), "null", "an AgentPool child resource",
 				"verify the AKS node pool configuration")
 		}
-		if strings.EqualFold(byoAKSString(pool.VnetSubnetID), ids.subnet.String()) ||
-			strings.EqualFold(byoAKSString(pool.PodSubnetID), ids.subnet.String()) {
+		properties := pool.properties
+		if strings.EqualFold(byoAKSString(properties.VnetSubnetID), ids.subnet.String()) ||
+			strings.EqualFold(byoAKSString(properties.PodSubnetID), ids.subnet.String()) {
 			return false, c.invalid("agentSubnetResourceId", "an AKS node or pod subnet", "a separate agent subnet",
 				"provide a dedicated Foundry/Data Proxy subnet; azd will not modify AKS node or pod subnets")
 		}
-		nodeSubnet, err := arm.ParseResourceID(byoAKSString(pool.VnetSubnetID))
+		nodeSubnet, err := arm.ParseResourceID(byoAKSString(properties.VnetSubnetID))
 		if err != nil || nodeSubnet.Parent == nil ||
 			!strings.EqualFold(nodeSubnet.ResourceType.String(), "Microsoft.Network/virtualNetworks/subnets") ||
 			!strings.EqualFold(nodeSubnet.Parent.String(), ids.subnet.Parent.String()) {
-			return false, c.invalid(fmt.Sprintf("agentPoolProfiles[%d].vnetSubnetID", i),
+			return false, c.invalid(fmt.Sprintf("agentPools[%d].vnetSubnetID", i),
 				"missing or in a different VNet", "a node subnet in the agent subnet's VNet",
 				"use separate subnets in the same VNet; cross-VNet connectivity is outside this demo")
 		}
@@ -267,6 +395,92 @@ func (c *byoAKSConfig) validateSubnet(ids *byoAKSResources, state *byoAKSSnapsho
 		delegated = true
 	}
 	return !delegated, nil
+}
+
+func byoAKSKubernetesVersionAtLeast(version string, minimumMajor, minimumMinor int) bool {
+	parts := strings.Split(strings.TrimSpace(version), ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	return majorErr == nil && minorErr == nil &&
+		(major > minimumMajor || major == minimumMajor && minor >= minimumMinor)
+}
+
+func byoAKSNodeImageAtLeast(version, minimum string) bool {
+	parse := func(value string) ([3]int, bool) {
+		matches := byoAKSNodeImagePattern.FindStringSubmatch(value)
+		if len(matches) != 4 {
+			return [3]int{}, false
+		}
+		var result [3]int
+		for i := range result {
+			number, err := strconv.Atoi(matches[i+1])
+			if err != nil {
+				return [3]int{}, false
+			}
+			result[i] = number
+		}
+		return result, true
+	}
+	actual, actualOK := parse(version)
+	floor, floorOK := parse(minimum)
+	if !actualOK || !floorOK {
+		return false
+	}
+	for i := range actual {
+		if actual[i] != floor[i] {
+			return actual[i] > floor[i]
+		}
+	}
+	return true
+}
+
+func byoAKSManagedIdentity(identity *armcontainerservice.ManagedClusterIdentity) bool {
+	if identity == nil || identity.Type == nil {
+		return false
+	}
+	parts := strings.FieldsFunc(string(*identity.Type), func(r rune) bool { return r == ',' })
+	hasManaged := false
+	for _, part := range parts {
+		switch strings.TrimSpace(strings.ToLower(part)) {
+		case "systemassigned", "userassigned":
+			hasManaged = true
+		case "":
+		default:
+			return false
+		}
+	}
+	return hasManaged
+}
+
+func formatAKSSKU(sku *armcontainerservice.ManagedClusterSKU) string {
+	if sku == nil {
+		return "<missing>"
+	}
+	return byoAKSString(sku.Name) + "/" + byoAKSString(sku.Tier)
+}
+
+func clusterIdentityType(identity *armcontainerservice.ManagedClusterIdentity) string {
+	if identity == nil {
+		return "<missing>"
+	}
+	return byoAKSString(identity.Type)
+}
+
+func formatInt32(value *int32) string {
+	if value == nil {
+		return "<missing>"
+	}
+	return strconv.FormatInt(int64(*value), 10)
+}
+
+func missingValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "<missing>"
+	}
+	return value
 }
 
 func (c *byoAKSConfig) invalid(property, observed, expected, suggestion string) error {

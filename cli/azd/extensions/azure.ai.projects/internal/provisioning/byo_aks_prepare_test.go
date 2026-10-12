@@ -153,6 +153,34 @@ func newBYOAKSTestProvider(t *testing.T) (*FoundryProvisioningProvider, *byoAKST
 					},
 				})
 			}
+			poolsPath := byoTestCluster + "/agentPools"
+			if strings.EqualFold(request.URL.Path, poolsPath) {
+				require.Equal(t, http.MethodGet, request.Method)
+				result := armcontainerservice.AgentPoolListResult{}
+				for _, pool := range azure.state.agentPools {
+					result.Value = append(result.Value, &armcontainerservice.AgentPool{
+						Name: new(pool.name), Properties: pool.properties,
+					})
+				}
+				return response(http.StatusOK, result)
+			}
+			if strings.HasPrefix(strings.ToLower(request.URL.Path), strings.ToLower(poolsPath+"/")) {
+				require.Equal(t, http.MethodGet, request.Method)
+				name := request.URL.Path[len(poolsPath)+1:]
+				for _, pool := range azure.state.agentPools {
+					if strings.EqualFold(pool.name, name) {
+						return response(http.StatusOK, armresources.GenericResource{
+							ID: new(request.URL.Path),
+							Properties: map[string]any{
+								"securityProfile": map[string]any{"sshAccess": pool.sshAccess},
+							},
+						})
+					}
+				}
+				return response(http.StatusNotFound, map[string]any{
+					"error": map[string]string{"code": "NotFound", "message": "test pool not found"},
+				})
+			}
 			switch strings.ToLower(request.URL.Path) {
 			case strings.ToLower(byoTestCluster):
 				require.Equal(t, http.MethodGet, request.Method)
@@ -224,7 +252,7 @@ func TestBYOAKSDoesNotDiscloseIssuerURLCredentials(t *testing.T) {
 	provider, azure := newBYOAKSTestProvider(t)
 	azure.state.cluster.Properties.OidcIssuerProfile.IssuerURL =
 		new("https://sensitive-user:sensitive-password@issuer.example/?sig=sensitive-signature#sensitive-fragment")
-	azure.state.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
+	azure.state.agentPools[0].properties.NodeLabels = nil
 	var messages []string
 	_, err := provider.Deploy(t.Context(), func(message string) { messages = append(messages, message) })
 	require.Error(t, err)
@@ -317,6 +345,8 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 	assert.Contains(t, output, byoTestManagementID)
 	assert.Contains(t, output, byoTestWorkloadID)
 	assert.Contains(t, output, "may still be propagating")
+	assert.Contains(t, output, "private trusted roots are validated later")
+	assert.NotContains(t, output, "private trusted roots passed")
 
 	azure.requests = nil
 	_, err = provider.Deploy(t.Context(), func(string) {})
@@ -405,16 +435,23 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 		suggestionContains []string
 	}{
 		{"missing sandbox label", func(a *byoAKSTestAzure) {
-			a.state.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
+			a.state.agentPools[0].properties.NodeLabels = nil
 		}, 0, nil},
 		{"different pool has the label", func(a *byoAKSTestAzure) {
-			a.state.cluster.Properties.AgentPoolProfiles[0].NodeLabels = nil
-			a.state.cluster.Properties.AgentPoolProfiles = append(a.state.cluster.Properties.AgentPoolProfiles,
-				&armcontainerservice.ManagedClusterAgentPoolProfile{
-					NodeLabels: map[string]*string{byoAKSSandboxLabel: new("true")}, VnetSubnetID: new(byoTestNodeSubnet),
-				})
+			a.state.agentPools[0].properties.NodeLabels = nil
+			a.state.agentPools = append(a.state.agentPools, &byoAKSAgentPool{
+				name: "wrong", sshAccess: "Disabled",
+				properties: &armcontainerservice.ManagedClusterAgentPoolProfileProperties{
+					Mode:         new(armcontainerservice.AgentPoolModeUser),
+					OSType:       new(armcontainerservice.OSTypeLinux),
+					OSSKU:        new(armcontainerservice.OSSKUAzureLinux),
+					NodeLabels:   map[string]*string{byoAKSSandboxLabel: new("true")},
+					VnetSubnetID: new(byoTestNodeSubnet), Count: new(int32(1)),
+					VMSize: new("Standard_D4s_v3"), NodeImageVersion: new(byoAKSMinimumNodeImage),
+					ProvisioningState: new("Succeeded"),
+				},
+			})
 		}, 0, nil},
-		{"native Kubernetes RBAC", func(a *byoAKSTestAzure) { a.state.cluster.Properties.AADProfile = nil }, 0, nil},
 		{"role read denied", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/roleAssignments") {
@@ -430,6 +467,22 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 			a.fail = func(r *http.Request) (int, string) {
 				if r.URL.Path == byoTestCluster {
 					return http.StatusConflict, "MissingSubscriptionRegistration"
+				}
+				return 0, ""
+			}
+		}, 0, nil},
+		{"AgentPool list denied", func(a *byoAKSTestAzure) {
+			a.fail = func(r *http.Request) (int, string) {
+				if strings.EqualFold(r.URL.Path, byoTestCluster+"/agentPools") {
+					return http.StatusForbidden, "AuthorizationFailed"
+				}
+				return 0, ""
+			}
+		}, 0, nil},
+		{"AgentPool direct GET failed", func(a *byoAKSTestAzure) {
+			a.fail = func(r *http.Request) (int, string) {
+				if strings.HasSuffix(strings.ToLower(r.URL.Path), "/agentpools/kata") {
+					return http.StatusInternalServerError, "ServiceError"
 				}
 				return 0, ""
 			}
@@ -479,12 +532,75 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 					assert.Contains(t, service.Suggestion, expected)
 				}
 			}
+
 			assert.Len(t, azure.writes(), tt.writes)
 			for _, request := range azure.requests {
 				assert.NotContains(t, request.path, "/providers/Microsoft.Resources/deployments/")
 			}
 		})
 	}
+}
+
+func TestBYOAKSAuthorizationBranches(t *testing.T) {
+	t.Run("managed Entra Azure RBAC plans cluster admin idempotently", func(t *testing.T) {
+		provider, azure := newBYOAKSTestProvider(t)
+		azure.state.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+			Managed: new(true), EnableAzureRBAC: new(true),
+		}
+		_, err := provider.Deploy(t.Context(), func(string) {})
+		require.NoError(t, err)
+		var clusterAdminWrites int
+		for _, request := range azure.writes() {
+			if strings.Contains(string(request.body), byoAKSClusterAdminRoleID) {
+				clusterAdminWrites++
+			}
+		}
+		assert.Equal(t, 1, clusterAdminWrites)
+
+		azure.requests = nil
+		_, err = provider.Deploy(t.Context(), func(string) {})
+		require.NoError(t, err)
+		for _, request := range azure.writes() {
+			assert.NotContains(t, string(request.body), byoAKSClusterAdminRoleID)
+		}
+	})
+
+	t.Run("managed Entra native RBAC is checked before writes", func(t *testing.T) {
+		provider, azure := newBYOAKSTestProvider(t)
+		azure.state.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+			Managed: new(true), EnableAzureRBAC: new(false),
+		}
+		called := false
+		provider.byoAKSNativeRBACCheck = func(
+			_ context.Context, _ *byoAKSResources, principalID string, _ *arm.ClientOptions,
+		) error {
+			called = true
+			assert.Equal(t, byoTestManagementID, principalID)
+			assert.Empty(t, azure.writes())
+			return nil
+		}
+		_, err := provider.Deploy(t.Context(), func(string) {})
+		require.NoError(t, err)
+		assert.True(t, called)
+		for _, request := range azure.writes() {
+			assert.NotContains(t, string(request.body), byoAKSClusterAdminRoleID)
+		}
+	})
+
+	t.Run("native RBAC failure causes zero writes", func(t *testing.T) {
+		provider, azure := newBYOAKSTestProvider(t)
+		azure.state.cluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+			Managed: new(true), EnableAzureRBAC: new(false),
+		}
+		provider.byoAKSNativeRBACCheck = func(
+			context.Context, *byoAKSResources, string, *arm.ClientOptions,
+		) error {
+			return errors.New("native Kubernetes RBAC test failure")
+		}
+		_, err := provider.Deploy(t.Context(), func(string) {})
+		require.ErrorContains(t, err, "native Kubernetes RBAC test failure")
+		assert.Empty(t, azure.writes())
+	})
 }
 
 func TestBYOAKSDeployPreservesFoundryServiceError(t *testing.T) {
@@ -565,7 +681,7 @@ func TestBYOAKSRoleEquivalence(t *testing.T) {
 	config, state := byoAKSTestConfig(), byoAKSTestSnapshot()
 	ids, err := config.resources(byoTestSubscription)
 	require.NoError(t, err)
-	role := byoAKSRoles(ids, state)[3]
+	role := byoAKSRoles(ids, state, byoAKSAuthorizationNonEntra)[3]
 	for _, tt := range []struct {
 		name, scope, principal, condition string
 		equivalent                        bool

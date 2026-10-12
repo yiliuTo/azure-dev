@@ -107,6 +107,7 @@ type FoundryProvisioningProvider struct {
 	existingAcrPullAssigned       bool
 	resourceTokenSalt             string
 	resourceGroupState            func(context.Context) (map[string]*string, bool, error)
+	byoAKSNativeRBACCheck         func(context.Context, *byoAKSResources, string, *arm.ClientOptions) error
 
 	// Lazily constructed on first compile. nil until needed.
 	bicepCliInstance bicepCompiler
