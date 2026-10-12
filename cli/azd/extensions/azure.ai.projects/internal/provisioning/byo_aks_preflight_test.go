@@ -27,6 +27,8 @@ const (
 	byoTestVNet         = byoTestScope + "/providers/Microsoft.Network/virtualNetworks/vnet"
 	byoTestNodeSubnet   = byoTestVNet + "/subnets/nodes"
 	byoTestAgentSubnet  = byoTestVNet + "/subnets/agents"
+	byoTestRouteTable   = byoTestScope + "/providers/Microsoft.Network/routeTables/existing"
+	byoTestNSG          = byoTestScope + "/providers/Microsoft.Network/networkSecurityGroups/existing"
 	byoTestManagement   = byoTestScope + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/management"
 	byoTestWorkload     = byoTestScope + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/workload"
 	byoTestStorage      = byoTestScope + "/providers/Microsoft.Storage/storageAccounts/storage"
@@ -43,6 +45,39 @@ func byoAKSTestConfig() *byoAKSConfig {
 }
 
 func byoAKSTestSnapshot() *byoAKSSnapshot {
+	agentSubnet := armnetwork.Subnet{
+		ID: new(byoTestAgentSubnet), Name: new("agents"),
+		Properties: &armnetwork.SubnetPropertiesFormat{
+			AddressPrefix: new("10.20.2.0/27"),
+			NetworkSecurityGroup: &armnetwork.SecurityGroup{
+				ID: new(byoTestNSG),
+			},
+			RouteTable: &armnetwork.RouteTable{
+				ID: new(byoTestRouteTable),
+			},
+			NatGateway: &armnetwork.SubResource{
+				ID: new(byoTestScope + "/providers/Microsoft.Network/natGateways/existing"),
+			},
+			DefaultOutboundAccess: new(false),
+			ServiceEndpoints: []*armnetwork.ServiceEndpointPropertiesFormat{{
+				Service: new("Microsoft.Storage"), Locations: []*string{new("eastus2")},
+			}},
+		},
+	}
+	nodeSubnet := armnetwork.Subnet{
+		ID: new(byoTestNodeSubnet), Name: new("nodes"),
+		Properties: &armnetwork.SubnetPropertiesFormat{
+			AddressPrefix: new("10.20.1.0/24"),
+		},
+	}
+	storage := armresources.GenericResource{
+		ID: new(byoTestStorage), Location: new("eastus2"),
+		Properties: map[string]any{
+			"publicNetworkAccess": "Enabled",
+			"primaryEndpoints":    map[string]any{"blob": "https://storage.blob.core.windows.net/"},
+			"networkAcls":         map[string]any{"defaultAction": "Allow"},
+		},
+	}
 	return &byoAKSSnapshot{
 		cluster: armcontainerservice.ManagedCluster{
 			ID: new(byoTestCluster), Location: new("eastus2"),
@@ -92,24 +127,45 @@ func byoAKSTestSnapshot() *byoAKSSnapshot {
 		workload: armmsi.Identity{Properties: &armmsi.UserAssignedIdentityProperties{
 			PrincipalID: new(byoTestWorkloadID), ClientID: new("workload-client"), TenantID: new("workload-tenant"),
 		}},
-		storage: armresources.GenericResource{ID: new(byoTestStorage), Location: new("eastus2")},
-		subnet: armnetwork.Subnet{
-			ID: new(byoTestAgentSubnet), Name: new("agents"),
-			Properties: &armnetwork.SubnetPropertiesFormat{
-				AddressPrefix: new("10.20.2.0/28"),
-				NetworkSecurityGroup: &armnetwork.SecurityGroup{
-					ID: new(byoTestScope + "/providers/Microsoft.Network/networkSecurityGroups/existing"),
+		storage: storage,
+		subnet:  agentSubnet,
+		network: &byoAKSNetworkSnapshot{
+			subnets: map[string]armnetwork.Subnet{
+				byoAKSNetworkKey(byoTestAgentSubnet): agentSubnet,
+				byoAKSNetworkKey(byoTestNodeSubnet):  nodeSubnet,
+			},
+			virtualNetworks: map[string]armnetwork.VirtualNetwork{
+				byoAKSNetworkKey(byoTestVNet): {
+					ID: new(byoTestVNet), Name: new("vnet"),
+					Properties: &armnetwork.VirtualNetworkPropertiesFormat{
+						ProvisioningState: new(armnetwork.ProvisioningStateSucceeded),
+					},
 				},
-				RouteTable: &armnetwork.RouteTable{
-					ID: new(byoTestScope + "/providers/Microsoft.Network/routeTables/existing"),
+			},
+			peerings: map[string][]*armnetwork.VirtualNetworkPeering{},
+			routeTables: map[string]armnetwork.RouteTable{
+				byoAKSNetworkKey(byoTestRouteTable): {
+					ID: new(byoTestRouteTable),
+					Properties: &armnetwork.RouteTablePropertiesFormat{
+						ProvisioningState: new(armnetwork.ProvisioningStateSucceeded),
+					},
 				},
-				NatGateway: &armnetwork.SubResource{
-					ID: new(byoTestScope + "/providers/Microsoft.Network/natGateways/existing"),
+			},
+			securityGroups: map[string]armnetwork.SecurityGroup{
+				byoAKSNetworkKey(byoTestNSG): {
+					ID: new(byoTestNSG),
+					Properties: &armnetwork.SecurityGroupPropertiesFormat{
+						ProvisioningState: new(armnetwork.ProvisioningStateSucceeded),
+					},
 				},
-				DefaultOutboundAccess: new(false),
-				ServiceEndpoints: []*armnetwork.ServiceEndpointPropertiesFormat{{
-					Service: new("Microsoft.Storage"), Locations: []*string{new("eastus2")},
-				}},
+			},
+			privateEndpoints:    map[string]*byoAKSPrivateEndpointSnapshot{},
+			privateDNSZoneLinks: map[string][]byoAKSPrivateDNSZoneLink{},
+			storage: byoAKSStorageNetwork{
+				resourceID:          byoTestStorage,
+				publicNetworkAccess: "Enabled",
+				defaultAction:       "Allow",
+				blobEndpoint:        "https://storage.blob.core.windows.net/",
 			},
 		},
 	}
@@ -143,14 +199,20 @@ func TestBYOAKSPreflight(t *testing.T) {
 		}, ""},
 		{"non overlay all pools have pod subnets", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.NetworkProfile.NetworkPluginMode = nil
-			s.agentPools[0].properties.PodSubnetID = new(byoTestVNet + "/subnets/pods")
+			podSubnetID := byoTestVNet + "/subnets/pods"
+			s.agentPools[0].properties.PodSubnetID = new(podSubnetID)
+			s.network.subnets[byoAKSNetworkKey(podSubnetID)] = armnetwork.Subnet{
+				ID: new(podSubnetID), Name: new("pods"),
+				Properties: &armnetwork.SubnetPropertiesFormat{AddressPrefix: new("10.20.3.0/24")},
+			}
 		}, ""},
 		{"missing issuer URL is allowed", func(s *byoAKSSnapshot) {
 			s.cluster.Properties.OidcIssuerProfile.IssuerURL = nil
 		}, ""},
 		{"addressPrefixes fallback", func(s *byoAKSSnapshot) {
 			s.subnet.Properties.AddressPrefix = nil
-			s.subnet.Properties.AddressPrefixes = []*string{new("192.168.1.0/28")}
+			s.subnet.Properties.AddressPrefixes = []*string{new("192.168.1.0/27")}
+			s.network.subnets[byoAKSNetworkKey(byoTestAgentSubnet)] = s.subnet
 		}, ""},
 		{"cluster region", func(s *byoAKSSnapshot) { s.cluster.Location = new("westus") }, "location"},
 		{"storage region", func(s *byoAKSSnapshot) {
@@ -257,14 +319,12 @@ func TestBYOAKSPreflight(t *testing.T) {
 		{"agent subnet is a pod subnet", func(s *byoAKSSnapshot) {
 			s.agentPools[0].properties.PodSubnetID = new(byoTestAgentSubnet)
 		}, "agentSubnetResourceId"},
-		{"different VNet is a demo boundary", func(s *byoAKSSnapshot) {
-			s.agentPools[0].properties.VnetSubnetID = new(byoTestVNet + "-other/subnets/nodes")
-		}, "agentPools[0].vnetSubnetID"},
 		{"missing subnet properties", func(s *byoAKSSnapshot) {
 			s.subnet.Properties = nil
 		}, "agentSubnetResourceId.properties"},
 		{"unsupported prefix", func(s *byoAKSSnapshot) {
 			s.subnet.Properties.AddressPrefix = new("11.0.0.0/24")
+			s.network.subnets[byoAKSNetworkKey(byoTestAgentSubnet)] = s.subnet
 		}, "agentSubnetResourceId.addressPrefix"},
 		{"conflicting delegation", func(s *byoAKSSnapshot) {
 			s.subnet.Properties.Delegations = []*armnetwork.Delegation{{

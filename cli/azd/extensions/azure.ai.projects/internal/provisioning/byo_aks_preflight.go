@@ -1,13 +1,12 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-// cspell:ignore BYOAKS armnetwork Kata
+// cspell:ignore AKSSKU BYOAKS OSSKU armnetwork azurepolicy Kata katagen systemassigned userassigned
 
 package provisioning
 
 import (
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -71,6 +70,7 @@ type byoAKSSnapshot struct {
 	subnet               armnetwork.Subnet
 	management, workload armmsi.Identity
 	storage              armresources.GenericResource
+	network              *byoAKSNetworkSnapshot
 }
 
 func byoAKSConfigFromParameters(parameters map[string]any) (*byoAKSConfig, error) {
@@ -184,7 +184,7 @@ func (c *byoAKSConfig) validate(
 		return nil, c.invalid("workloadIdentityResourceId.principalId", "the management principal",
 			"a different principal", "provide separate hosting management and workload identities")
 	}
-	needsDelegation, err := c.validateSubnet(ids, state)
+	needsDelegation, err := c.validateNetwork(ids, state)
 	if err != nil {
 		return nil, err
 	}
@@ -339,62 +339,6 @@ func (c *byoAKSConfig) validateDedicatedPool(pools []*byoAKSAgentPool) error {
 		"one same User Azure Linux KataVmIsolation pool with count >= 1, non-empty VM size, node image "+
 			byoAKSMinimumNodeImage+" or later, "+byoAKSSandboxLabel+"=true, SSH disabled, and Succeeded state",
 		"create or update a dedicated agent pool that satisfies every requirement")
-}
-
-func (c *byoAKSConfig) validateSubnet(ids *byoAKSResources, state *byoAKSSnapshot) (bool, error) {
-	for i, pool := range state.agentPools {
-		if pool == nil || pool.properties == nil {
-			return false, c.invalid(fmt.Sprintf("agentPools[%d]", i), "null", "an AgentPool child resource",
-				"verify the AKS node pool configuration")
-		}
-		properties := pool.properties
-		if strings.EqualFold(byoAKSString(properties.VnetSubnetID), ids.subnet.String()) ||
-			strings.EqualFold(byoAKSString(properties.PodSubnetID), ids.subnet.String()) {
-			return false, c.invalid("agentSubnetResourceId", "an AKS node or pod subnet", "a separate agent subnet",
-				"provide a dedicated Foundry/Data Proxy subnet; azd will not modify AKS node or pod subnets")
-		}
-		nodeSubnet, err := arm.ParseResourceID(byoAKSString(properties.VnetSubnetID))
-		if err != nil || nodeSubnet.Parent == nil ||
-			!strings.EqualFold(nodeSubnet.ResourceType.String(), "Microsoft.Network/virtualNetworks/subnets") ||
-			!strings.EqualFold(nodeSubnet.Parent.String(), ids.subnet.Parent.String()) {
-			return false, c.invalid(fmt.Sprintf("agentPools[%d].vnetSubnetID", i),
-				"missing or in a different VNet", "a node subnet in the agent subnet's VNet",
-				"use separate subnets in the same VNet; cross-VNet connectivity is outside this demo")
-		}
-	}
-	properties := state.subnet.Properties
-	if properties == nil {
-		return false, c.invalid("agentSubnetResourceId.properties", "missing", "subnet properties",
-			"verify the agent subnet can be read")
-	}
-	addressPrefix := byoAKSString(properties.AddressPrefix)
-	if addressPrefix == "" && len(properties.AddressPrefixes) > 0 {
-		addressPrefix = byoAKSString(properties.AddressPrefixes[0])
-	}
-	prefix, err := netip.ParsePrefix(addressPrefix)
-	if err != nil || !prefix.Addr().Is4() {
-		return false, c.invalid("agentSubnetResourceId.addressPrefix", addressPrefix, "an IPv4 CIDR",
-			"provide an agent subnet with an IPv4 address prefix beginning with 10, 172 or 192")
-	}
-	firstOctet := prefix.Addr().As4()[0]
-	if firstOctet != 10 && firstOctet != 172 && firstOctet != 192 {
-		return false, c.invalid("agentSubnetResourceId.addressPrefix", addressPrefix, "a 10, 172 or 192 IPv4 prefix",
-			"select an agent subnet with a supported address prefix; azd will not change its address range")
-	}
-	delegated := false
-	for _, delegation := range properties.Delegations {
-		if delegation == nil || delegation.Properties == nil ||
-			!strings.EqualFold(byoAKSString(delegation.Properties.ServiceName), byoAKSDelegation) {
-			service := "unknown delegation"
-			if delegation != nil && delegation.Properties != nil {
-				service = byoAKSString(delegation.Properties.ServiceName)
-			}
-			return false, c.invalid("agentSubnetResourceId.delegations", service, byoAKSDelegation+" or no delegation",
-				"use a dedicated agent subnet; azd will not remove or replace another service's delegation")
-		}
-		delegated = true
-	}
-	return !delegated, nil
 }
 
 func byoAKSKubernetesVersionAtLeast(version string, minimumMajor, minimumMinor int) bool {

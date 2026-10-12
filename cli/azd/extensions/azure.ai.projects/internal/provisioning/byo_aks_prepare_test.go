@@ -93,10 +93,16 @@ services:
 `, byoTestCluster, byoTestAgentSubnet, byoTestManagement, byoTestWorkload, byoTestStorage)
 }
 
-func newBYOAKSTestProvider(t *testing.T) (*FoundryProvisioningProvider, *byoAKSTestAzure) {
+func newBYOAKSTestProvider(
+	t *testing.T, states ...*byoAKSSnapshot,
+) (*FoundryProvisioningProvider, *byoAKSTestAzure) {
 	t.Helper()
+	state := byoAKSTestSnapshot()
+	if len(states) > 0 {
+		state = states[0]
+	}
 	azure := &byoAKSTestAzure{
-		state: byoAKSTestSnapshot(), assignments: map[string][]*armauthorization.RoleAssignment{},
+		state: state, assignments: map[string][]*armauthorization.RoleAssignment{},
 		transport: mockhttp.NewMockHttpUtil(),
 	}
 	azure.transport.When(func(*http.Request) bool { return true }).RespondFn(
@@ -169,17 +175,100 @@ func newBYOAKSTestProvider(t *testing.T) (*FoundryProvisioningProvider, *byoAKST
 				name := request.URL.Path[len(poolsPath)+1:]
 				for _, pool := range azure.state.agentPools {
 					if strings.EqualFold(pool.name, name) {
+						properties, err := json.Marshal(pool.properties)
+						require.NoError(t, err)
+						var rawProperties map[string]any
+						require.NoError(t, json.Unmarshal(properties, &rawProperties))
+						rawProperties["securityProfile"] = map[string]any{"sshAccess": pool.sshAccess}
 						return response(http.StatusOK, armresources.GenericResource{
-							ID: new(request.URL.Path),
-							Properties: map[string]any{
-								"securityProfile": map[string]any{"sshAccess": pool.sshAccess},
-							},
+							ID:         new(request.URL.Path),
+							Properties: rawProperties,
 						})
 					}
 				}
 				return response(http.StatusNotFound, map[string]any{
 					"error": map[string]string{"code": "NotFound", "message": "test pool not found"},
 				})
+			}
+			pathKey := byoAKSNetworkKey(request.URL.Path)
+			if subnet, exists := azure.state.network.subnets[pathKey]; exists {
+				if request.Method == http.MethodPut {
+					require.True(t, strings.EqualFold(request.URL.Path, byoTestAgentSubnet))
+					require.NoError(t, json.Unmarshal(body, &subnet))
+					require.NotNil(t, subnet.Properties)
+					subnet.Properties.ProvisioningState = new(armnetwork.ProvisioningStateSucceeded)
+					azure.state.subnet = subnet
+					azure.state.network.subnets[pathKey] = subnet
+				} else {
+					require.Equal(t, http.MethodGet, request.Method)
+				}
+				return response(http.StatusOK, subnet)
+			}
+			if vnet, exists := azure.state.network.virtualNetworks[pathKey]; exists {
+				require.Equal(t, http.MethodGet, request.Method)
+				return response(http.StatusOK, vnet)
+			}
+			if table, exists := azure.state.network.routeTables[pathKey]; exists {
+				require.Equal(t, http.MethodGet, request.Method)
+				return response(http.StatusOK, table)
+			}
+			if group, exists := azure.state.network.securityGroups[pathKey]; exists {
+				require.Equal(t, http.MethodGet, request.Method)
+				return response(http.StatusOK, group)
+			}
+			if endpoint, exists := azure.state.network.privateEndpoints[pathKey]; exists {
+				require.Equal(t, http.MethodGet, request.Method)
+				return response(http.StatusOK, endpoint.resource)
+			}
+			for vnetID, peerings := range azure.state.network.peerings {
+				if strings.EqualFold(request.URL.Path, vnetID+"/virtualNetworkPeerings") {
+					require.Equal(t, http.MethodGet, request.Method)
+					return response(http.StatusOK, armnetwork.VirtualNetworkPeeringListResult{Value: peerings})
+				}
+			}
+			for endpointID, endpoint := range azure.state.network.privateEndpoints {
+				if strings.EqualFold(request.URL.Path, endpointID+"/privateDnsZoneGroups") {
+					require.Equal(t, http.MethodGet, request.Method)
+					return response(http.StatusOK, armnetwork.PrivateDNSZoneGroupListResult{
+						Value: endpoint.dnsZoneGroups,
+					})
+				}
+			}
+			for _, links := range azure.state.network.privateDNSZoneLinks {
+				for _, link := range links {
+					if strings.EqualFold(request.URL.Path, link.id) {
+						require.Equal(t, http.MethodGet, request.Method)
+						return response(http.StatusOK, armresources.GenericResource{
+							ID: new(link.id),
+							Properties: map[string]any{
+								"virtualNetwork":          map[string]any{"id": link.virtualNetworkID},
+								"provisioningState":       link.provisioningState,
+								"virtualNetworkLinkState": link.linkState,
+							},
+						})
+					}
+				}
+			}
+			if strings.HasSuffix(strings.ToLower(request.URL.Path), "/resources") &&
+				strings.EqualFold(
+					request.URL.Query().Get("$filter"),
+					"resourceType eq 'Microsoft.Network/privateDnsZones/virtualNetworkLinks'",
+				) {
+				require.Equal(t, http.MethodGet, request.Method)
+				var values []*armresources.GenericResourceExpanded
+				for _, links := range azure.state.network.privateDNSZoneLinks {
+					for _, link := range links {
+						values = append(values, &armresources.GenericResourceExpanded{
+							ID: new(link.id),
+							Properties: map[string]any{
+								"virtualNetwork":          map[string]any{"id": link.virtualNetworkID},
+								"provisioningState":       link.provisioningState,
+								"virtualNetworkLinkState": link.linkState,
+							},
+						})
+					}
+				}
+				return response(http.StatusOK, armresources.ResourceListResult{Value: values})
 			}
 			switch strings.ToLower(request.URL.Path) {
 			case strings.ToLower(byoTestCluster):
@@ -194,17 +283,6 @@ func newBYOAKSTestProvider(t *testing.T) (*FoundryProvisioningProvider, *byoAKST
 			case strings.ToLower(byoTestStorage):
 				require.Equal(t, http.MethodGet, request.Method)
 				return response(http.StatusOK, azure.state.storage)
-			case strings.ToLower(byoTestAgentSubnet):
-				if request.Method == http.MethodPut {
-					var subnet armnetwork.Subnet
-					require.NoError(t, json.Unmarshal(body, &subnet))
-					require.NotNil(t, subnet.Properties)
-					subnet.Properties.ProvisioningState = new(armnetwork.ProvisioningStateSucceeded)
-					azure.state.subnet = subnet
-				} else {
-					require.Equal(t, http.MethodGet, request.Method)
-				}
-				return response(http.StatusOK, azure.state.subnet)
 			default:
 				t.Fatalf("unexpected ARM request: %s %s", request.Method, request.URL.Path)
 				return nil, nil
@@ -320,6 +398,13 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 			strings.ToLower(byoTestFoundryRG+"/providers/Microsoft.Authorization/roleAssignments"),
 		), "Foundry resource-group Reader must not be checked or created")
 	}
+	for _, request := range azure.requests {
+		path := strings.ToLower(request.path)
+		assert.NotContains(t, path, "/privateendpoints",
+			"public Storage access must not require private endpoint reads")
+		assert.NotContains(t, path, "/privatednszonegroups",
+			"public Storage access must not require private DNS zone-group reads")
+	}
 	assert.Equal(t, byoTestAgentSubnet, writes[4].path)
 	assert.Contains(t, writes[5].path, "/providers/Microsoft.Resources/deployments/")
 	var deployment armresources.Deployment
@@ -354,6 +439,84 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 	writes = azure.writes()
 	require.Len(t, writes, 1, "rerunning must not rewrite existing role assignments or subnet delegation")
 	assert.Contains(t, writes[0].path, "/providers/Microsoft.Resources/deployments/")
+}
+
+func TestBYOAKSDeployReadsCrossVNetPrerequisites(t *testing.T) {
+	snapshot := byoAKSTestSnapshot()
+	aksVNet, _ := configureBYOAKSCrossVNet(snapshot)
+	provider, azure := newBYOAKSTestProvider(t, snapshot)
+
+	_, err := provider.Deploy(t.Context(), func(string) {})
+	require.NoError(t, err)
+
+	requests := make([]string, 0, len(azure.requests))
+	for _, request := range azure.requests {
+		requests = append(requests, strings.ToLower(request.path))
+	}
+	allRequests := strings.Join(requests, "\n")
+	assert.Contains(t, allRequests, strings.ToLower(byoTestVNet+"/virtualNetworkPeerings"))
+	assert.Contains(t, allRequests, strings.ToLower(aksVNet+"/virtualNetworkPeerings"))
+}
+
+func TestBYOAKSDeployReadsRestrictedStoragePrivateLinkPrerequisites(t *testing.T) {
+	snapshot := byoAKSTestSnapshot()
+	privateEndpointID, _ := configureBYOAKSStoragePrivateEndpoint(snapshot)
+	snapshot.storage.Properties = map[string]any{
+		"publicNetworkAccess": "Disabled",
+		"networkAcls":         map[string]any{"defaultAction": "Deny"},
+		"primaryEndpoints":    map[string]any{"blob": "https://storage.blob.core.windows.net/"},
+		"privateEndpointConnections": []any{
+			map[string]any{
+				"properties": map[string]any{
+					"privateEndpoint": map[string]any{"id": privateEndpointID},
+					"privateLinkServiceConnectionState": map[string]any{
+						"status": "Approved",
+					},
+					"groupIds": []any{"blob"},
+				},
+			},
+		},
+	}
+	provider, azure := newBYOAKSTestProvider(t, snapshot)
+
+	_, err := provider.Deploy(t.Context(), func(string) {})
+	require.NoError(t, err)
+
+	requests := make([]string, 0, len(azure.requests))
+	for _, request := range azure.requests {
+		requests = append(requests, strings.ToLower(request.path))
+	}
+	allRequests := strings.Join(requests, "\n")
+	assert.Contains(t, allRequests, strings.ToLower(privateEndpointID))
+	assert.Contains(t, allRequests, strings.ToLower(privateEndpointID+"/privateDnsZoneGroups"))
+	assert.Contains(t, allRequests, strings.ToLower(byoTestScope+"/resources"))
+}
+
+func TestBYOAKSDeployRestrictedStorageServiceEndpointsSkipPrivateLinkReads(t *testing.T) {
+	snapshot := byoAKSTestSnapshot()
+	configureBYOAKSStorageServiceEndpoint(snapshot)
+	var rules []any
+	for _, rule := range snapshot.network.storage.virtualNetworkRules {
+		rules = append(rules, map[string]any{"id": rule.id, "state": rule.state})
+	}
+	snapshot.storage.Properties = map[string]any{
+		"publicNetworkAccess": "Enabled",
+		"networkAcls": map[string]any{
+			"defaultAction":       "Deny",
+			"virtualNetworkRules": rules,
+		},
+		"primaryEndpoints": map[string]any{"blob": "https://storage.blob.core.windows.net/"},
+	}
+	provider, azure := newBYOAKSTestProvider(t, snapshot)
+
+	_, err := provider.Deploy(t.Context(), func(string) {})
+	require.NoError(t, err)
+
+	for _, request := range azure.requests {
+		path := strings.ToLower(request.path)
+		assert.NotContains(t, path, "/privateendpoints")
+		assert.NotContains(t, path, "/privatednszonegroups")
+	}
 }
 
 func TestBYOAKSExistingAKSReaderAssignmentsAreReused(t *testing.T) {
@@ -483,6 +646,29 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 			a.fail = func(r *http.Request) (int, string) {
 				if strings.HasSuffix(strings.ToLower(r.URL.Path), "/agentpools/kata") {
 					return http.StatusInternalServerError, "ServiceError"
+				}
+				return 0, ""
+			}
+		}, 0, nil},
+		{"node subnet direct GET failed", func(a *byoAKSTestAzure) {
+			a.fail = func(r *http.Request) (int, string) {
+				if strings.EqualFold(r.URL.Path, byoTestNodeSubnet) {
+					return http.StatusForbidden, "AuthorizationFailed"
+				}
+				return 0, ""
+			}
+		}, 0, nil},
+		{"pod subnet direct GET failed", func(a *byoAKSTestAzure) {
+			podSubnetID := byoTestVNet + "/subnets/pods"
+			a.state.cluster.Properties.NetworkProfile.NetworkPluginMode = nil
+			a.state.agentPools[0].properties.PodSubnetID = new(podSubnetID)
+			a.state.network.subnets[byoAKSNetworkKey(podSubnetID)] = armnetwork.Subnet{
+				ID: new(podSubnetID), Name: new("pods"),
+				Properties: &armnetwork.SubnetPropertiesFormat{AddressPrefix: new("10.20.3.0/24")},
+			}
+			a.fail = func(r *http.Request) (int, string) {
+				if strings.EqualFold(r.URL.Path, podSubnetID) {
+					return http.StatusForbidden, "AuthorizationFailed"
 				}
 				return 0, ""
 			}

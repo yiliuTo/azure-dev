@@ -1,5 +1,7 @@
 # Foundry Projects
 
+<!-- cspell:ignore UAMI Kata blackhole katagen kubenet -->
+
 Manage Microsoft Foundry Project resources from your terminal. (Preview)
 
 See the shared [AI extension non-interactive input reference](../ai-non-interactive.md)
@@ -73,6 +75,10 @@ Projects without `agentHosting` keep their existing behavior.
 
 All requests use the identity logged in through `azd auth login`, not either
 managed identity. The caller needs read access to the referenced resources and
+the AKS AgentPool child resources, node and pod subnets, parent VNets, peerings,
+and any attached route tables or NSGs. Restricted storage configurations also
+require read access to the storage network policy and, when configured, its
+private endpoints, private DNS zone groups, zones and VNet links. The caller needs
 `Microsoft.Authorization/roleAssignments/read` and
 `Microsoft.Authorization/roleAssignments/write` at the AKS cluster, workload
 UAMI and storage account scopes listed below, and
@@ -95,7 +101,7 @@ The preflight checks:
   not required as an additional preflight condition.
 - The network is Azure CNI Overlay or Azure CNI Pod Subnet. kubenet and Azure CNI
   Node Subnet are rejected.
-- azd lists the AgentPool child ARM resources directly. **One and the same pool**
+- azd lists and then reads each AgentPool child ARM resource directly. **One and the same pool**
   must be User mode, Linux with Azure Linux, `KataVmIsolation`, count at least
   one, have a non-empty VM size, node image
   `AKSAzureLinux-V3katagen2-202608.14.0` or later, exact label
@@ -103,11 +109,32 @@ The preflight checks:
   provisioning state `Succeeded`. azd does not change the pool.
 - The two managed identities are different, both have resolved `principalId`
   values, and the workload identity also has `clientId` and `tenantId`.
-- The dedicated Foundry/Data Proxy subnet is different from every AKS node and pod
-  subnet. For this demo, it must be in the same VNet as the node subnets.
-- The agent subnet has an IPv4 address prefix beginning with 10, 172 or 192,
-  using `addressPrefix` or the first `addressPrefixes` entry. This demo does not
-  impose a `/27` minimum or a minimum VM SKU beyond a non-empty pool VM size.
+- The dedicated Foundry/Data Proxy subnet has one RFC 1918 IPv4 prefix with an
+  exact `/27` mask. azd reads the node subnet referenced by every AgentPool and,
+  for non-overlay networking, every referenced pod subnet. It compares their
+  actual address prefixes and rejects any CIDR overlap with the agent subnet.
+- When the agent and AKS subnets share a VNet, Azure system routing and
+  Azure-provided DNS satisfy the routing and name-resolution prerequisites.
+  Peering, custom routes, NSGs, private endpoints, and private DNS zones are not
+  required merely because they exist as possible Azure networking features.
+- When the subnets use separate VNets, azd requires connected, fully synchronized
+  bidirectional peering that includes both selected subnets and allows VNet
+  access. Azure system routes or attached UDRs must preserve the path in both
+  directions; a virtual appliance path also requires forwarded traffic on the
+  peerings. Both VNets must use Azure-provided DNS or share a custom DNS resolver.
+- Route tables and NSGs are read only when attached. They must be in `Succeeded`
+  state. azd rejects UDRs that blackhole or force the required subnet path to the
+  Internet or local VNet, and rejects a higher-priority NSG rule that
+  unconditionally denies every protocol and port across the required path.
+- Storage with public access and ACL default `Allow` needs no private networking.
+  With ACL default `Deny`, every agent, node, and non-overlay pod subnet must
+  have a successful Storage service endpoint and a matching successful storage
+  VNet rule. Otherwise, or when public access is disabled, azd requires an
+  approved blob private endpoint on a reachable subnet, a successful blob
+  private DNS zone group, and a `Succeeded`/`Completed` zone link for each source
+  VNet that uses Azure-provided DNS. VNets using custom DNS must share a resolver;
+  its reachability and forwarding behavior are operational prerequisites
+  described below.
 
 Authorization follows the cluster's authentication configuration:
 
@@ -122,7 +149,9 @@ Authorization follows the cluster's authentication configuration:
   caller needs `Microsoft.ContainerService/managedClusters/listClusterUserCredential/action`
   and Kubernetes API authorization to list ClusterRoleBindings. Private clusters
   also require working private DNS and network connectivity from the machine
-  running azd.
+  running azd. This control-plane probe originates on that machine; it does not
+  demonstrate routing or DNS from the agent subnet to the node-pool or storage
+  networks.
 - Non-Entra authentication needs no additional Kubernetes data-plane role for
   this provisioning flow. Legacy unmanaged Entra configurations fail preflight.
 
@@ -150,7 +179,9 @@ If the agent subnet has no delegation, azd adds `Microsoft.App/environments`,
 retaining the other returned subnet properties, including NSG, route table, NAT
 gateway and service endpoints. It does not edit VNet DNS, change address ranges,
 touch AKS node/pod subnets, remove conflicting delegations or enable multiple
-delegations. The planned scopes, principals and changes are displayed before
+delegations. An existing different delegation fails preflight. azd does not
+create or modify peering, routes, NSGs, private endpoints, private DNS, or storage
+network rules. The planned scopes, principals and changes are displayed before
 preparation starts. Both the role assignments and delegation are idempotent.
 Federated identity credentials and trusted access are not pre-created; the
 Foundry service owns its workload federation setup.
@@ -204,14 +235,20 @@ automatic preparation. Initialize and Preview never apply preparation.
 This is a client-side check for this azd path, not a service-wide implementation
 of preflight across Portal, other CLIs or direct ARM callers.
 
-The checks do not prove storage data-plane reachability, available subnet
-capacity, or that a new role assignment is already effective. RBAC propagation
-can cause the immediate Foundry request to fail even after preparation succeeds.
-The service error is preserved. Diagnose persistent authorization failures
-rather than repeatedly retrying or assuming a fixed sleep proves readiness.
-Successful preparation is retained after later failures and is reused on retry.
-`azd down` does not undo these changes to customer-owned identities, AKS, storage
-or the agent subnet.
+The network checks prove the ARM configuration prerequisites described above;
+they do not originate packets from the agent subnet. They therefore cannot prove
+that a custom DNS resolver is reachable or forwards the required private zones,
+that a virtual appliance forwards traffic, that narrower protocol- or
+port-specific NSG rules permit a service's undocumented traffic, or that Storage
+data-plane requests succeed. Validate those operational behaviors with workloads
+before production.
+The checks also do not prove available subnet capacity or that a new role
+assignment is already effective. RBAC propagation can cause the immediate
+Foundry request to fail even after preparation succeeds. The service error is
+preserved. Diagnose persistent authorization failures rather than repeatedly
+retrying or assuming a fixed sleep proves readiness. Successful preparation is
+retained after later failures and is reused on retry. `azd down` does not undo
+these changes to customer-owned identities, AKS, storage or the agent subnet.
 
 **Historical pre-public-preview validation results (2026-09-29 and 2026-09-30,
 West US 2):**

@@ -123,6 +123,8 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 	}
 	progress("BYO AKS runtime preflight passed. Agent-image private trusted roots are validated later, " +
 		"when the image digest is known.")
+	progress("BYO AKS network preflight validated ARM configuration prerequisites only. Kubernetes API checks " +
+		"originate on this machine and do not prove agent-subnet or Storage data-plane traffic.")
 	progress("BYO AKS preflight passed. Preparing required Foundry hosting role assignments:")
 	for _, role := range roles {
 		action := "Assign"
@@ -192,12 +194,16 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 			if err != nil {
 				return nil, fmt.Errorf("read AgentPool child resource %s: %w", poolID, err)
 			}
+			properties, err := byoAKSAgentPoolProperties(raw.Properties)
+			if err != nil {
+				return nil, fmt.Errorf("read AgentPool child resource %s properties: %w", poolID, err)
+			}
 			sshAccess, err := byoAKSAgentPoolSSHAccess(raw.Properties)
 			if err != nil {
 				return nil, fmt.Errorf("read AgentPool child resource %s security profile: %w", poolID, err)
 			}
 			pools = append(pools, &byoAKSAgentPool{
-				name: *pool.Name, properties: pool.Properties, sshAccess: sshAccess,
+				name: *pool.Name, properties: properties, sshAccess: sshAccess,
 			})
 		}
 	}
@@ -236,9 +242,15 @@ func (p *FoundryProvisioningProvider) readBYOAKS(
 	if err != nil {
 		return nil, fmt.Errorf("read storage account %s: %w", ids.storage, err)
 	}
+	network, err := p.readBYOAKSNetwork(
+		ctx, ids, cluster.ManagedCluster, pools, subnet.Subnet, storage.GenericResource, options,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &byoAKSSnapshot{
 		cluster: cluster.ManagedCluster, agentPools: pools, management: management, workload: workload,
-		subnet: subnet.Subnet, storage: storage.GenericResource,
+		subnet: subnet.Subnet, storage: storage.GenericResource, network: network,
 	}, nil
 }
 
@@ -289,6 +301,20 @@ func byoAKSAgentPoolSSHAccess(properties any) (string, error) {
 		return "", err
 	}
 	return value.SecurityProfile.SSHAccess, nil
+}
+
+func byoAKSAgentPoolProperties(
+	properties any,
+) (*armcontainerservice.ManagedClusterAgentPoolProfileProperties, error) {
+	encoded, err := json.Marshal(properties)
+	if err != nil {
+		return nil, err
+	}
+	var value armcontainerservice.ManagedClusterAgentPoolProfileProperties
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return nil, err
+	}
+	return &value, nil
 }
 
 func (p *FoundryProvisioningProvider) inspectBYOAKSRoles(
@@ -405,10 +431,12 @@ func (c *byoAKSConfig) azureError(err error, operation string) error {
 	result := exterrors.ServiceFromAzure(err, operation)
 	message := fmt.Sprintf("BYO AKS preparation for cluster %q: %s", c.ClusterResourceID, err)
 	suggestion := "Verify the configured resources exist and the current azd identity can read the AKS cluster, " +
-		"its AgentPool child resources, hosting and workload identities, storage account, agent subnet, and role " +
-		"assignments at the AKS cluster, workload identity, and storage account scopes. Managed Entra clusters " +
-		"using native Kubernetes RBAC also require listClusterUserCredential/action and network/DNS connectivity " +
-		"to read ClusterRoleBindings from the Kubernetes API."
+		"its AgentPool child resources, node and pod subnets, hosting and workload identities, storage account, " +
+		"agent subnet, parent VNets, peerings, attached route tables and NSGs, and role assignments at the AKS " +
+		"cluster, workload identity, and storage account scopes. Restricted Storage access can additionally require " +
+		"read access to private endpoints, private DNS zone groups, zones, and VNet links. Managed Entra clusters " +
+		"using native Kubernetes RBAC also require listClusterUserCredential/action and connectivity from this " +
+		"machine to read ClusterRoleBindings from the Kubernetes API; that probe does not prove subnet data-plane traffic."
 	if operation == exterrors.OpBYOAKSPrepare {
 		suggestion = "The current azd identity needs roleAssignments read/write at the AKS cluster, workload identity, " +
 			"and storage account scopes, plus write access to the agent subnet. Obtain the required access from an " +
