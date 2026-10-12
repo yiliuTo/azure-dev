@@ -129,12 +129,14 @@ The preflight checks:
 - Storage with public access and ACL default `Allow` needs no private networking.
   With ACL default `Deny`, every agent, node, and non-overlay pod subnet must
   have a successful Storage service endpoint and a matching successful storage
-  VNet rule. Otherwise, or when public access is disabled, azd requires an
-  approved blob private endpoint on a reachable subnet, a successful blob
-  private DNS zone group, and a `Succeeded`/`Completed` zone link for each source
-  VNet that uses Azure-provided DNS. VNets using custom DNS must share a resolver;
-  its reachability and forwarding behavior are operational prerequisites
-  described below.
+  VNet rule. Attached NSGs are evaluated for either public path; when an NSG
+  blocks that path, azd can instead accept a complete private-link path.
+  Otherwise, or when public access is disabled, azd requires an approved blob
+  private endpoint on a reachable subnet, a successful blob private DNS zone
+  group, and a `Succeeded`/`Completed` zone link for each source VNet that uses
+  Azure-provided DNS. VNets using custom DNS must share a resolver; its
+  reachability and forwarding behavior are operational prerequisites described
+  below.
 
 Authorization follows the cluster's authentication configuration:
 

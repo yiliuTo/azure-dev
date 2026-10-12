@@ -84,19 +84,34 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetwork(
 			}
 		}
 	}
+	if err := p.readBYOAKSNetworkDependencies(ctx, network, options); err != nil {
+		return nil, err
+	}
+
+	privateEndpointConfigured := slices.ContainsFunc(
+		storageNetwork.privateEndpointReferences,
+		func(reference byoAKSStoragePrivateEndpointReference) bool {
+			return strings.EqualFold(reference.status, "Approved")
+		},
+	)
 	publicEnabled := strings.EqualFold(storageNetwork.publicNetworkAccess, "Enabled")
 	publicDisabled := strings.EqualFold(storageNetwork.publicNetworkAccess, "Disabled")
+	defaultAllow := strings.EqualFold(storageNetwork.defaultAction, "Allow")
 	defaultDeny := strings.EqualFold(storageNetwork.defaultAction, "Deny")
+	serviceEndpointComplete := defaultDeny &&
+		len(byoAKSMissingStorageServiceEndpoints(storageNetwork, sourceSubnets)) == 0
+	publicPathBlocked := publicEnabled && (defaultAllow || serviceEndpointComplete) &&
+		byoAKSValidateStorageOutboundNSGs(network, sourceSubnets) != nil
 	privateEndpointRequired := publicDisabled ||
-		(publicEnabled && defaultDeny &&
-			len(byoAKSMissingStorageServiceEndpoints(storageNetwork, sourceSubnets)) > 0)
-	if privateEndpointRequired {
+		(publicEnabled && defaultDeny && !serviceEndpointComplete) ||
+		publicPathBlocked
+	if privateEndpointRequired && privateEndpointConfigured {
 		if err := p.readBYOAKSStoragePrivateEndpoints(ctx, network, options); err != nil {
 			return nil, err
 		}
-	}
-	if err := p.readBYOAKSNetworkDependencies(ctx, network, options); err != nil {
-		return nil, err
+		if err := p.readBYOAKSNetworkDependencies(ctx, network, options); err != nil {
+			return nil, err
+		}
 	}
 	return network, nil
 }
@@ -288,6 +303,9 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetworkDependencies(
 		}
 	}
 	for key, id := range vnetIDs {
+		if _, exists := network.virtualNetworks[key]; exists {
+			continue
+		}
 		client, err := armnetwork.NewVirtualNetworksClient(id.SubscriptionID, p.credential, options)
 		if err != nil {
 			return fmt.Errorf("create virtual networks client: %w", err)
@@ -300,10 +318,14 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetworkDependencies(
 	}
 	if len(vnetIDs) > 1 {
 		for key, id := range vnetIDs {
+			if _, exists := network.peerings[key]; exists {
+				continue
+			}
 			client, err := armnetwork.NewVirtualNetworkPeeringsClient(id.SubscriptionID, p.credential, options)
 			if err != nil {
 				return fmt.Errorf("create virtual network peerings client: %w", err)
 			}
+			network.peerings[key] = []*armnetwork.VirtualNetworkPeering{}
 			pager := client.NewListPager(id.ResourceGroupName, id.Name, nil)
 			for pager.More() {
 				page, err := pager.NextPage(ctx)
@@ -315,6 +337,9 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetworkDependencies(
 		}
 	}
 	for key, id := range routeTableIDs {
+		if _, exists := network.routeTables[key]; exists {
+			continue
+		}
 		client, err := armnetwork.NewRouteTablesClient(id.SubscriptionID, p.credential, options)
 		if err != nil {
 			return fmt.Errorf("create route tables client: %w", err)
@@ -326,6 +351,9 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetworkDependencies(
 		network.routeTables[key] = response.RouteTable
 	}
 	for key, id := range securityGroupIDs {
+		if _, exists := network.securityGroups[key]; exists {
+			continue
+		}
 		client, err := armnetwork.NewSecurityGroupsClient(id.SubscriptionID, p.credential, options)
 		if err != nil {
 			return fmt.Errorf("create network security groups client: %w", err)
@@ -357,6 +385,9 @@ func (p *FoundryProvisioningProvider) readBYOAKSNetworkDependencies(
 		}
 	}
 	for key, id := range zoneIDs {
+		if _, exists := network.privateDNSZoneLinks[key]; exists {
+			continue
+		}
 		links, err := p.readBYOAKSPrivateDNSZoneLinks(ctx, id, options)
 		if err != nil {
 			return err

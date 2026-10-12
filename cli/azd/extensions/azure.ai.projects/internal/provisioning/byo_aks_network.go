@@ -775,17 +775,19 @@ func byoAKSValidateStorageNetwork(
 		}
 	}
 	publicEnabled := strings.EqualFold(publicNetworkAccess, "Enabled")
+	var publicIssue *byoAKSNetworkIssue
 	if publicEnabled && strings.EqualFold(defaultAction, "Allow") {
-		return nil
-	}
-	if publicEnabled {
-		if missing := byoAKSMissingStorageServiceEndpoints(network.storage, sources); len(missing) == 0 {
-			for _, source := range sources {
-				if issue := byoAKSValidateStorageOutboundNSG(network, source); issue != nil {
-					return issue
-				}
-			}
+		publicIssue = byoAKSValidateStorageOutboundNSGs(network, sources)
+		if publicIssue == nil {
 			return nil
+		}
+	}
+	if publicEnabled && strings.EqualFold(defaultAction, "Deny") {
+		if missing := byoAKSMissingStorageServiceEndpoints(network.storage, sources); len(missing) == 0 {
+			publicIssue = byoAKSValidateStorageOutboundNSGs(network, sources)
+			if publicIssue == nil {
+				return nil
+			}
 		}
 	}
 	var failures []string
@@ -804,6 +806,9 @@ func byoAKSValidateStorageNetwork(
 			continue
 		}
 		return nil
+	}
+	if publicIssue != nil {
+		return publicIssue
 	}
 	observed := "no approved, reachable blob private endpoint"
 	if len(failures) > 0 {
@@ -842,6 +847,17 @@ func byoAKSMissingStorageServiceEndpoints(
 		}
 	}
 	return missing
+}
+
+func byoAKSValidateStorageOutboundNSGs(
+	network *byoAKSNetworkSnapshot, sources []byoAKSSubnetRef,
+) *byoAKSNetworkIssue {
+	for _, source := range sources {
+		if issue := byoAKSValidateStorageOutboundNSG(network, source); issue != nil {
+			return issue
+		}
+	}
+	return nil
 }
 
 func byoAKSValidateStorageOutboundNSG(

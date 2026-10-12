@@ -360,6 +360,30 @@ func byoAKSTestNSG(access armnetwork.SecurityRuleAccess) armnetwork.SecurityGrou
 	}
 }
 
+func byoAKSTestStorageNSG(rules ...*armnetwork.SecurityRule) armnetwork.SecurityGroup {
+	return armnetwork.SecurityGroup{
+		ID: new(byoTestNSG),
+		Properties: &armnetwork.SecurityGroupPropertiesFormat{
+			ProvisioningState: new(armnetwork.ProvisioningStateSucceeded),
+			SecurityRules:     rules,
+		},
+	}
+}
+
+func byoAKSTestStorageNSGRule(
+	name, destination string, access armnetwork.SecurityRuleAccess, priority int32,
+) *armnetwork.SecurityRule {
+	return &armnetwork.SecurityRule{
+		Name: new(name),
+		Properties: &armnetwork.SecurityRulePropertiesFormat{
+			Access: new(access), Direction: new(armnetwork.SecurityRuleDirectionOutbound),
+			Priority: new(priority), Protocol: new(armnetwork.SecurityRuleProtocolAsterisk),
+			SourceAddressPrefix: new("*"), DestinationAddressPrefix: new(destination),
+			SourcePortRange: new("*"), DestinationPortRange: new("*"),
+		},
+	}
+}
+
 func configureBYOAKSStorageServiceEndpoint(state *byoAKSSnapshot) {
 	state.network.storage.publicNetworkAccess = "Enabled"
 	state.network.storage.defaultAction = "Deny"
@@ -438,6 +462,45 @@ func TestBYOAKSStorageNetworkAccess(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("public default Allow without NSG passes", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		state.subnet.Properties.NetworkSecurityGroup = nil
+		state.network.subnets[byoAKSNetworkKey(byoTestAgentSubnet)] = state.subnet
+		clear(state.network.securityGroups)
+		_, err := validateBYOAKSNetwork(t, state)
+		require.NoError(t, err)
+	})
+
+	t.Run("public default Allow fails unconditional Storage deny", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		state.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+			byoAKSTestStorageNSGRule("deny-storage", "Storage", armnetwork.SecurityRuleAccessDeny, 100),
+		)
+		requireBYOAKSNetworkFailure(t, state, "networkSecurityGroup.securityRules")
+	})
+
+	t.Run("public default Allow honors higher-priority Storage allow", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		state.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+			byoAKSTestStorageNSGRule("allow-storage", "Storage", armnetwork.SecurityRuleAccessAllow, 100),
+			byoAKSTestStorageNSGRule("deny-storage", "Storage", armnetwork.SecurityRuleAccessDeny, 200),
+		)
+		_, err := validateBYOAKSNetwork(t, state)
+		require.NoError(t, err)
+	})
+
+	t.Run("public default Allow blocked by NSG falls back to private endpoint", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		configureBYOAKSStoragePrivateEndpoint(state)
+		state.network.storage.publicNetworkAccess = "Enabled"
+		state.network.storage.defaultAction = "Allow"
+		state.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+			byoAKSTestStorageNSGRule("deny-public-storage", "Storage", armnetwork.SecurityRuleAccessDeny, 100),
+		)
+		_, err := validateBYOAKSNetwork(t, state)
+		require.NoError(t, err)
+	})
+
 	t.Run("restricted public endpoint with complete subnet ACLs", func(t *testing.T) {
 		state := byoAKSTestSnapshot()
 		configureBYOAKSStorageServiceEndpoint(state)
@@ -509,6 +572,17 @@ func TestBYOAKSStorageNetworkAccess(t *testing.T) {
 		requireBYOAKSNetworkFailure(t, state, "storageAccountResourceId.networkAccess")
 	})
 
+	t.Run("restricted public endpoint blocked by NSG falls back to private endpoint", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		configureBYOAKSStoragePrivateEndpoint(state)
+		configureBYOAKSStorageServiceEndpoint(state)
+		state.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+			byoAKSTestStorageNSGRule("deny-service-endpoint", "Storage", armnetwork.SecurityRuleAccessDeny, 100),
+		)
+		_, err := validateBYOAKSNetwork(t, state)
+		require.NoError(t, err)
+	})
+
 	t.Run("disabled public endpoint cannot use only service endpoints", func(t *testing.T) {
 		state := byoAKSTestSnapshot()
 		configureBYOAKSStorageServiceEndpoint(state)
@@ -519,6 +593,16 @@ func TestBYOAKSStorageNetworkAccess(t *testing.T) {
 	t.Run("private endpoint and private DNS complete", func(t *testing.T) {
 		state := byoAKSTestSnapshot()
 		configureBYOAKSStoragePrivateEndpoint(state)
+		_, err := validateBYOAKSNetwork(t, state)
+		require.NoError(t, err)
+	})
+
+	t.Run("private endpoint does not require public Storage NSG access", func(t *testing.T) {
+		state := byoAKSTestSnapshot()
+		configureBYOAKSStoragePrivateEndpoint(state)
+		state.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+			byoAKSTestStorageNSGRule("deny-public-storage", "Storage", armnetwork.SecurityRuleAccessDeny, 100),
+		)
 		_, err := validateBYOAKSNetwork(t, state)
 		require.NoError(t, err)
 	})

@@ -492,6 +492,73 @@ func TestBYOAKSDeployReadsRestrictedStoragePrivateLinkPrerequisites(t *testing.T
 	assert.Contains(t, allRequests, strings.ToLower(byoTestScope+"/resources"))
 }
 
+func TestBYOAKSDeployPublicStorageNSGBlockLoadsPrivateLinkFallback(t *testing.T) {
+	snapshot := byoAKSTestSnapshot()
+	privateEndpointID, _ := configureBYOAKSStoragePrivateEndpoint(snapshot)
+	snapshot.network.storage.publicNetworkAccess = "Enabled"
+	snapshot.network.storage.defaultAction = "Allow"
+	snapshot.network.securityGroups[byoAKSNetworkKey(byoTestNSG)] = byoAKSTestStorageNSG(
+		byoAKSTestStorageNSGRule("deny-public-storage", "Storage", armnetwork.SecurityRuleAccessDeny, 100),
+	)
+	snapshot.storage.Properties = map[string]any{
+		"publicNetworkAccess": "Enabled",
+		"networkAcls":         map[string]any{"defaultAction": "Allow"},
+		"primaryEndpoints":    map[string]any{"blob": "https://storage.blob.core.windows.net/"},
+		"privateEndpointConnections": []any{
+			map[string]any{
+				"properties": map[string]any{
+					"privateEndpoint": map[string]any{"id": privateEndpointID},
+					"privateLinkServiceConnectionState": map[string]any{
+						"status": "Approved",
+					},
+					"groupIds": []any{"blob"},
+				},
+			},
+		},
+	}
+	provider, azure := newBYOAKSTestProvider(t, snapshot)
+
+	_, err := provider.Deploy(t.Context(), func(string) {})
+	require.NoError(t, err)
+
+	requests := make([]string, 0, len(azure.requests))
+	for _, request := range azure.requests {
+		requests = append(requests, strings.ToLower(request.path))
+	}
+	allRequests := strings.Join(requests, "\n")
+	assert.Contains(t, allRequests, strings.ToLower(privateEndpointID))
+	assert.Contains(t, allRequests, strings.ToLower(privateEndpointID+"/privateDnsZoneGroups"))
+}
+
+func TestBYOAKSDeployPublicStorageDoesNotReadUnneededPrivateLink(t *testing.T) {
+	snapshot := byoAKSTestSnapshot()
+	unneededEndpointID := byoTestScope + "/providers/Microsoft.Network/privateEndpoints/not-needed"
+	snapshot.storage.Properties = map[string]any{
+		"publicNetworkAccess": "Enabled",
+		"networkAcls":         map[string]any{"defaultAction": "Allow"},
+		"primaryEndpoints":    map[string]any{"blob": "https://storage.blob.core.windows.net/"},
+		"privateEndpointConnections": []any{
+			map[string]any{
+				"properties": map[string]any{
+					"privateEndpoint": map[string]any{"id": unneededEndpointID},
+					"privateLinkServiceConnectionState": map[string]any{
+						"status": "Approved",
+					},
+					"groupIds": []any{"blob"},
+				},
+			},
+		},
+	}
+	provider, azure := newBYOAKSTestProvider(t, snapshot)
+
+	_, err := provider.Deploy(t.Context(), func(string) {})
+	require.NoError(t, err)
+
+	for _, request := range azure.requests {
+		assert.False(t, strings.EqualFold(request.path, unneededEndpointID))
+	}
+}
+
 func TestBYOAKSDeployRestrictedStorageServiceEndpointsSkipPrivateLinkReads(t *testing.T) {
 	snapshot := byoAKSTestSnapshot()
 	configureBYOAKSStorageServiceEndpoint(snapshot)
