@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-// cspell:ignore BYOAKS armnetwork roledefinitions
+// cspell:ignore AKSACR BYOAKS BYOAKSACR armnetwork roledefinitions
 
 package provisioning
 
@@ -28,16 +28,20 @@ import (
 type byoAKSRole struct {
 	name, definitionID, principalID string
 	scope                           *arm.ResourceID
+	inspectionScope                 *arm.ResourceID
+	scopeExists                     bool
 	exists                          bool
 	client                          *armauthorization.RoleAssignmentsClient
 }
 
 type byoAKSPlan struct {
-	config          *byoAKSConfig
-	ids             *byoAKSResources
-	state           *byoAKSSnapshot
-	needsDelegation bool
-	authorization   byoAKSAuthorization
+	config              *byoAKSConfig
+	ids                 *byoAKSResources
+	state               *byoAKSSnapshot
+	needsDelegation     bool
+	resourceGroupExists bool
+	acr                 *byoAKSACRPlan
+	roles               []*byoAKSRole
 }
 
 func (p *FoundryProvisioningProvider) planBYOAKS(
@@ -100,14 +104,78 @@ func (p *FoundryProvisioningProvider) planBYOAKS(
 			return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
 		}
 	}
+	resourceGroupExists, err := p.resourceGroupExists(ctx)
+	if err != nil {
+		return nil, err
+	}
+	acr, err := p.planBYOAKSACR(ctx, config, ids, state, &options)
+	if err != nil {
+		var local *azdext.LocalError
+		if errors.As(err, &local) {
+			return nil, err
+		}
+		return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
+	}
+	if !acr.role.scopeExists {
+		acr.role.inspectionScope, err = p.byoAKSFutureResourceParent(acr, resourceGroupExists)
+		if err != nil {
+			return nil, err
+		}
+	}
+	roles := append(byoAKSRoles(ids, state, validation.authorization), acr.role)
+	if err := p.inspectBYOAKSRoles(ctx, roles, &options); err != nil {
+		return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
+	}
+	if err := p.checkBYOAKSOperatorPermissions(
+		ctx, roles, acr, resourceGroupExists, &options,
+	); err != nil {
+		var local *azdext.LocalError
+		if errors.As(err, &local) {
+			return nil, err
+		}
+		return nil, config.azureError(err, exterrors.OpBYOAKSPreflight)
+	}
+	progress("BYO AKS runtime preflight passed. Agent-image private trusted roots are validated later, " +
+		"when the image digest is known.")
+	progress("BYO AKS network preflight validated ARM configuration prerequisites only. Kubernetes API checks " +
+		"originate on this machine and do not prove agent-subnet or Storage data-plane traffic.")
+	if resourceGroupExists {
+		progress(fmt.Sprintf("Satisfied: Foundry resource group %q already exists and its tags will not be changed",
+			p.rgName))
+	} else {
+		progress(fmt.Sprintf("Will automatically prepare: create Foundry resource group %q", p.rgName))
+	}
+	if acr.exists {
+		progress(fmt.Sprintf("Satisfied: Azure Container Registry %s uses %s",
+			acr.id, byoAKSACRRoleName(acr.roleDefinitionID)))
+	} else {
+		progress(fmt.Sprintf("Will automatically prepare: create Azure Container Registry %s", acr.id))
+	}
+	for _, role := range roles {
+		status := "Will automatically prepare"
+		if role.exists {
+			status = "Satisfied"
+		}
+		progress(fmt.Sprintf("%s: %s for principal %s at %s",
+			status, role.name, role.principalID, role.scope))
+	}
+	if validation.needsDelegation {
+		progress(fmt.Sprintf("Will automatically prepare: add %s delegation to agent subnet %s",
+			byoAKSDelegation, ids.subnet))
+	} else {
+		progress(fmt.Sprintf("Satisfied: agent subnet %s delegates to %s", ids.subnet, byoAKSDelegation))
+	}
+	progress("Satisfied: the current azd identity has roleAssignments/write at every role target scope " +
+		"and the create permissions required for resources that are currently missing")
 	return &byoAKSPlan{
 		config: config, ids: ids, state: state,
-		needsDelegation: validation.needsDelegation, authorization: validation.authorization,
+		needsDelegation:     validation.needsDelegation,
+		resourceGroupExists: resourceGroupExists, acr: acr, roles: roles,
 	}, nil
 }
 
 func (p *FoundryProvisioningProvider) applyBYOAKS(
-	ctx context.Context, plan *byoAKSPlan, progress grpcbroker.ProgressFunc,
+	ctx context.Context, source *templateSource, plan *byoAKSPlan, progress grpcbroker.ProgressFunc,
 ) error {
 	if plan == nil {
 		return nil
@@ -117,29 +185,23 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 		options = *p.armClientOptions
 	}
 	options.DisableRPRegistration = true
-	roles := byoAKSRoles(plan.ids, plan.state, plan.authorization)
-	if err := p.inspectBYOAKSRoles(ctx, roles, &options); err != nil {
-		return plan.config.azureError(err, exterrors.OpBYOAKSPreflight)
+	if err := p.ensureBYOAKSFoundryResourceGroup(
+		ctx, source, plan.resourceGroupExists, &options, progress,
+	); err != nil {
+		return plan.config.azureError(err, exterrors.OpBYOAKSPrepare)
 	}
-	progress("BYO AKS runtime preflight passed. Agent-image private trusted roots are validated later, " +
-		"when the image digest is known.")
-	progress("BYO AKS network preflight validated ARM configuration prerequisites only. Kubernetes API checks " +
-		"originate on this machine and do not prove agent-subnet or Storage data-plane traffic.")
-	progress("BYO AKS preflight passed. Preparing required Foundry hosting role assignments:")
-	for _, role := range roles {
-		action := "Assign"
-		if role.exists {
-			action = "Already assigned"
-		}
-		progress(fmt.Sprintf("%s %s to principal %s at %s", action, role.name, role.principalID, role.scope))
+	source.parameters["createResourceGroup"] = map[string]any{"value": false}
+	if err := p.prepareBYOAKSACR(ctx, source, plan.acr, progress); err != nil {
+		return plan.config.azureError(err, exterrors.OpBYOAKSPrepare)
 	}
+	progress("Preparing missing BYO AKS role assignments and subnet delegation...")
 	if plan.needsDelegation {
 		progress(fmt.Sprintf("Add %s delegation to agent subnet %s; preserve its other properties",
 			byoAKSDelegation, plan.ids.subnet))
 	} else {
 		progress(fmt.Sprintf("Agent subnet %s already delegates to %s", plan.ids.subnet, byoAKSDelegation))
 	}
-	for _, role := range roles {
+	for _, role := range plan.roles {
 		if role.exists {
 			continue
 		}
@@ -156,6 +218,74 @@ func (p *FoundryProvisioningProvider) applyBYOAKS(
 	}
 	progress("BYO AKS preparation complete. New role assignments may still be propagating.")
 	return nil
+}
+
+func (p *FoundryProvisioningProvider) ensureBYOAKSFoundryResourceGroup(
+	ctx context.Context,
+	source *templateSource,
+	exists bool,
+	options *arm.ClientOptions,
+	progress grpcbroker.ProgressFunc,
+) error {
+	if exists {
+		progress(fmt.Sprintf("Using existing Foundry resource group %q without changing its tags", p.rgName))
+		return nil
+	}
+	resourceGroup, err := byoAKSResourceGroupFromParameters(source.parameters)
+	if err != nil {
+		return err
+	}
+	factory, err := armresources.NewClientFactory(p.subID, p.credential, options)
+	if err != nil {
+		return fmt.Errorf("create Foundry resource group client: %w", err)
+	}
+	progress(fmt.Sprintf("Creating Foundry resource group %q before automatic preparation...", p.rgName))
+	if _, err := factory.NewResourceGroupsClient().CreateOrUpdate(ctx, p.rgName, resourceGroup, nil); err != nil {
+		return fmt.Errorf("create Foundry resource group %q: %w", p.rgName, err)
+	}
+	if (p.isLayer || !p.rgExplicit) && p.azdClient != nil {
+		if err := p.persistCreatedResourceGroupOwnership(ctx); err != nil {
+			return fmt.Errorf("record ownership of Foundry resource group %q: %w", p.rgName, err)
+		}
+	}
+	return nil
+}
+
+func byoAKSResourceGroupFromParameters(parameters map[string]any) (armresources.ResourceGroup, error) {
+	location, err := byoAKSParameterValue[string](parameters, "location")
+	if err != nil {
+		return armresources.ResourceGroup{}, err
+	}
+	tags, err := byoAKSParameterValue[map[string]string](parameters, "tags")
+	if err != nil {
+		return armresources.ResourceGroup{}, err
+	}
+	resourceTags := make(map[string]*string, len(tags))
+	for key, value := range tags {
+		resourceTags[key] = new(value)
+	}
+	return armresources.ResourceGroup{Location: new(location), Tags: resourceTags}, nil
+}
+
+func byoAKSParameterValue[T any](parameters map[string]any, name string) (T, error) {
+	var zero T
+	envelope, ok := parameters[name].(map[string]any)
+	if !ok {
+		return zero, fmt.Errorf("Foundry template parameter %q is missing its ARM value envelope", name)
+	}
+	value, ok := envelope["value"]
+	if !ok {
+		return zero, fmt.Errorf("Foundry template parameter %q has no value", name)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return zero, fmt.Errorf("encode Foundry template parameter %q: %w", name, err)
+	}
+	var result T
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return zero, fmt.Errorf("decode Foundry template parameter %q: %w", name, err)
+	}
+	return result, nil
 }
 
 func (p *FoundryProvisioningProvider) readBYOAKS(
@@ -262,26 +392,26 @@ func byoAKSRoles(
 	roles := []*byoAKSRole{
 		{
 			name: "Reader", definitionID: "acdd72a7-3385-48ef-bd42-f606fba81ae7",
-			principalID: management, scope: ids.cluster,
+			principalID: management, scope: ids.cluster, scopeExists: true,
 		},
 		{
 			name: "Kubernetes Extension Contributor", definitionID: "85cb6faf-e071-4c9b-8136-154b5a04f717",
-			principalID: management, scope: ids.cluster,
+			principalID: management, scope: ids.cluster, scopeExists: true,
 		},
 		{
 			name:         "Managed Identity Federated Identity Credential Contributor",
 			definitionID: "7e559ce2-48d7-4b27-9128-fa1b247f1308",
-			principalID:  management, scope: ids.workload,
+			principalID:  management, scope: ids.workload, scopeExists: true,
 		},
 		{
 			name: "Storage Blob Data Contributor", definitionID: "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
-			principalID: workload, scope: ids.storage,
+			principalID: workload, scope: ids.storage, scopeExists: true,
 		},
 	}
 	if authorization == byoAKSAuthorizationAzureRBAC {
 		roles = append(roles, &byoAKSRole{
 			name: "Azure Kubernetes Service RBAC Cluster Admin", definitionID: byoAKSClusterAdminRoleID,
-			principalID: management, scope: ids.cluster,
+			principalID: management, scope: ids.cluster, scopeExists: true,
 		})
 	}
 	return roles
@@ -322,15 +452,22 @@ func (p *FoundryProvisioningProvider) inspectBYOAKSRoles(
 ) error {
 	assignments := map[string][]*armauthorization.RoleAssignment{}
 	for _, role := range roles {
-		client, err := armauthorization.NewRoleAssignmentsClient(role.scope.SubscriptionID, p.credential, options)
-		if err != nil {
-			return fmt.Errorf("create role assignments client: %w", err)
+		if role.client == nil {
+			client, err := armauthorization.NewRoleAssignmentsClient(role.scope.SubscriptionID, p.credential, options)
+			if err != nil {
+				return fmt.Errorf("create role assignments client: %w", err)
+			}
+			role.client = client
 		}
-		role.client = client
-		scope := role.scope.String()
+		inspectionScope := role.scope
+		if role.inspectionScope != nil {
+			inspectionScope = role.inspectionScope
+		}
+		scope := inspectionScope.String()
 		existing, read := assignments[scope]
 		if !read {
-			existing, err = role.list(ctx)
+			var err error
+			existing, err = role.listAt(ctx, inspectionScope)
 			if err != nil {
 				return err
 			}
@@ -342,15 +479,22 @@ func (p *FoundryProvisioningProvider) inspectBYOAKSRoles(
 }
 
 func (role *byoAKSRole) list(ctx context.Context) ([]*armauthorization.RoleAssignment, error) {
+	return role.listAt(ctx, role.scope)
+}
+
+func (role *byoAKSRole) listAt(
+	ctx context.Context,
+	scope *arm.ResourceID,
+) ([]*armauthorization.RoleAssignment, error) {
 	var result []*armauthorization.RoleAssignment
 	options := &armauthorization.RoleAssignmentsClientListForScopeOptions{
 		Filter: new("atScope()"),
 	}
-	pager := role.client.NewListForScopePager(role.scope.String(), options)
+	pager := role.client.NewListForScopePager(scope.String(), options)
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list role assignments at %s: %w", role.scope, err)
+			return nil, fmt.Errorf("list role assignments at %s: %w", scope, err)
 		}
 		result = append(result, page.Value...)
 	}
@@ -432,16 +576,18 @@ func (c *byoAKSConfig) azureError(err error, operation string) error {
 	message := fmt.Sprintf("BYO AKS preparation for cluster %q: %s", c.ClusterResourceID, err)
 	suggestion := "Verify the configured resources exist and the current azd identity can read the AKS cluster, " +
 		"its AgentPool child resources, node and pod subnets, hosting and workload identities, storage account, " +
-		"agent subnet, parent VNets, peerings, attached route tables and NSGs, and role assignments at the AKS " +
-		"cluster, workload identity, and storage account scopes. Restricted Storage access can additionally require " +
+		"container registry, agent subnet, parent VNets, peerings, attached route tables and NSGs, and role " +
+		"assignments at the AKS cluster, workload identity, storage account, and container registry scopes. " +
+		"Restricted Storage access can additionally require " +
 		"read access to private endpoints, private DNS zone groups, zones, and VNet links. Managed Entra clusters " +
 		"using native Kubernetes RBAC also require listClusterUserCredential/action and connectivity from this " +
 		"machine to read ClusterRoleBindings from the Kubernetes API; that probe does not prove subnet data-plane traffic."
 	if operation == exterrors.OpBYOAKSPrepare {
-		suggestion = "The current azd identity needs roleAssignments read/write at the AKS cluster, workload identity, " +
-			"and storage account scopes, plus write access to the agent subnet. Obtain the required access from an " +
-			"administrator, then rerun 'azd provision'. Earlier successful preparation is retained; azd does not " +
-			"elevate the caller."
+		suggestion = "The current azd identity needs roleAssignments/write at the AKS cluster, workload identity, " +
+			"storage account, and container registry scopes, write access to the agent subnet, and create access " +
+			"for a Foundry resource group or container registry only when that resource is missing. Obtain the " +
+			"listed access from an administrator, then rerun 'azd provision'. Earlier successful preparation is " +
+			"retained; azd does not elevate the caller."
 	}
 	switch classified := result.(type) {
 	case *azdext.ServiceError:

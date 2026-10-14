@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
+// cspell:ignore AKSACR
 // cspell:ignore BYOAKS
 
 package provisioning
@@ -108,6 +109,8 @@ type FoundryProvisioningProvider struct {
 	resourceTokenSalt             string
 	resourceGroupState            func(context.Context) (map[string]*string, bool, error)
 	byoAKSNativeRBACCheck         func(context.Context, *byoAKSResources, string, *arm.ClientOptions) error
+	byoAKSOperatorPermissionCheck byoAKSOperatorPermissionCheck
+	byoAKSPersistACRState         func(context.Context, *byoAKSACRPlan) error
 
 	// Lazily constructed on first compile. nil until needed.
 	bicepCliInstance bicepCompiler
@@ -1227,7 +1230,7 @@ func (p *FoundryProvisioningProvider) Deploy(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.applyBYOAKS(ctx, byoAKS, progress); err != nil {
+	if err := p.applyBYOAKS(ctx, src, byoAKS, progress); err != nil {
 		return nil, err
 	}
 
@@ -2110,9 +2113,9 @@ var canonicalOutputNames = []string{
 	"AZURE_AI_PROJECT_ACR_CONNECTION_NAME",
 	"AZURE_AI_PROJECT_CONNECTION_NAMES",
 	"AZURE_AI_PROJECT_CONNECTIONS_PROJECT_ENDPOINT",
+	"AZD_FOUNDRY_ACR_MODE",
 	"AZURE_FOUNDRY_NETWORK_MODE",
 	"AZURE_FOUNDRY_MANAGED_ISOLATION_MODE",
-	"AZD_FOUNDRY_ACR_MODE",
 }
 
 var greenfieldOutputNames = []string{
@@ -2128,6 +2131,7 @@ var greenfieldOutputNames = []string{
 	"AZURE_AI_PROJECT_ACR_CONNECTION_NAME",
 	"AZURE_AI_PROJECT_CONNECTION_NAMES",
 	"AZURE_AI_PROJECT_CONNECTIONS_PROJECT_ENDPOINT",
+	"AZD_FOUNDRY_ACR_MODE",
 	"AZURE_FOUNDRY_NETWORK_MODE",
 	"AZURE_FOUNDRY_MANAGED_ISOLATION_MODE",
 }

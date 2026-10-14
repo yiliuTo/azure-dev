@@ -53,10 +53,17 @@ services:
       hostingManagementIdentityResourceId: ${AZURE_HOSTING_MANAGEMENT_IDENTITY_ID}
       storageAccountResourceId: ${AZURE_HOSTED_AGENTS_STORAGE_ID}
       workloadIdentityResourceId: ${AZURE_HOSTED_AGENTS_WORKLOAD_IDENTITY_ID}
+      # Optional: omit to let azd create a dedicated registry in the Foundry resource group.
+      # containerRegistryResourceId: ${AZURE_CONTAINER_REGISTRY_RESOURCE_ID}
 ```
 
 The referenced cluster, agent subnet, storage account, and two user-assigned managed
-identities must already exist. The storage account must be in the same
+identities must already exist. An optional `containerRegistryResourceId` must be
+the full ARM ID of an existing Azure Container Registry and supports `${VAR}`
+substitution from the azd environment. When it is omitted, azd deterministically
+names, creates, records, and reuses one dedicated Premium registry in the Foundry
+resource group. It never writes this resolved value back to `azure.yaml`.
+The storage account must be in the same
 subscription and region as the AKS cluster, and its data-plane endpoint must be
 reachable from the workload network. The hosting management identity is
 attached to the Foundry account automatically.
@@ -81,13 +88,20 @@ require read access to the storage network policy and, when configured, its
 private endpoints, private DNS zone groups, zones and VNet links. The caller needs
 `Microsoft.Authorization/roleAssignments/read` and
 `Microsoft.Authorization/roleAssignments/write` at the AKS cluster, workload
-UAMI and storage account scopes listed below, and
+UAMI, storage account, and container registry scopes listed below, and
 `Microsoft.Network/virtualNetworks/subnets/write` on the agent subnet.
-The caller also needs permission to read and, when absent, create the Foundry
-resource group, plus the usual permission to provision its resources. azd does
-not elevate the caller or grant either managed identity a network role. A denied
-read or required preparation operation stops provisioning; it is not a warning
-that allows Foundry creation to continue.
+The `roleAssignments/write` check is unconditional, even when every target
+assignment already exists. The caller also needs permission to read the Foundry
+resource group and registry. azd checks resource-group or registry create actions
+only for a resource that is actually missing and will be created during this
+run. For a future registry, azd evaluates its role-assignment and create actions
+at the existing Foundry resource group, or at the subscription when that group
+is also missing. It does not add a general write gate to customer-provided AKS,
+VNet, UAMI, Storage, resource-group, or registry resources. azd does not elevate the caller
+or grant either managed identity a network role. A denied read or required
+preparation operation stops provisioning; it is not a warning that allows
+Foundry creation to continue. The later ARM deployment still enforces the normal
+create and write permissions for the Foundry resources it deploys.
 
 The preflight checks:
 
@@ -109,6 +123,10 @@ The preflight checks:
   provisioning state `Succeeded`. azd does not change the pool.
 - The two managed identities are different, both have resolved `principalId`
   values, and the workload identity also has `clientId` and `tenantId`.
+- AKS exposes a kubelet identity `objectId`. A provided or previously recorded
+  registry is readable, fully provisioned, has a login server, and uses either
+  legacy registry permissions or RBAC Registry + ABAC Repository Permissions.
+  An omitted registry is reported as a resource azd will automatically prepare.
 - The dedicated Foundry/Data Proxy subnet has one RFC 1918 IPv4 prefix with an
   exact `/27` mask. azd reads the node subnet referenced by every AgentPool and,
   for non-overlay networking, every referenced pod subnet. It compares their
@@ -173,9 +191,34 @@ scope are reused; a blob-container-only assignment does not satisfy the storage
 account scope. No role is newly assigned at subscription scope. The workload
 identity receives no AKS management permission.
 
-The preflight finishes before azd creates or changes any resource. The main
-Foundry provisioning deployment remains responsible for creating its resource
-group after role and subnet preparation succeeds.
+Container image pulls add exactly one separate assignment for the AKS kubelet
+identity, using its `objectId` as the assignment principal:
+
+| Registry permission mode | Scope | Role | Role definition ID |
+|---|---|---|---|
+| Legacy/RBAC Registry Permissions | Container registry resource | AcrPull | `7f951dda-4ed3-4680-a7ca-43fe172d538d` |
+| RBAC Registry + ABAC Repository Permissions | Container registry resource | Container Registry Repository Reader | `cfdd1b31-da27-4c57-8c4d-79c61a2f2427` |
+
+azd selects only the role matching the registry mode. An existing unconditional
+exact or inherited assignment is reused. An assignment with a condition is not
+treated as equivalent because azd cannot assume that its condition permits the
+required image pull.
+
+The preflight runs exactly once and finishes before azd creates or changes any
+resource. It reports each prerequisite as satisfied, automatically preparable,
+or an error that cannot be repaired automatically. After it passes, preparation
+creates a missing Foundry resource group without changing tags on an existing
+group, creates a missing dedicated registry, and then applies the planned role
+assignments and subnet delegation. Preparation consumes that plan; completion
+polling and read-back do not rerun preflight. The main Foundry deployment uses
+the same prepared registry and does not create or retag the resource group.
+
+The prepared registry ID, login server, and lifecycle mode are recorded through
+the existing `AZURE_CONTAINER_REGISTRY_RESOURCE_ID`,
+`AZURE_CONTAINER_REGISTRY_ENDPOINT`, and `AZD_FOUNDRY_ACR_MODE` outputs. A
+provided registry is connected to the Foundry project instead of creating a
+second registry. The Foundry project identity receives the registry
+mode-appropriate read role through the existing connection flow.
 
 If the agent subnet has no delegation, azd adds `Microsoft.App/environments`,
 retaining the other returned subnet properties, including NSG, route table, NAT
@@ -184,9 +227,12 @@ touch AKS node/pod subnets, remove conflicting delegations or enable multiple
 delegations. An existing different delegation fails preflight. azd does not
 create or modify peering, routes, NSGs, private endpoints, private DNS, or storage
 network rules. The planned scopes, principals and changes are displayed before
-preparation starts. Both the role assignments and delegation are idempotent.
+preparation starts. Registry creation, role assignments, and delegation are
+idempotent.
 Federated identity credentials and trusted access are not pre-created; the
-Foundry service owns its workload federation setup.
+Foundry service owns its workload federation setup. azd does not add a separate
+Microsoft Graph or federated-identity tenant-policy gate; a later service or
+Graph failure is preserved with its Azure error and remediation context.
 
 Agent-image private trusted-root validation is intentionally outside this
 account/project preflight because the agent image digest is not yet known. It
@@ -217,6 +263,10 @@ azd env set AZURE_HOSTED_AGENTS_WORKLOAD_IDENTITY_ID "<workload-uami-resource-id
 azd env set AZURE_HOSTED_AGENTS_STORAGE_ID "<storage-account-resource-id>"
 azd provision
 ```
+
+To reuse an existing registry, uncomment `containerRegistryResourceId` in the
+service configuration and set `AZURE_CONTAINER_REGISTRY_RESOURCE_ID` to its full
+ARM resource ID before provisioning. Otherwise, leave the field absent.
 
 The root `infra.provider: microsoft.foundry` path reads `AZURE_RESOURCE_GROUP`;
 `AZURE_FOUNDRY_RESOURCE_GROUP` is for a named Foundry infrastructure layer, not a
@@ -250,7 +300,8 @@ Foundry request to fail even after preparation succeeds. The service error is
 preserved. Diagnose persistent authorization failures rather than repeatedly
 retrying or assuming a fixed sleep proves readiness. Successful preparation is
 retained after later failures and is reused on retry. `azd down` does not undo
-these changes to customer-owned identities, AKS, storage or the agent subnet.
+these changes to customer-owned identities, AKS, storage, a provided registry,
+or the agent subnet.
 
 **Historical pre-public-preview validation results (2026-09-29 and 2026-09-30,
 West US 2):**
@@ -297,7 +348,9 @@ A fresh AKS 1.35 cluster with Azure CNI Overlay, OIDC, workload identity, Azure
 RBAC, and a labeled Kata pool was validated through native `azd provision`.
 With the sandbox label removed, preflight failed before creating assignments,
 subnet delegation, or the Foundry resource group. After restoring the label,
-azd created exactly the four assignments documented above, delegated the agent
+azd created exactly the four hosting/workload assignments documented above
+(before the kubelet registry-role preparation described in this revision),
+delegated the agent
 subnet, and the Foundry account, project, and Trusted Access binding all reached
 `Succeeded`. The hosting identity had neither AKS Contributor nor AKS RBAC
 Cluster Admin on the cluster and had no Reader assignment on the Foundry

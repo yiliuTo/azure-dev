@@ -249,6 +249,7 @@ type agentHostingBlock struct {
 	HostingManagementIdentityResourceID string `yaml:"hostingManagementIdentityResourceId"`
 	StorageAccountResourceID            string `yaml:"storageAccountResourceId"`
 	WorkloadIdentityResourceID          string `yaml:"workloadIdentityResourceId"`
+	ContainerRegistryResourceID         string `yaml:"containerRegistryResourceId,omitempty"`
 }
 
 // agentHostingParameter is passed to Bicep and Terraform. Enabled keeps the
@@ -263,6 +264,7 @@ type agentHostingParameter struct {
 	HostingManagementIdentityResourceID string `json:"hostingManagementIdentityResourceId"`
 	StorageAccountResourceID            string `json:"storageAccountResourceId"`
 	WorkloadIdentityResourceID          string `json:"workloadIdentityResourceId"`
+	ContainerRegistryResourceID         string `json:"containerRegistryResourceId"`
 }
 
 // networkBlock mirrors the network: sub-tree on the service body.
@@ -377,11 +379,14 @@ func Synthesize(in Input) (*Result, error) {
 	}
 
 	params := map[string]any{
-		"deployments":           deployments,
-		"includeAcr":            includeAcr,
-		"connections":           connections,
-		"connectionCredentials": connectionCredentials,
-		"agentHosting":          agentHosting,
+		"deployments":                 deployments,
+		"includeAcr":                  includeAcr,
+		"connections":                 connections,
+		"connectionCredentials":       connectionCredentials,
+		"agentHosting":                agentHosting,
+		"preparedAcrResourceId":       agentHosting.ContainerRegistryResourceID,
+		"preparedAcrRoleDefinitionId": "",
+		"acrMode":                     agentHostingACRMode(agentHosting),
 	}
 	maps.Copy(params, netParams)
 
@@ -389,6 +394,13 @@ func Synthesize(in Input) (*Result, error) {
 		Parameters:  params,
 		NetworkMode: netMode,
 	}, nil
+}
+
+func agentHostingACRMode(hosting agentHostingParameter) string {
+	if hosting.ContainerRegistryResourceID != "" {
+		return "reuse-connect"
+	}
+	return "create"
 }
 
 // SynthesizeExistingProject derives parameters for editable infrastructure that
@@ -738,6 +750,9 @@ func deriveIncludeAcr(
 	projectRoot string,
 	env map[string]string,
 ) (bool, error) {
+	if svc.AgentHosting != nil {
+		return true, nil
+	}
 	if slices.ContainsFunc(svc.Agents, agentNeedsAcr) {
 		return true, nil
 	}
@@ -1278,6 +1293,9 @@ var agentHostingResourceIDPatterns = map[string]*regexp.Regexp{
 	"workloadIdentityResourceId": regexp.MustCompile(
 		`(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.ManagedIdentity/userAssignedIdentities/[^/]+$`,
 	),
+	"containerRegistryResourceId": regexp.MustCompile(
+		`(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.ContainerRegistry/registries/[^/]+$`,
+	),
 }
 
 func synthesizeAgentHosting(
@@ -1366,6 +1384,16 @@ func synthesizeAgentHosting(
 	if err != nil {
 		return agentHostingParameter{}, err
 	}
+	containerRegistryID, err := resolveOptionalAgentHostingValue(
+		hosting.ContainerRegistryResourceID,
+		fieldPath("containerRegistryResourceId"),
+		env,
+		resolve,
+		agentHostingResourceIDPatterns["containerRegistryResourceId"],
+	)
+	if err != nil {
+		return agentHostingParameter{}, err
+	}
 
 	return agentHostingParameter{
 		Enabled:                             true,
@@ -1376,7 +1404,39 @@ func synthesizeAgentHosting(
 		HostingManagementIdentityResourceID: managementIdentityID,
 		StorageAccountResourceID:            storageID,
 		WorkloadIdentityResourceID:          workloadIdentityID,
+		ContainerRegistryResourceID:         containerRegistryID,
 	}, nil
+}
+
+func resolveOptionalAgentHostingValue(
+	value string,
+	fieldPath string,
+	env map[string]string,
+	resolve bool,
+	resourceIDPattern *regexp.Regexp,
+) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if err := ValidateEnvReferences(value); err != nil {
+		return "", fmt.Errorf("%s: %w", fieldPath, err)
+	}
+	if resolve {
+		resolved, err := resolveVars(value, env)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", fieldPath, err)
+		}
+		value = strings.TrimSpace(resolved)
+		if value == "" {
+			return "", fmt.Errorf("%s: resolved to an empty value", fieldPath)
+		}
+	}
+	if (resolve || !containsVarRef(value)) && !resourceIDPattern.MatchString(value) {
+		return "", fmt.Errorf("%s: %q is not a well-formed resource ID for the required Azure resource type",
+			fieldPath, value)
+	}
+	return value, nil
 }
 
 func resolveAgentHostingValue(

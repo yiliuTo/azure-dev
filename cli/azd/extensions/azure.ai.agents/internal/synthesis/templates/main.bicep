@@ -58,6 +58,7 @@ type agentHostingType = {
   hostingManagementIdentityResourceId: string
   storageAccountResourceId: string
   workloadIdentityResourceId: string
+  containerRegistryResourceId: string
 }
 
 // Parameters
@@ -69,6 +70,9 @@ param location string
 @minLength(1)
 @maxLength(90)
 param resourceGroupName string
+
+@description('Create the target resource group before deploying resources into it.')
+param createResourceGroup bool = true
 
 @description('Tags applied to all resources.')
 param tags object = {}
@@ -87,6 +91,19 @@ param deployments deploymentsType = []
 @description('Include an Azure Container Registry. Set true when any agent uses docker:.')
 param includeAcr bool = false
 
+@description('Existing registry prepared for BYO AKS. Empty keeps the template-owned registry behavior.')
+param preparedAcrResourceId string = ''
+
+@description('Full role definition ID used by the Foundry project identity on the prepared registry.')
+param preparedAcrRoleDefinitionId string = ''
+
+@description('Registry lifecycle mode recorded in azd outputs.')
+@allowed([
+  'create'
+  'reuse-connect'
+])
+param acrMode string = 'create'
+
 @description('Foundry project connections to create (host: azure.ai.connection services).')
 param connections connectionsType = []
 
@@ -104,6 +121,7 @@ param agentHosting agentHostingType = {
   hostingManagementIdentityResourceId: ''
   storageAccountResourceId: ''
   workloadIdentityResourceId: ''
+  containerRegistryResourceId: ''
 }
 
 @description('Object id of the developer running azd. When set, grants Cognitive Services User on the project. Empty disables the role assignment so headless / CI runs do not fail.')
@@ -153,7 +171,7 @@ param dnsZonesSubscription string = ''
 
 // Resources
 
-resource resourceGroup 'Microsoft.Resources/resourceGroups@2021-04-01' = {
+resource resourceGroup 'Microsoft.Resources/resourceGroups@2021-04-01' = if (createResourceGroup) {
   name: resourceGroupName
   location: location
   tags: tags
@@ -169,6 +187,9 @@ module resources 'modules/resources.bicep' = {
     foundryProjectName: foundryProjectName
     deployments: deployments
     includeAcr: includeAcr
+    preparedAcrResourceId: preparedAcrResourceId
+    preparedAcrRoleDefinitionId: preparedAcrRoleDefinitionId
+    acrMode: acrMode
     connections: connections
     connectionCredentials: connectionCredentials
     agentHosting: agentHosting
@@ -189,6 +210,22 @@ module resources 'modules/resources.bicep' = {
   }
 }
 
+var usePreparedAcr = includeAcr && !empty(preparedAcrResourceId)
+var preparedAcrParts = split(preparedAcrResourceId, '/')
+var preparedAcrSubscription = usePreparedAcr ? preparedAcrParts[2] : subscription().subscriptionId
+var preparedAcrResourceGroup = usePreparedAcr ? preparedAcrParts[4] : resourceGroupName
+var preparedAcrName = usePreparedAcr ? preparedAcrParts[8] : ''
+
+module preparedAcrAccess 'modules/acr-access.bicep' = if (usePreparedAcr && !empty(preparedAcrRoleDefinitionId)) {
+  name: 'foundry-acr-access-${uniqueString(preparedAcrResourceId, resourceGroupName, foundryProjectName)}'
+  scope: az.resourceGroup(preparedAcrSubscription, preparedAcrResourceGroup)
+  params: {
+    registryName: preparedAcrName
+    projectPrincipalId: resources.outputs.AZURE_AI_PROJECT_PRINCIPAL_ID
+    roleDefinitionId: preparedAcrRoleDefinitionId
+  }
+}
+
 // Outputs
 
 output AZURE_RESOURCE_GROUP string = resourceGroupName
@@ -203,5 +240,6 @@ output AZURE_CONTAINER_REGISTRY_RESOURCE_ID string = resources.outputs.AZURE_CON
 output AZURE_AI_PROJECT_ACR_CONNECTION_NAME string = resources.outputs.AZURE_AI_PROJECT_ACR_CONNECTION_NAME
 output AZURE_AI_PROJECT_CONNECTION_NAMES string = resources.outputs.AZURE_AI_PROJECT_CONNECTION_NAMES
 output AZURE_AI_PROJECT_CONNECTIONS_PROJECT_ENDPOINT string = resources.outputs.FOUNDRY_PROJECT_ENDPOINT
+output AZD_FOUNDRY_ACR_MODE string = resources.outputs.AZD_FOUNDRY_ACR_MODE
 output AZURE_FOUNDRY_NETWORK_MODE string = resources.outputs.AZURE_FOUNDRY_NETWORK_MODE
 output AZURE_FOUNDRY_MANAGED_ISOLATION_MODE string = resources.outputs.AZURE_FOUNDRY_MANAGED_ISOLATION_MODE

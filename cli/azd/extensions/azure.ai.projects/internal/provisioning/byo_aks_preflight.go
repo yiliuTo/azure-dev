@@ -58,10 +58,11 @@ type byoAKSConfig struct {
 	HostingManagementIdentityResourceID string `json:"hostingManagementIdentityResourceId"`
 	StorageAccountResourceID            string `json:"storageAccountResourceId"`
 	WorkloadIdentityResourceID          string `json:"workloadIdentityResourceId"`
+	ContainerRegistryResourceID         string `json:"containerRegistryResourceId"`
 }
 
 type byoAKSResources struct {
-	cluster, subnet, management, workload, storage *arm.ResourceID
+	cluster, subnet, management, workload, storage, registry *arm.ResourceID
 }
 
 type byoAKSSnapshot struct {
@@ -107,25 +108,36 @@ func (c *byoAKSConfig) resources(subscriptionID string) (*byoAKSResources, error
 		name, value, resourceType string
 		destination               **arm.ResourceID
 		sameSubscription          bool
+		optional                  bool
 	}{
-		{"clusterResourceId", c.ClusterResourceID, "Microsoft.ContainerService/managedClusters", &resources.cluster, true},
+		{
+			"clusterResourceId", c.ClusterResourceID,
+			"Microsoft.ContainerService/managedClusters", &resources.cluster, true, false,
+		},
 		{
 			"agentSubnetResourceId", c.AgentSubnetResourceID,
-			"Microsoft.Network/virtualNetworks/subnets", &resources.subnet, true,
+			"Microsoft.Network/virtualNetworks/subnets", &resources.subnet, true, false,
 		},
 		{
 			"hostingManagementIdentityResourceId", c.HostingManagementIdentityResourceID,
-			"Microsoft.ManagedIdentity/userAssignedIdentities", &resources.management, false,
+			"Microsoft.ManagedIdentity/userAssignedIdentities", &resources.management, false, false,
 		},
 		{
 			"workloadIdentityResourceId", c.WorkloadIdentityResourceID,
-			"Microsoft.ManagedIdentity/userAssignedIdentities", &resources.workload, false,
+			"Microsoft.ManagedIdentity/userAssignedIdentities", &resources.workload, false, false,
 		},
 		{
 			"storageAccountResourceId", c.StorageAccountResourceID,
-			"Microsoft.Storage/storageAccounts", &resources.storage, true,
+			"Microsoft.Storage/storageAccounts", &resources.storage, true, false,
+		},
+		{
+			"containerRegistryResourceId", c.ContainerRegistryResourceID,
+			"Microsoft.ContainerRegistry/registries", &resources.registry, false, true,
 		},
 	} {
+		if field.optional && strings.TrimSpace(field.value) == "" {
+			continue
+		}
 		id, err := arm.ParseResourceID(field.value)
 		if err != nil || strings.ContainsAny(field.value, "?#") ||
 			id.SubscriptionID == "" || id.ResourceGroupName == "" || id.Name == "" ||

@@ -25,23 +25,29 @@ param foundryAccountName string
 @description('Name of the existing Foundry project receiving the ACR connection.')
 param foundryProjectName string
 
-@description('Principal id of the Foundry project managed identity; receives AcrPull and is the connection credential identity.')
+@description('Principal id of the Foundry project managed identity; receives the registry mode-appropriate read role and is the connection credential identity.')
 param foundryProjectPrincipalId string
+
+@description('Existing registry resource ID. Empty creates the registry in this resource group.')
+param existingRegistryResourceId string = ''
+
+@description('Full role definition ID granted to the Foundry project identity.')
+param projectAcrRoleDefinitionId string
 
 @description('When true, the registry disables public network access to stay inside the isolation boundary.')
 param enableNetworkIsolation bool = false
 
 // Variables
 
-// Built-in role definition ids. See: https://learn.microsoft.com/azure/role-based-access-control/built-in-roles
-var acrPullRoleId = subscriptionResourceId(
-  'Microsoft.Authorization/roleDefinitions',
-  '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-)
+var useExistingRegistry = !empty(existingRegistryResourceId)
+var existingRegistryParts = split(existingRegistryResourceId, '/')
+var existingRegistrySubscription = useExistingRegistry ? existingRegistryParts[2] : subscription().subscriptionId
+var existingRegistryResourceGroup = useExistingRegistry ? existingRegistryParts[4] : resourceGroup().name
+var existingRegistryName = useExistingRegistry ? existingRegistryParts[8] : name
 
 // Resources
 
-resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = if (!useExistingRegistry) {
   name: name
   location: location
   tags: tags
@@ -62,15 +68,20 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
 }
 
-// Grant the Foundry project's managed identity AcrPull on this registry so the
-// hosted agent can pull images using the project identity.
-resource foundryAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(registry.id, foundryProjectPrincipalId, acrPullRoleId)
+resource existingRegistry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = if (useExistingRegistry) {
+  name: existingRegistryName
+  scope: resourceGroup(existingRegistrySubscription, existingRegistryResourceGroup)
+}
+
+// Grant the Foundry project's managed identity the registry mode-appropriate
+// read role so the hosted agent can pull images using the project identity.
+resource foundryAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!useExistingRegistry) {
+  name: guid(registry.id, foundryProjectPrincipalId, projectAcrRoleDefinitionId)
   scope: registry
   properties: {
     principalId: foundryProjectPrincipalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: acrPullRoleId
+    roleDefinitionId: projectAcrRoleDefinitionId
   }
 }
 
@@ -88,17 +99,17 @@ resource foundryAccount 'Microsoft.CognitiveServices/accounts@2025-04-01-preview
       name: '${name}-conn'
       properties: {
         category: 'ContainerRegistry'
-        target: registry.properties.loginServer
+        target: useExistingRegistry ? existingRegistry!.properties.loginServer : registry!.properties.loginServer
         authType: 'ManagedIdentity'
         // RegistryIdentity auth requires both the identity client id (the
         // project principal) and the registry resource id.
         credentials: {
           clientId: foundryProjectPrincipalId
-          resourceId: registry.id
+          resourceId: useExistingRegistry ? existingRegistry!.id : registry!.id
         }
         isSharedToAll: true
         metadata: {
-          ResourceId: registry.id
+          ResourceId: useExistingRegistry ? existingRegistry!.id : registry!.id
         }
       }
       dependsOn: [
@@ -110,6 +121,6 @@ resource foundryAccount 'Microsoft.CognitiveServices/accounts@2025-04-01-preview
 
 // Outputs
 
-output loginServer string = registry.properties.loginServer
-output resourceId string = registry.id
+output loginServer string = useExistingRegistry ? existingRegistry!.properties.loginServer : registry!.properties.loginServer
+output resourceId string = useExistingRegistry ? existingRegistry!.id : registry!.id
 output connectionName string = foundryAccount::project::acrConnection.name

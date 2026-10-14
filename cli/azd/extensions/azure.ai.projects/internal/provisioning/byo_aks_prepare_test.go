@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/fake"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerregistry/armcontainerregistry"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v8"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
@@ -40,11 +41,15 @@ type byoAKSTestRequest struct {
 }
 
 type byoAKSTestAzure struct {
-	state       *byoAKSSnapshot
-	requests    []byoAKSTestRequest
-	assignments map[string][]*armauthorization.RoleAssignment
-	fail        func(*http.Request) (int, string)
-	transport   *mockhttp.MockHttpClient
+	state               *byoAKSSnapshot
+	requests            []byoAKSTestRequest
+	assignments         map[string][]*armauthorization.RoleAssignment
+	permissions         map[string][]*armauthorization.Permission
+	registry            armcontainerregistry.Registry
+	resourceGroupExists bool
+	acrState            map[string]string
+	fail                func(*http.Request) (int, string)
+	transport           *mockhttp.MockHttpClient
 }
 
 type byoAKSTestPipelineKey struct{}
@@ -90,7 +95,8 @@ services:
       hostingManagementIdentityResourceId: %s
       workloadIdentityResourceId: %s
       storageAccountResourceId: %s
-`, byoTestCluster, byoTestAgentSubnet, byoTestManagement, byoTestWorkload, byoTestStorage)
+      containerRegistryResourceId: %s
+`, byoTestCluster, byoTestAgentSubnet, byoTestManagement, byoTestWorkload, byoTestStorage, byoTestRegistry)
 }
 
 func newBYOAKSTestProvider(
@@ -103,7 +109,18 @@ func newBYOAKSTestProvider(
 	}
 	azure := &byoAKSTestAzure{
 		state: state, assignments: map[string][]*armauthorization.RoleAssignment{},
-		transport: mockhttp.NewMockHttpUtil(),
+		permissions: map[string][]*armauthorization.Permission{},
+		registry: armcontainerregistry.Registry{
+			ID: new(byoTestRegistry), Name: new("registry"), Location: new("eastus2"),
+			Properties: &armcontainerregistry.RegistryProperties{
+				LoginServer:        new("registry.azurecr.io"),
+				ProvisioningState:  new(armcontainerregistry.ProvisioningStateSucceeded),
+				RoleAssignmentMode: new(armcontainerregistry.RoleAssignmentModeLegacyRegistryPermissions),
+			},
+		},
+		resourceGroupExists: true,
+		acrState:            map[string]string{},
+		transport:           mockhttp.NewMockHttpUtil(),
 	}
 	azure.transport.When(func(*http.Request) bool { return true }).RespondFn(
 		func(request *http.Request) (*http.Response, error) {
@@ -130,6 +147,19 @@ func newBYOAKSTestProvider(
 					})
 				}
 			}
+			if strings.HasSuffix(
+				strings.ToLower(request.URL.Path),
+				"/providers/microsoft.authorization/permissions",
+			) {
+				require.Equal(t, http.MethodGet, request.Method)
+				scope := request.URL.Path[:len(request.URL.Path)-len(
+					"/providers/Microsoft.Authorization/permissions")]
+				values := azure.permissions[strings.ToLower(scope)]
+				if values == nil {
+					values = []*armauthorization.Permission{{Actions: []*string{new("*")}}}
+				}
+				return response(http.StatusOK, armauthorization.PermissionGetResult{Value: values})
+			}
 			if scope, _, ok := strings.Cut(request.URL.Path, "/providers/Microsoft.Authorization/roleAssignments"); ok {
 				key := strings.ToLower(scope)
 				if request.Method == http.MethodGet {
@@ -144,6 +174,50 @@ func newBYOAKSTestProvider(
 				assignment := &armauthorization.RoleAssignment{ID: new(request.URL.Path), Properties: parameters.Properties}
 				azure.assignments[key] = append(azure.assignments[key], assignment)
 				return response(http.StatusCreated, assignment)
+			}
+			if strings.Contains(strings.ToLower(request.URL.Path),
+				"/providers/microsoft.containerregistry/registries/") {
+				switch request.Method {
+				case http.MethodGet:
+					if azure.registry.ID == nil || !strings.EqualFold(*azure.registry.ID, request.URL.Path) {
+						return response(http.StatusNotFound, map[string]any{
+							"error": map[string]string{"code": "ResourceNotFound", "message": "registry not found"},
+						})
+					}
+					return response(http.StatusOK, azure.registry)
+				case http.MethodPut:
+					require.NoError(t, json.Unmarshal(body, &azure.registry))
+					azure.registry.ID = new(request.URL.Path)
+					azure.registry.Name = new(request.URL.Path[strings.LastIndex(request.URL.Path, "/")+1:])
+					if azure.registry.Properties == nil {
+						azure.registry.Properties = &armcontainerregistry.RegistryProperties{}
+					}
+					azure.registry.Properties.LoginServer = new(*azure.registry.Name + ".azurecr.io")
+					azure.registry.Properties.ProvisioningState =
+						new(armcontainerregistry.ProvisioningStateSucceeded)
+					return response(http.StatusOK, azure.registry)
+				}
+			}
+			if strings.EqualFold(request.URL.Path, byoTestFoundryRG) {
+				switch request.Method {
+				case http.MethodGet:
+					if !azure.resourceGroupExists {
+						return response(http.StatusNotFound, map[string]any{
+							"error": map[string]string{"code": "ResourceGroupNotFound", "message": "group not found"},
+						})
+					}
+					return response(http.StatusOK, armresources.ResourceGroup{
+						ID: new(byoTestFoundryRG), Name: new("foundry"), Location: new("eastus2"),
+						Tags: map[string]*string{"azd-env-name": new("test")},
+					})
+				case http.MethodPut:
+					azure.resourceGroupExists = true
+					var group armresources.ResourceGroup
+					require.NoError(t, json.Unmarshal(body, &group))
+					group.ID = new(byoTestFoundryRG)
+					group.Name = new("foundry")
+					return response(http.StatusOK, group)
+				}
 			}
 			if strings.Contains(request.URL.Path, "/providers/Microsoft.Resources/deployments/") {
 				if strings.HasSuffix(request.URL.Path, "/whatIf") {
@@ -307,6 +381,23 @@ func newBYOAKSTestProvider(
 		projectPath: t.TempDir(), subID: byoTestSubscription, envName: "test", location: "eastus2", rgName: "foundry",
 		rgExplicit: true, synthResult: result, armTemplate: template,
 		credential: &byoAKSTestCredential{}, armClientOptions: options,
+		resourceGroupState: func(context.Context) (map[string]*string, bool, error) {
+			if !azure.resourceGroupExists {
+				return nil, false, nil
+			}
+			return map[string]*string{"azd-env-name": new("test")}, true, nil
+		},
+		byoAKSOperatorPermissionCheck: func(
+			context.Context, *arm.ResourceID, []string, *arm.ClientOptions,
+		) ([]string, error) {
+			return nil, nil
+		},
+		byoAKSPersistACRState: func(_ context.Context, plan *byoAKSACRPlan) error {
+			azure.acrState["AZURE_CONTAINER_REGISTRY_RESOURCE_ID"] = plan.id.String()
+			azure.acrState["AZURE_CONTAINER_REGISTRY_ENDPOINT"] = plan.endpoint
+			azure.acrState["AZD_FOUNDRY_ACR_MODE"] = plan.mode
+			return nil
+		},
 	}, azure
 }
 
@@ -360,7 +451,7 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result.Deployment)
 	writes := azure.writes()
-	require.Len(t, writes, 6, "four roles, subnet update, then the Foundry deployment")
+	require.Len(t, writes, 7, "five roles, subnet update, then the Foundry deployment")
 	firstWrite := len(azure.requests) - len(writes)
 	require.Greater(t, firstWrite, 0)
 	for _, request := range azure.requests[:firstWrite] {
@@ -371,6 +462,7 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 		{"85cb6faf-e071-4c9b-8136-154b5a04f717", byoTestCluster, byoTestManagementID},
 		{"7e559ce2-48d7-4b27-9128-fa1b247f1308", byoTestWorkload, byoTestManagementID},
 		{"ba92f5b4-2d11-453d-a403-e96b0029c9fe", byoTestStorage, byoTestWorkloadID},
+		{byoAKSAcrPullRoleID, byoTestRegistry, byoTestKubeletID},
 	}
 	for i, assignment := range expected {
 		assert.True(t, strings.HasPrefix(
@@ -405,28 +497,34 @@ func TestBYOAKSDeployPreparesBeforeFoundry(t *testing.T) {
 		assert.NotContains(t, path, "/privatednszonegroups",
 			"public Storage access must not require private DNS zone-group reads")
 	}
-	assert.Equal(t, byoTestAgentSubnet, writes[4].path)
-	assert.Contains(t, writes[5].path, "/providers/Microsoft.Resources/deployments/")
+	assert.Equal(t, byoTestAgentSubnet, writes[5].path)
+	assert.Contains(t, writes[6].path, "/providers/Microsoft.Resources/deployments/")
 	var deployment armresources.Deployment
-	require.NoError(t, json.Unmarshal(writes[5].body, &deployment))
+	require.NoError(t, json.Unmarshal(writes[6].body, &deployment))
 	require.NotNil(t, deployment.Properties)
 	parameters, ok := deployment.Properties.Parameters.(map[string]any)
 	require.True(t, ok)
-	assert.NotContains(t, parameters, "createResourceGroup",
-		"the main Foundry deployment must retain responsibility for resource-group provisioning")
+	require.Contains(t, parameters, "createResourceGroup")
+	assert.Equal(t, map[string]any{"value": false}, parameters["createResourceGroup"],
+		"automatic preparation must keep the main deployment from rewriting the existing resource group")
+	assert.Equal(t, map[string]any{"value": byoTestRegistry}, parameters["preparedAcrResourceId"])
+	assert.Equal(t, map[string]any{"value": "reuse-connect"}, parameters["acrMode"])
+	assert.Equal(t, map[string]any{"value": "/subscriptions/" + byoTestSubscription +
+		"/providers/Microsoft.Authorization/roleDefinitions/" + byoAKSAcrPullRoleID},
+		parameters["preparedAcrRoleDefinitionId"])
 	var original, updated map[string]any
 	require.NoError(t, json.Unmarshal(before, &original))
 	var subnet struct {
 		Properties map[string]any `json:"properties"`
 	}
-	require.NoError(t, json.Unmarshal(writes[4].body, &subnet))
+	require.NoError(t, json.Unmarshal(writes[5].body, &subnet))
 	updated = subnet.Properties
 	require.Contains(t, updated, "delegations")
 	delete(updated, "delegations")
 	assert.Equal(t, original, updated, "delegation must be the only changed subnet property")
 	assert.NotContains(t, updated, "allowMultipleDelegations")
 	output := strings.Join(messages, "\n")
-	assert.Contains(t, output, "required Foundry hosting role assignments")
+	assert.Contains(t, output, "Preparing missing BYO AKS role assignments")
 	assert.Contains(t, output, byoTestManagementID)
 	assert.Contains(t, output, byoTestWorkloadID)
 	assert.Contains(t, output, "may still be propagating")
@@ -691,7 +789,7 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 			}
 		}, 0, []string{
 			"AKS cluster", "hosting and workload identities", "storage account", "agent subnet",
-			"role assignments at the AKS cluster, workload identity, and storage account scopes",
+			"role assignments at the AKS cluster, workload identity, storage account, and container registry scopes",
 		}},
 		{"no implicit provider registration during preflight", func(a *byoAKSTestAzure) {
 			a.fail = func(r *http.Request) (int, string) {
@@ -748,7 +846,7 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				return 0, ""
 			}
 		}, 1, []string{
-			"roleAssignments read/write at the AKS cluster, workload identity, and storage account scopes",
+			"roleAssignments/write at the AKS cluster, workload identity, storage account, and container registry scopes",
 			"write access to the agent subnet",
 		}},
 		{"unverified role exists conflict is not success", func(a *byoAKSTestAzure) {
@@ -766,8 +864,8 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 				}
 				return 0, ""
 			}
-		}, 5, []string{
-			"roleAssignments read/write at the AKS cluster, workload identity, and storage account scopes",
+		}, 6, []string{
+			"roleAssignments/write at the AKS cluster, workload identity, storage account, and container registry scopes",
 			"write access to the agent subnet",
 		}},
 	} {
@@ -780,7 +878,6 @@ func TestBYOAKSDeployFailureStopsFoundry(t *testing.T) {
 			if len(tt.suggestionContains) > 0 {
 				service, ok := errors.AsType[*azdext.ServiceError](err)
 				require.True(t, ok)
-				assert.NotContains(t, service.Suggestion, "Foundry resource group")
 				for _, expected := range tt.suggestionContains {
 					assert.Contains(t, service.Suggestion, expected)
 				}
@@ -869,7 +966,7 @@ func TestBYOAKSDeployPreservesFoundryServiceError(t *testing.T) {
 	service, ok := errors.AsType[*azdext.ServiceError](err)
 	require.True(t, ok)
 	assert.Equal(t, exterrors.OpArmDeploymentCreate+".RoleAssignmentNotYetEffective", service.ErrorCode)
-	assert.Len(t, azure.writes(), 6)
+	assert.Len(t, azure.writes(), 7)
 	azure.requests, azure.fail = nil, nil
 	_, err = provider.Deploy(t.Context(), func(string) {})
 	require.NoError(t, err)

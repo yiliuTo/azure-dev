@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1428,6 +1429,7 @@ func TestTemplatesFS_Embedded(t *testing.T) {
 		"templates/main.bicep",
 		"templates/main.arm.json",
 		"templates/abbreviations.json",
+		"templates/modules/acr-access.bicep",
 		"templates/modules/acr.bicep",
 		"templates/modules/acr-pull-role-assignment.bicep",
 		"templates/modules/connections.bicep",
@@ -1576,7 +1578,8 @@ func TestARMTemplate_IsValidJSONWithExpectedShape(t *testing.T) {
 
 	// isolationMode must be wired to the V2 managed network child resource
 	// (regression guard: it was previously a no-op echoed only to output).
-	assert.Contains(t, text, `"type": "Microsoft.CognitiveServices/accounts/managedNetworks"`,
+	assert.Contains(t, strings.ToLower(text),
+		`"type": "microsoft.cognitiveservices/accounts/managednetworks"`,
 		"managed isolationMode must provision a managedNetworks child resource")
 	assert.Contains(t, text, `"isolationMode": "[parameters('managedIsolationMode')]"`,
 		"managedNetworks isolationMode must come from the managedIsolationMode param")

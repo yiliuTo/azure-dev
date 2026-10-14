@@ -55,6 +55,7 @@ type agentHostingType = {
   hostingManagementIdentityResourceId: string
   storageAccountResourceId: string
   workloadIdentityResourceId: string
+  containerRegistryResourceId: string
 }
 
 // Parameters
@@ -79,6 +80,19 @@ param deployments deploymentsType = []
 @description('Include an Azure Container Registry. Set true when any agent uses docker:.')
 param includeAcr bool = false
 
+@description('Existing registry prepared for BYO AKS. Empty keeps the template-owned registry behavior.')
+param preparedAcrResourceId string = ''
+
+@description('Full role definition ID used by the Foundry project identity on the prepared registry.')
+param preparedAcrRoleDefinitionId string = ''
+
+@description('Registry lifecycle mode recorded in azd outputs.')
+@allowed([
+  'create'
+  'reuse-connect'
+])
+param acrMode string = 'create'
+
 @description('Foundry project connections to create (host: azure.ai.connection services).')
 param connections connectionsType = []
 
@@ -96,6 +110,7 @@ param agentHosting agentHostingType = {
   hostingManagementIdentityResourceId: ''
   storageAccountResourceId: ''
   workloadIdentityResourceId: ''
+  containerRegistryResourceId: ''
 }
 
 @description('Object id of the developer running azd. When set, grants Cognitive Services User on the project. Empty disables the role assignment so headless / CI runs do not fail.')
@@ -164,6 +179,10 @@ var disablePublicDataPlaneAccess = enableNetworkIsolation
 var cognitiveServicesUserRoleId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'a97b65f3-24c7-4388-baec-2e87135dc908'
+)
+var acrPullRoleId = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 )
 
 // Resources
@@ -329,6 +348,10 @@ module acr 'acr.bicep' = if (includeAcr) {
     foundryProjectName: foundryAccount::project.name
     foundryProjectPrincipalId: foundryAccount::project.identity.principalId
     enableNetworkIsolation: enableNetworkIsolation
+    existingRegistryResourceId: preparedAcrResourceId
+    projectAcrRoleDefinitionId: empty(preparedAcrRoleDefinitionId)
+      ? acrPullRoleId
+      : preparedAcrRoleDefinitionId
   }
 }
 
@@ -377,6 +400,7 @@ resource developerCognitiveServicesUser 'Microsoft.Authorization/roleAssignments
 // Outputs
 
 output AZURE_AI_PROJECT_ID string = foundryAccount::project.id
+output AZURE_AI_PROJECT_PRINCIPAL_ID string = foundryAccount::project.identity.principalId
 output AZURE_AI_ACCOUNT_NAME string = foundryAccount.name
 output AZURE_AI_PROJECT_NAME string = foundryAccount::project.name
 output AZURE_OPENAI_ENDPOINT string = 'https://${foundryAccount.name}.openai.azure.com/'
@@ -385,5 +409,6 @@ output AZURE_CONTAINER_REGISTRY_ENDPOINT string = includeAcr ? acr!.outputs.logi
 output AZURE_CONTAINER_REGISTRY_RESOURCE_ID string = includeAcr ? acr!.outputs.resourceId : ''
 output AZURE_AI_PROJECT_ACR_CONNECTION_NAME string = includeAcr ? acr!.outputs.connectionName : ''
 output AZURE_AI_PROJECT_CONNECTION_NAMES string = empty(connections) ? '' : projectConnections!.outputs.connectionNames
+output AZD_FOUNDRY_ACR_MODE string = includeAcr ? acrMode : 'none'
 output AZURE_FOUNDRY_NETWORK_MODE string = !enableNetworkIsolation ? 'none' : (useManagedEgress ? 'managed' : 'byo')
 output AZURE_FOUNDRY_MANAGED_ISOLATION_MODE string = useManagedNetwork ? managedIsolationMode : ''

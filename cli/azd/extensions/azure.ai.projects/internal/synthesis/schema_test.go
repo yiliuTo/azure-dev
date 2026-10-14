@@ -103,6 +103,8 @@ func TestSchema_AgentHostingStructuralInvariants(t *testing.T) {
 	for _, field := range hosting.Required {
 		assert.Contains(t, hosting.Properties, field)
 	}
+	assert.Contains(t, hosting.Properties, "containerRegistryResourceId")
+	assert.NotContains(t, hosting.Required, "containerRegistryResourceId")
 }
 
 func assertNetworkRejectsAgentSubnetWithIsolationMode(t *testing.T, allOf []json.RawMessage) {

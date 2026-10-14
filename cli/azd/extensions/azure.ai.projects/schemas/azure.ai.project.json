@@ -116,6 +116,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Full ARM resource ID of the separate user-assigned identity federated to AKS service accounts."
+        },
+        "containerRegistryResourceId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional full ARM resource ID of an existing Azure Container Registry. Supports ${VAR} resolved from the azd environment. When omitted, azd creates and reuses a dedicated registry in the Foundry resource group."
         }
       }
     },

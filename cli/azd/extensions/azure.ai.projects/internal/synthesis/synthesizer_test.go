@@ -524,6 +524,7 @@ func TestSynthesize_AgentHosting(t *testing.T) {
 		managerID  = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/manager"
 		storageID  = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/agents"
 		workloadID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/workload"
+		registryID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ContainerRegistry/registries/agents"
 	)
 	raw := []byte(`
 services:
@@ -537,18 +538,21 @@ services:
       hostingManagementIdentityResourceId: ${MANAGER_ID}
       storageAccountResourceId: ${STORAGE_ID}
       workloadIdentityResourceId: ${WORKLOAD_ID}
+      containerRegistryResourceId: ${ACR_ID}
 `)
 
+	env := map[string]string{
+		"AKS_ID":      clusterID,
+		"SUBNET_ID":   subnetID,
+		"MANAGER_ID":  managerID,
+		"STORAGE_ID":  storageID,
+		"WORKLOAD_ID": workloadID,
+		"ACR_ID":      registryID,
+	}
 	result, err := Synthesize(Input{
 		RawAzureYAML: raw,
 		ServiceName:  "project",
-		Env: map[string]string{
-			"AKS_ID":      clusterID,
-			"SUBNET_ID":   subnetID,
-			"MANAGER_ID":  managerID,
-			"STORAGE_ID":  storageID,
-			"WORKLOAD_ID": workloadID,
-		},
+		Env:          env,
 	})
 	require.NoError(t, err)
 
@@ -563,7 +567,26 @@ services:
 		HostingManagementIdentityResourceID: managerID,
 		StorageAccountResourceID:            storageID,
 		WorkloadIdentityResourceID:          workloadID,
+		ContainerRegistryResourceID:         registryID,
 	}, hosting)
+	assert.Equal(t, true, result.Parameters["includeAcr"])
+	assert.Equal(t, registryID, result.Parameters["preparedAcrResourceId"])
+	assert.Equal(t, "reuse-connect", result.Parameters["acrMode"])
+
+	withoutRegistry, err := Synthesize(Input{
+		RawAzureYAML: []byte(strings.Replace(
+			string(raw),
+			"      containerRegistryResourceId: ${ACR_ID}\n",
+			"",
+			1,
+		)),
+		ServiceName: "project",
+		Env:         env,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, true, withoutRegistry.Parameters["includeAcr"])
+	assert.Equal(t, "", withoutRegistry.Parameters["preparedAcrResourceId"])
+	assert.Equal(t, "create", withoutRegistry.Parameters["acrMode"])
 }
 
 func TestSynthesize_AgentHostingPreservesReferencesForEject(t *testing.T) {
@@ -581,6 +604,7 @@ services:
       hostingManagementIdentityResourceId: ${MANAGER_ID}
       storageAccountResourceId: ${STORAGE_ID}
       workloadIdentityResourceId: ${WORKLOAD_ID}
+      containerRegistryResourceId: ${ACR_ID}
 `)
 	result, err := Synthesize(Input{
 		RawAzureYAML:    raw,
@@ -595,6 +619,7 @@ services:
 	assert.Equal(t, "${MANAGER_ID}", hosting.HostingManagementIdentityResourceID)
 	assert.Equal(t, "${STORAGE_ID}", hosting.StorageAccountResourceID)
 	assert.Equal(t, "${WORKLOAD_ID}", hosting.WorkloadIdentityResourceID)
+	assert.Equal(t, "${ACR_ID}", hosting.ContainerRegistryResourceID)
 }
 
 func TestSynthesize_AgentHostingValidation(t *testing.T) {
@@ -612,6 +637,7 @@ services:
       hostingManagementIdentityResourceId: ${MANAGER_ID}
       storageAccountResourceId: /subscriptions/sub/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/agents
       workloadIdentityResourceId: ${WORKLOAD_ID}
+      containerRegistryResourceId: ${ACR_ID}
 `
 	tests := []struct {
 		name       string
@@ -636,6 +662,17 @@ services:
 			yaml:       strings.Replace(valid, "Microsoft.Network/virtualNetworks/vnet/subnets", "Microsoft.Storage/storageAccounts", 1),
 			synthesize: Synthesize,
 			want:       "agentSubnetResourceId",
+		},
+		{
+			name: "wrong container registry resource type",
+			yaml: strings.Replace(
+				valid,
+				"${ACR_ID}",
+				"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/not-an-acr",
+				1,
+			),
+			synthesize: Synthesize,
+			want:       "containerRegistryResourceId",
 		},
 		{
 			name: "missing agent subnet",
@@ -673,6 +710,8 @@ services:
 						"Microsoft.ManagedIdentity/userAssignedIdentities/manager",
 					"WORKLOAD_ID": "/subscriptions/sub/resourceGroups/rg/providers/" +
 						"Microsoft.ManagedIdentity/userAssignedIdentities/workload",
+					"ACR_ID": "/subscriptions/sub/resourceGroups/rg/providers/" +
+						"Microsoft.ContainerRegistry/registries/agents",
 				},
 			})
 			require.Error(t, err)
@@ -1783,6 +1822,7 @@ func TestTemplatesFS_Embedded(t *testing.T) {
 		"templates/main.bicep",
 		"templates/main.arm.json",
 		"templates/abbreviations.json",
+		"templates/modules/acr-access.bicep",
 		"templates/modules/acr.bicep",
 		"templates/modules/acr-pull-role-assignment.bicep",
 		"templates/modules/connections.bicep",
@@ -1988,7 +2028,11 @@ func TestARMTemplate_IsValidJSONWithExpectedShape(t *testing.T) {
 	params, ok := arm["parameters"].(map[string]any)
 	require.True(t, ok, "parameters must be an object")
 	assert.Contains(t, params, "resourceGroupName")
+	assert.Contains(t, params, "createResourceGroup")
 	assert.Contains(t, params, "agentHosting")
+	assert.Contains(t, params, "preparedAcrResourceId")
+	assert.Contains(t, params, "preparedAcrRoleDefinitionId")
+	assert.Contains(t, params, "acrMode")
 
 	// connections must remain an array so ejected templates preserve the
 	// connection object shape.
@@ -2054,7 +2098,8 @@ func TestARMTemplate_IsValidJSONWithExpectedShape(t *testing.T) {
 
 	// isolationMode must be wired to the V2 managed network child resource
 	// (regression guard: it was previously a no-op echoed only to output).
-	assert.Contains(t, text, `"type": "Microsoft.CognitiveServices/accounts/managedNetworks"`,
+	assert.Contains(t, strings.ToLower(text),
+		`"type": "microsoft.cognitiveservices/accounts/managednetworks"`,
 		"managed isolationMode must provision a managedNetworks child resource")
 	assert.Contains(t, text, `"isolationMode": "[parameters('managedIsolationMode')]"`,
 		"managedNetworks isolationMode must come from the managedIsolationMode param")

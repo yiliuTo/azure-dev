@@ -1357,20 +1357,19 @@ func TestPlannedOutputsMatchSelectedTemplate(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		provider  FoundryProvisioningProvider
-		want      string
+		want      []string
 		doNotWant string
 	}{
 		{
-			name:      "greenfield",
-			want:      "AZURE_FOUNDRY_NETWORK_MODE",
-			doNotWant: "AZD_FOUNDRY_ACR_MODE",
+			name: "greenfield",
+			want: []string{"AZURE_FOUNDRY_NETWORK_MODE", "AZD_FOUNDRY_ACR_MODE"},
 		},
 		{
 			name: "existing project",
 			provider: FoundryProvisioningProvider{
 				brownfieldEndpoint: "https://account.services.ai.azure.com/api/projects/project",
 			},
-			want:      "AZD_FOUNDRY_ACR_MODE",
+			want:      []string{"AZD_FOUNDRY_ACR_MODE"},
 			doNotWant: "AZURE_FOUNDRY_NETWORK_MODE",
 		},
 	} {
@@ -1381,8 +1380,12 @@ func TestPlannedOutputsMatchSelectedTemplate(t *testing.T) {
 			for _, output := range outputs {
 				names = append(names, output.Name)
 			}
-			assert.Contains(t, names, tt.want)
-			assert.NotContains(t, names, tt.doNotWant)
+			for _, want := range tt.want {
+				assert.Contains(t, names, want)
+			}
+			if tt.doNotWant != "" {
+				assert.NotContains(t, names, tt.doNotWant)
+			}
 			assert.Contains(t, names, "AZURE_AI_PROJECT_CONNECTIONS_PROJECT_ENDPOINT")
 		})
 	}

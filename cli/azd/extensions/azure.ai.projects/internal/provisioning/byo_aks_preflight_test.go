@@ -32,8 +32,10 @@ const (
 	byoTestManagement   = byoTestScope + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/management"
 	byoTestWorkload     = byoTestScope + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/workload"
 	byoTestStorage      = byoTestScope + "/providers/Microsoft.Storage/storageAccounts/storage"
+	byoTestRegistry     = byoTestScope + "/providers/Microsoft.ContainerRegistry/registries/registry"
 	byoTestManagementID = "00000000-0000-0000-0000-000000000002"
 	byoTestWorkloadID   = "00000000-0000-0000-0000-000000000003"
+	byoTestKubeletID    = "00000000-0000-0000-0000-000000000004"
 )
 
 func byoAKSTestConfig() *byoAKSConfig {
@@ -41,6 +43,7 @@ func byoAKSTestConfig() *byoAKSConfig {
 		Enabled: true, HostingType: "ManagedCluster", ClusterResourceID: byoTestCluster,
 		AgentSubnetResourceID: byoTestAgentSubnet, HostingManagementIdentityResourceID: byoTestManagement,
 		WorkloadIdentityResourceID: byoTestWorkload, StorageAccountResourceID: byoTestStorage,
+		ContainerRegistryResourceID: byoTestRegistry,
 	}
 }
 
@@ -91,6 +94,9 @@ func byoAKSTestSnapshot() *byoAKSSnapshot {
 			Properties: &armcontainerservice.ManagedClusterProperties{
 				KubernetesVersion: new("1.31.0"),
 				ProvisioningState: new("Succeeded"),
+				IdentityProfile: map[string]*armcontainerservice.UserAssignedIdentity{
+					"kubeletidentity": {ObjectID: new(byoTestKubeletID)},
+				},
 				OidcIssuerProfile: &armcontainerservice.ManagedClusterOIDCIssuerProfile{
 					Enabled: new(true), IssuerURL: new("https://issuer.example/"),
 				},
