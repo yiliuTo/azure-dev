@@ -202,6 +202,9 @@ dictionaryDefinitions:
 dictionaries:
   - azdProjectDictionary
 overrides:
+  - filename: "**/extensions/azure.ai.projects/internal/onboarding/resource_source.go"
+    words:
+      - managedidentity
   - filename: "{docs/extensions/contract-versioning.md,grpc/README.md}"
     words:
       - generateprojectclient

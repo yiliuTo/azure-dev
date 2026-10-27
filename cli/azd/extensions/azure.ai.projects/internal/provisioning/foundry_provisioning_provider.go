@@ -105,6 +105,7 @@ type FoundryProvisioningProvider struct {
 
 	// Lazily constructed on first compile. nil until needed.
 	bicepCliInstance bicepCompiler
+	byoNames         func(context.Context, *templateSource) (byoResolvedNames, error)
 	byoPipeline      *onboarding.Pipeline
 	byoBindings      func(context.Context, onboarding.Plan, onboarding.Facts) (onboarding.DeploymentData, error)
 	byoLifecycle     onboarding.Lifecycle
@@ -1339,7 +1340,7 @@ func (p *FoundryProvisioningProvider) resolveTemplate(
 			}
 			for _, key := range []string{
 				"agentHosting", "includeAcr", "containerRegistryResourceId", "containerRegistryABAC",
-				"byoAccountName", "byoOwner", "byoOnboarding",
+				"byoOnboarding",
 			} {
 				if _, declared := parameters[key]; !declared {
 					return nil, fmt.Errorf("BYO-AKS Bicep template must declare deployment-plan parameter %s; regenerate it", key)

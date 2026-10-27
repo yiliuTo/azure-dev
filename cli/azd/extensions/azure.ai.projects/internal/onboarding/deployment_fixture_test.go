@@ -124,6 +124,13 @@ func (f *preparationARM) options() *arm.ClientOptions {
 			}
 			return respond(200, map[string]any{"value": identities})
 		}
+		if strings.HasSuffix(key, "/resources") {
+			var resources []any
+			for _, resource := range f.resources {
+				resources = append(resources, resource)
+			}
+			return respond(200, map[string]any{"value": resources})
+		}
 		if resource, exists := f.resources[key]; exists {
 			return respond(200, resource)
 		}
@@ -233,7 +240,7 @@ func (f *preparationARM) materializeGraph(spec FoundrySpec) {
 			continue
 		}
 		f.resources[strings.ToLower(item.resource.ID)] = map[string]any{
-			"id": item.resource.ID, "tags": ownerTags(f.plan.Owner), "location": f.plan.Location,
+			"id": item.resource.ID, "location": f.plan.Location,
 			"properties": map[string]any{
 				"principalId": fmt.Sprintf("00000000-0000-0000-0000-%012d", index+1),
 				"clientId":    fmt.Sprintf("00000000-0000-0000-0000-%012d", (index+1)*11), "tenantId": "tenant",
@@ -242,12 +249,11 @@ func (f *preparationARM) materializeGraph(spec FoundrySpec) {
 	}
 	if !data.StorageSupplied {
 		body := storageContractBody(f.plan.Storage.ID)
-		body["tags"] = ownerTags(f.plan.Owner)
 		f.resources[strings.ToLower(f.plan.Storage.ID)] = body
 	}
 	if !f.plan.Registry.Supplied {
 		f.resources[strings.ToLower(f.plan.Registry.ID)] = map[string]any{
-			"id": f.plan.Registry.ID, "tags": ownerTags(f.plan.Owner),
+			"id": f.plan.Registry.ID,
 			"properties": map[string]any{"provisioningState": "Succeeded", "roleAssignmentMode": "LegacyRegistryPermissions",
 				"loginServer": "owned.azurecr.io"},
 		}
@@ -294,7 +300,8 @@ func (f *preparationARM) materializeGraph(spec FoundrySpec) {
 		f.graphGrantWrites = append(f.graphGrantWrites, id)
 		f.resources[strings.ToLower(id)] = map[string]any{"id": id, "properties": map[string]any{
 			"scope": grant.scope, "principalId": grant.principalID, "roleDefinitionId": roleID,
-			"principalType": "ServicePrincipal", "description": f.plan.Owner,
+			"principalType": "ServicePrincipal", "description": f.plan.DeploymentID,
+			"createdOn": "2026-10-26T00:50:00Z",
 		}}
 	}
 }

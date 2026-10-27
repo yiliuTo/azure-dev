@@ -27,10 +27,12 @@ func deleteProgressGrant(t *testing.T, f *cleanupARM, scope string) {
 	for id := range f.base.resources {
 		if strings.HasPrefix(id, strings.ToLower(scope)+"/providers/microsoft.authorization/roleassignments/") {
 			delete(f.base.resources, id)
-			if f.operationStates == nil {
-				f.operationStates = map[string]string{}
+			if f.deploymentState == "Failed" {
+				if f.operationStates == nil {
+					f.operationStates = map[string]string{}
+				}
+				f.operationStates[id] = "Failed"
 			}
-			f.operationStates[id] = "Failed"
 			deleted = true
 		}
 	}

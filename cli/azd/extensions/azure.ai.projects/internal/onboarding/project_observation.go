@@ -49,8 +49,7 @@ func (l *ownedLifecycle) verifyDeployedProject(
 		return err
 	}
 	if spec.Deployment == nil {
-		if !strings.EqualFold(authString(project.ID), spec.ProjectID) ||
-			authString(project.Tags[preparationOwnerTag]) != state.Owner || project.Identity == nil {
+		if !strings.EqualFold(authString(project.ID), spec.ProjectID) || project.Identity == nil {
 			return fmt.Errorf("legacy Foundry project ownership/identity is unverified")
 		}
 		return nil
@@ -64,12 +63,6 @@ func (l *ownedLifecycle) verifyDeployedProject(
 		!(state.CleanupStarted && state.Foundry.ProjectDeleteStarted &&
 			resourceValue(project.Properties.ProvisioningState) == "Deleting")) {
 		return fmt.Errorf("deployed Foundry project exact ID/location/state/system identity/tenant is unverified")
-	}
-	if owner, present := project.Tags[preparationOwnerTag]; present {
-		if authString(owner) != state.Owner {
-			return fmt.Errorf("deployed Foundry project ownership tag conflicts with the recorded environment")
-		}
-		return nil
 	}
 	// Some Project RP responses omit tags. Absence is not ownership evidence:
 	// require the exact Create in the content-bound deployment graph instead.
@@ -98,10 +91,9 @@ func (l *ownedLifecycle) verifyProjectParentAccount(ctx context.Context, state *
 		return fmt.Errorf("verify untagged Foundry project's owned parent account: %w", err)
 	}
 	if state.Foundry.AccountDeleted || !strings.EqualFold(authString(observed.ID), spec.AccountID) ||
-		authString(observed.Tags[preparationOwnerTag]) != state.Owner ||
 		!strings.EqualFold(authString(observed.Location), spec.Location) ||
 		observed.Properties == nil || resourceValue(observed.Properties.ProvisioningState) != "Succeeded" {
-		return fmt.Errorf("untagged Foundry project's exact owner-tagged parent account is unverified")
+		return fmt.Errorf("Foundry project's exact deployment-bound parent account is unverified")
 	}
 	return nil
 }

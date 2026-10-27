@@ -170,12 +170,11 @@ func TestP09OwnedRegistryOutputRetainsOriginalSelectionOnRetry(t *testing.T) {
 	input := Input{
 		ClusterID: f.base.plan.Cluster.ID, RegistryID: f.base.plan.Registry.ID,
 		SubscriptionID: f.base.plan.SubscriptionID, ResourceGroup: f.base.plan.ResourceGroup,
-		Location: f.base.plan.Location, Environment: f.base.plan.Environment, ProjectPath: "retry",
-		FoundryName: "foundry-project",
+		Location: f.base.plan.Location, Environment: f.base.plan.Environment,
+		FoundryAccountID: f.base.plan.Account.ID, DeploymentID: f.base.plan.DeploymentID,
 	}
 	plan, err := BuildPlan(input)
 	require.NoError(t, err)
-	plan.Owner = f.base.plan.Owner
 	require.True(t, plan.RegistryCustomerSupplied)
 	plan, err = ResolveRegistrySelection(t.Context(), plan, f.base.journal)
 	require.NoError(t, err)
@@ -188,7 +187,6 @@ func TestP09OwnedRegistryOutputRetainsOriginalSelectionOnRetry(t *testing.T) {
 	input.RegistryID += "different"
 	different, err := BuildPlan(input)
 	require.NoError(t, err)
-	different.Owner = plan.Owner
 	different, err = ResolveRegistrySelection(t.Context(), different, f.base.journal)
 	require.NoError(t, err)
 	assert.True(t, different.RegistryCustomerSupplied, "different customer registry must retain the new grant check")

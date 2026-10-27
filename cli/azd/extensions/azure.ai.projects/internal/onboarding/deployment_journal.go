@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 )
 
-const preparationOwnerTag = "azd-byoaks-owner"
-const preparationJournalVersion = 2
+const preparationJournalVersion = 3
 
 // Journal atomically stores deployment intents and observed ownership. Load returns a zero state when absent.
 // Callers must serialize deployment for an environment; this interface is not a distributed lock.
@@ -22,19 +22,21 @@ type Journal interface {
 	Save(context.Context, PreparationState) error
 }
 
-// PreparationState retains the existing ledger format so older exact owned records remain recoverable.
+// PreparationState associates exact deployment provenance and cleanup progress with an environment.
 type PreparationState struct {
 	Version          int                         `json:"version"`
 	SubscriptionID   string                      `json:"subscriptionId"`
 	ResourceGroup    string                      `json:"resourceGroup"`
 	Location         string                      `json:"location"`
-	Owner            string                      `json:"owner"`
+	Environment      string                      `json:"environment"`
+	DeploymentID     string                      `json:"deploymentId"`
 	Network          *SubnetPreparation          `json:"network,omitempty"`
 	Resources        map[string]OwnedResource    `json:"resources"`
 	Assignments      map[string]OwnedAssignment  `json:"assignments"`
 	Foundry          *FoundryState               `json:"foundry,omitempty"`
 	Registry         *RegistryBinding            `json:"registry,omitempty"`
 	ResourceProgress map[string]ResourceProgress `json:"resourceProgress,omitempty"`
+	Sources          map[string]ResourceSource   `json:"sources,omitempty"`
 	CleanupStarted   bool                        `json:"cleanupStarted,omitempty"`
 	CleanupComplete  bool                        `json:"cleanupComplete,omitempty"`
 }
@@ -76,24 +78,21 @@ type OwnedResource struct {
 
 // OwnedAssignment records an observed exact owned grant; reused customer grants are never added.
 type OwnedAssignment struct {
-	ID          string `json:"id"`
-	Scope       string `json:"scope"`
-	PrincipalID string `json:"principalId"`
-	RoleID      string `json:"roleId"`
-	Complete    bool   `json:"complete"`
-	Deleted     bool   `json:"deleted,omitempty"`
+	ID          string    `json:"id"`
+	Scope       string    `json:"scope"`
+	PrincipalID string    `json:"principalId"`
+	RoleID      string    `json:"roleId"`
+	Complete    bool      `json:"complete"`
+	Deleted     bool      `json:"deleted,omitempty"`
+	CreatedOn   time.Time `json:"createdOn"`
 }
 
-func confirmOwned(state PreparationState, step, id string, tags map[string]*string) error {
+func confirmOwned(state PreparationState, step, id string, _ map[string]*string) error {
 	record, ok := state.Resources[step]
-	if !ok || !strings.EqualFold(record.ID, id) || authString(tags[preparationOwnerTag]) != state.Owner {
-		return fmt.Errorf("%s: existing resource is not the exact journaled, owner-tagged resource; refusing adoption", step)
+	if !ok || !strings.EqualFold(record.ID, id) || state.DeploymentID == "" {
+		return fmt.Errorf("%s: existing resource is not the exact journaled resource; refusing adoption", step)
 	}
 	return nil
-}
-
-func ownerTags(owner string) map[string]*string {
-	return map[string]*string{preparationOwnerTag: new(owner)}
 }
 
 func responseNotFound(err error) bool {

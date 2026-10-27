@@ -57,12 +57,6 @@ param tags object = {}
 @description('Optional salt to vary resource names across re-provisions.')
 param resourceTokenSalt string = ''
 
-@description('Internal planned BYO account name; empty preserves standard naming.')
-param byoAccountName string = ''
-
-@description('Internal ownership marker for the BYO Foundry account, not for a supplied resource group.')
-param byoOwner string = ''
-
 @description('Internal read-only onboarding plan; never part of public agentHosting YAML.')
 param byoOnboarding object = {}
 
@@ -147,7 +141,7 @@ var effectiveHosting = hasOnboardingPlan ? union(agentHosting, {
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2021-04-01' = if (!suppliedResourceGroup) {
   name: resourceGroupName
   location: location
-  tags: hasOnboardingPlan ? union(tags, { 'azd-byoaks-owner': byoOnboarding.owner }) : tags
+  tags: tags
 }
 
 module prerequisites 'modules/byo-prerequisites.bicep' = if (hasOnboardingPlan) {
@@ -168,8 +162,7 @@ module resources 'modules/resources.bicep' = {
     location: location
     tags: tags
     resourceTokenSalt: resourceTokenSalt
-    byoAccountName: hasOnboardingPlan ? byoOnboarding.accountName : byoAccountName
-    byoOwner: hasOnboardingPlan ? byoOnboarding.owner : byoOwner
+    byoDeploymentId: hasOnboardingPlan ? byoOnboarding.deploymentId : ''
     foundryProjectName: foundryProjectName
     deployments: deployments
     includeAcr: includeAcr

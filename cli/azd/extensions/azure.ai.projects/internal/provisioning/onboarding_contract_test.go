@@ -75,7 +75,7 @@ func byoContractProvider(t *testing.T) *FoundryProvisioningProvider {
 	require.NoError(t, err)
 	var armTemplate map[string]any
 	require.NoError(t, json.Unmarshal(template, &armTemplate))
-	return &FoundryProvisioningProvider{
+	p := &FoundryProvisioningProvider{
 		azdClient: newResolveEnvTestClient(t, &resolveEnvStubEnvServer{
 			envName: "contract", get: map[string]string{},
 		}, &resolveEnvStubPromptServer{}),
@@ -97,6 +97,15 @@ func byoContractProvider(t *testing.T) *FoundryProvisioningProvider {
 			}, nil
 		},
 	}
+	p.byoNames = func(context.Context, *templateSource) (byoResolvedNames, error) {
+		return byoResolvedNames{
+			AccountID: "/subscriptions/" + p.subID + "/resourceGroups/" + p.rgName +
+				"/providers/Microsoft.CognitiveServices/accounts/cog-6ufu4rgx47pmc",
+			RegistryName: byoRegistryName(p.subID, p.rgName, p.envName, p.projectPath),
+			DeploymentID: "/subscriptions/" + p.subID + "/providers/Microsoft.Resources/deployments/" + p.deploymentName(),
+		}, nil
+	}
+	return p
 }
 
 func byoContractPipeline(events *[]string, status onboarding.Status) *onboarding.Pipeline {
@@ -261,7 +270,7 @@ func TestBYOProviderPreflightThenSingleDeployment(t *testing.T) {
 			assert.Empty(t, hosting["workloadIdentityResourceId"])
 			assert.NotContains(t, deployment.Properties.Parameters, "byoRegistryAccessReady")
 			require.Contains(t, deployment.Properties.Parameters, "byoOnboarding")
-			body := `{"id":"` + request.URL.Path + `","properties":{"provisioningState":"Succeeded","outputs":{}}}`
+			body := contractBYOSuccessBody(t, p, request.URL.Path)
 			return &http.Response{
 				StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
 				Body: io.NopCloser(strings.NewReader(body)), Request: request,
@@ -334,11 +343,11 @@ func TestBYOProviderInitializeRejectsExplicitEmptyIdentities(t *testing.T) {
 func TestBYOJournalReadAfterWriteUsesNewPersistedState(t *testing.T) {
 	client := newValidateTestClient(t, &validateStubProjectServer{}, &resolveEnvStubEnvServer{envName: "contract"})
 	p := &FoundryProvisioningProvider{
-		azdClient: client, envName: "contract", virtualEnv: map[string]string{envKeyBYOJournal: `{"owner":"old"}`},
+		azdClient: client, envName: "contract", virtualEnv: map[string]string{envKeyBYOJournal: `{"environment":"old"}`},
 	}
 	journal := environmentJournal{p}
-	require.NoError(t, journal.Save(t.Context(), onboarding.PreparationState{Owner: "new"}))
+	require.NoError(t, journal.Save(t.Context(), onboarding.PreparationState{Environment: "new"}))
 	state, err := journal.Load(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, "new", state.Owner)
+	assert.Equal(t, "new", state.Environment)
 }

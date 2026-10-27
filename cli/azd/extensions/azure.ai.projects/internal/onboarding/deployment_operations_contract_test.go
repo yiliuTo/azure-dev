@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,7 +25,7 @@ func TestRecoveryRequiresGrantIDInExactDeploymentOperationGraph(t *testing.T) {
 		"scope": f.spec.RegistryID, "principalId": f.spec.Deployment.KubeletObjectID,
 		"roleDefinitionId": "/subscriptions/" + registry.SubscriptionID +
 			"/providers/Microsoft.Authorization/roleDefinitions/" + registryRoleID(false),
-		"principalType": "ServicePrincipal", "description": f.base.plan.Owner,
+		"principalType": "ServicePrincipal", "description": f.base.plan.DeploymentID,
 	}}
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
@@ -49,7 +50,7 @@ func TestUnreadableDeploymentOperationOwnershipRetainsEveryDependency(t *testing
 	f.deploy(t)
 	f.operationReadDenied = true
 	err := f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil)
-	require.ErrorContains(t, err, "ownership recovery")
+	require.ErrorContains(t, err, "terminal deployment operations")
 	assert.Empty(t, f.deletes, "unreadable graph evidence is not permission to delete dependencies")
 	resources := []Resource{f.base.plan.Hosting, f.base.plan.Workload, f.base.plan.Storage, f.base.plan.Registry}
 	for _, resource := range resources {
@@ -70,27 +71,53 @@ func TestDeploymentGrantRecoveryTraversesExactCrossSubscriptionNestedOperations(
 		require.Equal(t, http.MethodGet, request.Method)
 		reads = append(reads, request.URL.Path)
 		var targetID, kind string
-		switch request.URL.Path {
-		case root + "/operations":
+		switch strings.ToLower(request.URL.Path) {
+		case strings.ToLower(root + "/operations"):
 			targetID, kind = nested, "Microsoft.Resources/deployments"
-		case nestedOperations:
+		case strings.ToLower(nestedOperations):
 			targetID, kind = grant, "Microsoft.Authorization/roleAssignments"
+		case strings.ToLower(nested):
+			return contractARMResponse(request, 200, `{"id":"`+nested+`","properties":{
+				"correlationId":"unit-correlation","templateHash":"nested-hash","provisioningState":"Succeeded"}}`), nil
 		default:
 			t.Fatalf("unexpected deployment operation scope %s", request.URL.Path)
 		}
-		body, err := json.Marshal(map[string]any{"value": []any{map[string]any{"properties": map[string]any{
-			"targetResource": map[string]any{"id": targetID, "resourceType": kind},
-		}}}})
+		body, err := json.Marshal(map[string]any{"value": []any{map[string]any{
+			"id": strings.TrimSuffix(request.URL.Path, "/operations") + "/operations/exact",
+			"properties": map[string]any{
+				"provisioningOperation": "Create", "provisioningState": "Succeeded",
+				"targetResource": map[string]any{"id": targetID, "resourceType": kind},
+			}}}})
 		require.NoError(t, err)
 		return contractARMResponse(request, 200, string(body)), nil
 	})
 	l := &ownedLifecycle{credential: contractCredential{}, options: onboardingARMOptions(options)}
+	attempt, err := captureOperationContractAttempt(t, l, root, "Succeeded", true)
+	require.NoError(t, err)
 	targets, err := l.deploymentGrantTargets(t.Context(), Plan{SubscriptionID: "target"}, &FoundryState{
-		Attempts: []FoundryAttempt{{ID: root, Terminal: true}},
+		Attempts: []FoundryAttempt{attempt},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]bool{strings.ToLower(grant): true}, targets)
-	assert.Equal(t, []string{root + "/operations", nestedOperations}, reads)
+	require.Len(t, reads, 4)
+	for index, expected := range []string{root + "/operations", nested, nestedOperations, nested} {
+		assert.True(t, strings.EqualFold(expected, reads[index]))
+	}
+}
+
+func captureOperationContractAttempt(
+	t *testing.T, lifecycle *ownedLifecycle, id, state string, terminal bool,
+) (FoundryAttempt, error) {
+	t.Helper()
+	attempt := FoundryAttempt{ID: id, Terminal: terminal, ProvisioningState: state,
+		CorrelationID: "unit-correlation", TemplateHash: "unit-generator",
+		TemplateDigest: "unit-content-digest", ARMTemplateHash: "unit-arm-hash"}
+	properties := &armresources.DeploymentPropertiesExtended{
+		CorrelationID: new(attempt.CorrelationID), TemplateHash: new(attempt.ARMTemplateHash),
+		ProvisioningState: new(armresources.ProvisioningState(state)),
+	}
+	err := lifecycle.captureAttemptEvidence(t.Context(), &attempt, properties)
+	return attempt, err
 }
 
 func TestDeploymentOperationsPagerPreservesExactPathAndContinuation(t *testing.T) {

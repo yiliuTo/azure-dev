@@ -49,7 +49,7 @@ resource "azurerm_role_assignment" "foundry_acr_pull" {
   role_definition_id = "/subscriptions/${split("/", local.registry_id)[2]}/providers/Microsoft.Authorization/roleDefinitions/${local.acr_pull_role_id}"
   principal_id       = local.project_principal_id
   principal_type     = "ServicePrincipal"
-  description        = local.byo_enabled ? var.byo_onboarding.owner : null
+  description          = local.byo_enabled ? var.byo_onboarding.deploymentId : null
 }
 
 # Project connection so Foundry can resolve the registry by name.

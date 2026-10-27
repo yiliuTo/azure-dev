@@ -85,14 +85,14 @@ func TestDeploymentBindingsReadOnlyReuseArbitraryCompatibleKubeletGrant(t *testi
 
 func TestDeploymentStartJournalsOnlyResourceIntentsBeforeARM(t *testing.T) {
 	f := newCleanupARM(t, false, false)
-	id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/first"
+	id := f.base.plan.DeploymentID
 	require.Empty(t, f.base.journal.data, "read-only Check does not persist a preparation state")
 	require.NoError(t, f.lifecycle.Start(t.Context(), f.base.plan, f.spec, id))
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	require.Len(t, state.Foundry.Attempts, 1)
 	assert.Equal(t, id, state.Foundry.Attempts[0].ID)
-	assert.Equal(t, f.base.plan.Owner, state.Owner)
+	assert.Equal(t, f.base.plan.DeploymentID, state.DeploymentID)
 	assert.Equal(t, f.spec.Deployment, state.Foundry.Spec.Deployment)
 	assert.Empty(t, state.Assignments, "future principal GUIDs are not fabricated")
 	assert.Empty(t, state.Foundry.ProjectPrincipalID)
@@ -115,12 +115,12 @@ func TestLifecycleRejectsUnjournaledDeterministicCollisions(t *testing.T) {
 			resource := deploymentResources(f.base.plan)[step]
 			// An owner tag alone is not permission to adopt an existing resource.
 			f.base.resources[strings.ToLower(resource.ID)] = map[string]any{
-				"id": resource.ID, "tags": ownerTags(f.base.plan.Owner),
+				"id": resource.ID,
 			}
 			_, err := f.lifecycle.Check(t.Context(), f.base.plan, f.spec)
 			require.ErrorContains(t, err, "refusing adoption")
 			require.Empty(t, f.base.journal.data)
-			id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/first"
+			id := f.base.plan.DeploymentID
 			require.Error(t, f.lifecycle.Start(t.Context(), f.base.plan, f.spec, id))
 			require.Empty(t, f.base.journal.data)
 		})
@@ -138,6 +138,7 @@ func TestFailedARMGraphRecoveryNeedsNoOutputsOrPredictedGrantUUIDs(t *testing.T)
 		record.Identity, record.Complete = Identity{}, false
 		state.Resources[key] = record
 	}
+	state.Foundry.Attempts[0].Evidence = nil
 	require.NoError(t, f.base.journal.Save(t.Context(), state))
 	for _, root := range f.roots {
 		properties := cleanupObject(t, root["properties"])
@@ -188,7 +189,7 @@ func TestRegistryEnvironmentOutputRetryPreservesOriginalOwnedLedger(t *testing.T
 	spec.Deployment = &data
 	_, err = f.lifecycle.Check(t.Context(), plan, spec)
 	require.NoError(t, err)
-	id := "/subscriptions/" + plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/retry"
+	id := plan.DeploymentID
 	require.NoError(t, f.lifecycle.Start(t.Context(), plan, spec, id))
 	after, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
@@ -200,7 +201,8 @@ func TestRegistryEnvironmentOutputRetryPreservesOriginalOwnedLedger(t *testing.T
 func TestLegacyDependencyLedgerIsNotSilentlyReplaced(t *testing.T) {
 	f := newCleanupARM(t, false, false)
 	state := PreparationState{
-		Version: preparationJournalVersion, Owner: f.base.plan.Owner, SubscriptionID: f.base.plan.SubscriptionID,
+		Version: preparationJournalVersion, DeploymentID: f.base.plan.DeploymentID,
+		Environment: f.base.plan.Environment, SubscriptionID: f.base.plan.SubscriptionID,
 		ResourceGroup: f.base.plan.ResourceGroup, Location: f.base.plan.Location,
 		Resources: map[string]OwnedResource{"R04": {ID: f.base.plan.Hosting.ID, Complete: true}},
 	}
@@ -208,7 +210,7 @@ func TestLegacyDependencyLedgerIsNotSilentlyReplaced(t *testing.T) {
 	before := string(f.base.journal.data)
 	_, err := f.lifecycle.Check(t.Context(), f.base.plan, f.spec)
 	require.ErrorContains(t, err, "legacy dependency ownership remains")
-	id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/first"
+	id := f.base.plan.DeploymentID
 	require.Error(t, f.lifecycle.Start(t.Context(), f.base.plan, f.spec, id))
 	assert.Equal(t, before, string(f.base.journal.data))
 	_, err = CleanupPlan(state)
@@ -230,7 +232,7 @@ func TestFreshLifecycleCollisionCheckDoesNotGETFutureIdentities(t *testing.T) {
 	lifecycle := NewLifecycle(contractCredential{}, options, f.base.journal)
 	_, err := lifecycle.Check(t.Context(), f.base.plan, f.spec)
 	require.NoError(t, err)
-	id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/first"
+	id := f.base.plan.DeploymentID
 	require.NoError(t, lifecycle.Start(t.Context(), f.base.plan, f.spec, id))
 	assert.Equal(t, 2, lists, "existing RG identities are listed for collision protection; future identities are not GET")
 }
@@ -239,7 +241,7 @@ func TestExistingParentResolutionPreservesAllCustomerGroupTags(t *testing.T) {
 	f, _ := preparationContractFixture(t, true, true, false)
 	groupID := "/subscriptions/" + f.plan.SubscriptionID + "/resourceGroups/" + f.plan.ResourceGroup
 	f.resources[strings.ToLower(groupID)]["tags"] = map[string]any{
-		"customer": "retained", preparationOwnerTag: "existing-other-owner",
+		"customer": "retained", "customer-owner": "existing-other-owner",
 	}
 	plan := f.plan
 	plan.ResourceGroupSupplied = false
@@ -248,7 +250,7 @@ func TestExistingParentResolutionPreservesAllCustomerGroupTags(t *testing.T) {
 	assert.True(t, resolved.ResourceGroupSupplied)
 	require.Contains(t, resolved.ResourceGroupTags, "customer")
 	assert.Equal(t, "retained", authString(resolved.ResourceGroupTags["customer"]))
-	assert.Equal(t, "existing-other-owner", authString(resolved.ResourceGroupTags[preparationOwnerTag]))
+	assert.Equal(t, "existing-other-owner", authString(resolved.ResourceGroupTags["customer-owner"]))
 	assert.Empty(t, f.journal.data)
 	assert.Empty(t, f.writes)
 }
@@ -274,7 +276,7 @@ func TestOwnedStorageRetryReferencesExistingSKUWithoutLosingR02Ownership(t *test
 			spec.Deployment = &data
 			_, err = f.lifecycle.Check(t.Context(), f.base.plan, spec)
 			require.NoError(t, err)
-			id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/retry"
+			id := f.base.plan.DeploymentID
 			require.NoError(t, f.lifecycle.Start(t.Context(), f.base.plan, spec, id))
 			after, err := f.base.journal.Load(t.Context())
 			require.NoError(t, err)
@@ -290,7 +292,7 @@ func TestOwnedStorageRetryReferencesExistingSKUWithoutLosingR02Ownership(t *test
 func TestOwnedStorageReferenceCannotAdoptAnUnjournaledOwnerTag(t *testing.T) {
 	f := newCleanupARM(t, false, false)
 	body := storageContractBody(f.base.plan.Storage.ID)
-	body["tags"] = ownerTags(f.base.plan.Owner)
+	body["tags"] = map[string]*string{"azd-env-name": new(f.base.plan.Environment)}
 	f.base.resources[strings.ToLower(f.base.plan.Storage.ID)] = body
 	data, err := ResolveDeploymentBindings(t.Context(), contractCredential{}, f.options, f.base.plan, Facts{
 		TenantID: "tenant", KubeletObjectID: f.spec.Deployment.KubeletObjectID,
@@ -301,7 +303,7 @@ func TestOwnedStorageReferenceCannotAdoptAnUnjournaledOwnerTag(t *testing.T) {
 	spec.Deployment = &data
 	_, err = f.lifecycle.Check(t.Context(), f.base.plan, spec)
 	require.ErrorContains(t, err, "owned Storage reference requires the exact active journaled resource")
-	id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/first"
+	id := f.base.plan.DeploymentID
 	require.Error(t, f.lifecycle.Start(t.Context(), f.base.plan, spec, id))
 	assert.Empty(t, f.base.journal.data)
 	assert.Empty(t, f.base.writes)

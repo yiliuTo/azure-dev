@@ -63,6 +63,10 @@ func validateDeploymentData(plan Plan, spec FoundrySpec, state PreparationState)
 		data.RegistryABAC != spec.RegistryABAC || data.FederatedIdentityRoleDefinitionID == "" {
 		return fmt.Errorf("deployment bindings differ from the internally planned resource graph")
 	}
+	if data.StorageCustomerSupplied != expected.StorageCustomerSupplied ||
+		data.RegistryCustomerSupplied != expected.RegistryCustomerSupplied {
+		return fmt.Errorf("deployment resource source differs from the original explicit selection")
+	}
 	return nil
 }
 
@@ -169,6 +173,9 @@ func (l *ownedLifecycle) checkDeploymentResources(ctx context.Context, plan Plan
 func (l *ownedLifecycle) observeDeployment(ctx context.Context, plan Plan, state *PreparationState) error {
 	if state.Foundry == nil || state.Foundry.Spec.Deployment == nil {
 		return nil
+	}
+	if err := l.verifyResourceSources(ctx, plan, state); err != nil {
+		return err
 	}
 	data := state.Foundry.Spec.Deployment
 	observedIdentities := map[string]bool{}
@@ -284,9 +291,6 @@ func (l *ownedLifecycle) observeDeployment(ctx context.Context, plan Plan, state
 	if err != nil {
 		return err
 	}
-	for _, record := range state.Assignments {
-		targets[strings.ToLower(record.ID)] = true
-	}
 	observedGrants := map[string]bool{}
 	for _, grant := range grants {
 		if !createsGrant(recovered, grant.checkID) {
@@ -352,15 +356,13 @@ func (l *ownedLifecycle) observeGrant(
 		}
 		for _, assignment := range page.Value {
 			if assignment == nil || assignment.Properties == nil ||
-				authString(assignment.Properties.Description) != state.Owner ||
+				!strings.EqualFold(authString(assignment.Properties.Description), state.DeploymentID) ||
 				!targets[strings.ToLower(authString(assignment.ID))] {
 				continue
 			}
 			expected := grant
 			if expected.principalID == "" {
-				// A partial graph can retain an exact grant after its identity was removed.
-				// Bind the real principal only from the attempted graph's actual assignment ID.
-				expected.principalID = authString(assignment.Properties.PrincipalID)
+				continue // A grant's own value cannot establish the expected principal.
 			}
 			if expected.principalID == "" || !compatibleGrant(*assignment, expected) {
 				continue
@@ -371,12 +373,18 @@ func (l *ownedLifecycle) observeGrant(
 				return fmt.Errorf("%s: owned grant exact ID is unverified", grant.checkID)
 			}
 			key := strings.ToLower(actualID)
+			if assignment.Properties.CreatedOn == nil || assignment.Properties.CreatedOn.IsZero() {
+				return fmt.Errorf("%s: exact grant has no current creation evidence", grant.checkID)
+			}
+			if err := l.verifyGrantBirth(ctx, *state, actualID, *assignment.Properties.CreatedOn); err != nil {
+				return err
+			}
 			record := OwnedAssignment{ID: actualID, Scope: grant.scope, PrincipalID: expected.principalID,
-				RoleID: grant.roleID, Complete: true}
+				RoleID: grant.roleID, Complete: true, CreatedOn: *assignment.Properties.CreatedOn}
 			for _, old := range state.Assignments {
 				if strings.EqualFold(old.ID, actualID) && (old.Deleted ||
 					!strings.EqualFold(old.PrincipalID, record.PrincipalID) ||
-					!strings.EqualFold(old.RoleID, record.RoleID)) {
+					!strings.EqualFold(old.RoleID, record.RoleID) || !old.CreatedOn.Equal(record.CreatedOn)) {
 					return fmt.Errorf("%s: recorded grant ownership changed", grant.checkID)
 				}
 			}
@@ -398,6 +406,7 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 	// Optional collectors record succeeded grants and path-bound child/network Creates, respectively.
 	targets := map[string]bool{}
 	visited := map[string]bool{}
+	var evidence *AttemptEvidence
 	var read func(string, bool, bool, bool, bool) error
 	read = func(deploymentID string, observedBefore, failedAttempt, rejectedBeforeCreate, boundPath bool) error {
 		key := strings.ToLower(deploymentID)
@@ -418,10 +427,6 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 		}
 		boundPath = boundPath && strings.EqualFold(id.SubscriptionID, plan.SubscriptionID) &&
 			(id.ResourceGroupName == "" || strings.EqualFold(id.ResourceGroupName, plan.ResourceGroup))
-		pager, err := NewDeploymentOperationsPager(deploymentID, l.credential, l.options)
-		if err != nil {
-			return err
-		}
 		var children []struct {
 			id       string
 			rejected bool
@@ -439,12 +444,18 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 					if _, err := ParseID(targetID, "Microsoft.Authorization/roleAssignments"); err != nil {
 						return fmt.Errorf("deployment operation role-assignment ID is invalid: %w", err)
 					}
+					if !succeededCreateOperation(operation, deploymentID) {
+						continue
+					}
 					targets[strings.ToLower(targetID)] = true
 					if len(succeeded) > 0 && succeeded[0] != nil &&
 						strings.EqualFold(authString(operation.Properties.ProvisioningState), "Succeeded") {
 						succeeded[0][strings.ToLower(targetID)] = true
 					}
 				case strings.EqualFold(authString(target.ResourceType), "Microsoft.Resources/deployments"):
+					if !exactCreateOperation(operation, deploymentID) {
+						return fmt.Errorf("nested deployment source lacks an exact parent Create operation")
+					}
 					children = append(children, struct {
 						id       string
 						rejected bool
@@ -452,7 +463,12 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 					}{targetID, failedAttempt && nestedValidationRejected(operation, deploymentID),
 						boundPath && succeededCreateOperation(operation, deploymentID)})
 				case strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/projects"),
+					strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/deployments"),
 					strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/projects/connections"),
+					strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts"),
+					strings.EqualFold(authString(target.ResourceType), "Microsoft.Storage/storageAccounts"),
+					strings.EqualFold(authString(target.ResourceType), "Microsoft.ContainerRegistry/registries"),
+					strings.EqualFold(authString(target.ResourceType), "Microsoft.ManagedIdentity/userAssignedIdentities"),
 					networkCleanupType(authString(target.ResourceType)):
 					if len(succeeded) > 1 && succeeded[1] != nil &&
 						boundPath && succeededCreateOperation(operation, deploymentID) {
@@ -465,23 +481,15 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 		if id.ResourceGroupName == "" && !strings.EqualFold(id.SubscriptionID, plan.SubscriptionID) {
 			return fmt.Errorf("unexpected nested subscription deployment outside the recorded target")
 		}
-		for pager.More() {
-			page, err := pager.NextPage(ctx)
-			if deploymentRecordNotFound(err) && rejectedBeforeCreate {
-				if err := l.confirmRejectedDeploymentAbsent(ctx, deploymentID); err != nil {
-					return err
-				}
-				break // No nested record or operations exist; this branch supplies no owned-grant evidence.
-			}
-			if responseNotFound(err) && observedBefore {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("read exact ARM graph operations for ownership recovery: %w", err)
-			}
-			if err := collect(page.Value); err != nil {
-				return err
-			}
+		if evidence == nil {
+			return fmt.Errorf("exact ARM graph operations provenance is missing")
+		}
+		operations, ok := evidence.Operations[strings.ToLower(deploymentID)]
+		if !ok {
+			return fmt.Errorf("exact nested ARM graph source is missing")
+		}
+		if err := collect(operations); err != nil {
+			return err
 		}
 		for _, child := range children {
 			if err := read(child.id, observedBefore, failedAttempt, child.rejected, child.bound); err != nil {
@@ -491,6 +499,11 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 		return nil
 	}
 	for _, attempt := range foundry.Attempts {
+		if err := validateAttemptEvidence(attempt); err != nil {
+			return nil, err
+		}
+		evidence = attempt.Evidence
+		clear(visited)
 		if err := read(attempt.ID, attempt.OwnershipObserved,
 			attempt.Terminal && attempt.ProvisioningState == "Failed", false, attempt.Terminal); err != nil {
 			return nil, err
@@ -500,17 +513,27 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 }
 
 func succeededCreateOperation(operation *armresources.DeploymentOperation, deploymentID string) bool {
+	return exactCreateOperation(operation, deploymentID) &&
+		strings.EqualFold(authString(operation.Properties.ProvisioningState), "Succeeded")
+}
+
+func exactCreateOperation(operation *armresources.DeploymentOperation, deploymentID string) bool {
+	if operation == nil || operation.Properties == nil {
+		return false
+	}
 	id, err := arm.ParseResourceID(authString(operation.ID))
 	return err == nil && validResourceIDSyntax(authString(operation.ID)) &&
 		strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/deployments/operations") &&
 		strings.EqualFold(id.Parent.String(), deploymentID) &&
 		operation.Properties != nil &&
 		operation.Properties.ProvisioningOperation != nil &&
-		*operation.Properties.ProvisioningOperation == armresources.ProvisioningOperationCreate &&
-		strings.EqualFold(authString(operation.Properties.ProvisioningState), "Succeeded")
+		*operation.Properties.ProvisioningOperation == armresources.ProvisioningOperationCreate
 }
 
 func nestedValidationRejected(operation *armresources.DeploymentOperation, deploymentID string) bool {
+	if operation == nil || operation.Properties == nil {
+		return false
+	}
 	id, err := arm.ParseResourceID(authString(operation.ID))
 	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/deployments/operations") ||
 		!strings.EqualFold(id.Parent.String(), deploymentID) {

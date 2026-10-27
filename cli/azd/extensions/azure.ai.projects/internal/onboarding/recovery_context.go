@@ -55,6 +55,9 @@ func ResolveRecoveryContext(
 	if err := lifecycle.verifyAttempts(ctx, plan, state.Foundry); err != nil {
 		return plan, err
 	}
+	if err := lifecycle.verifyResourceSources(ctx, plan, &state); err != nil {
+		return plan, err
+	}
 	succeeded := map[string]bool{}
 	if _, err := lifecycle.deploymentGrantTargets(ctx, plan, state.Foundry, succeeded); err != nil {
 		return plan, err

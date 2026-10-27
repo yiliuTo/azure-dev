@@ -65,6 +65,9 @@ func (p *FoundryProvisioningProvider) planBYO(
 	if err != nil {
 		return err
 	}
+	if _, err := standardBYOTemplateHash(source.armTemplate); err != nil {
+		return err
+	}
 	selected, err := byoDeploymentSelection(source)
 	if err != nil {
 		return err
@@ -82,9 +85,9 @@ func (p *FoundryProvisioningProvider) planBYO(
 				"make the explicit parameter and environment selections agree", key)
 		}
 	}
-	foundryName, ok := byoParameterValue(source, "foundryProjectName").(string)
-	if !ok {
-		return fmt.Errorf("I03: effective foundryProjectName must be a string for resource naming")
+	names, err := p.resolveBYONames(ctx, source)
+	if err != nil {
+		return err
 	}
 	registryID, err := p.optionalRegistryID(ctx)
 	if err != nil {
@@ -100,8 +103,8 @@ func (p *FoundryProvisioningProvider) planBYO(
 		WorkloadIdentityID: hosting.WorkloadIdentityResourceID,
 		RegistryID:         registryID, AgentSubnetID: subnetID,
 		SubscriptionID: p.subID, ResourceGroup: p.rgName, Location: p.location,
-		Environment: p.envName, ProjectPath: p.projectPath,
-		FoundryName: foundryName,
+		Environment: p.envName, FoundryAccountID: names.AccountID,
+		DeploymentID: names.DeploymentID, RegistryName: names.RegistryName,
 	})
 	if err != nil {
 		return err
@@ -115,6 +118,12 @@ func (p *FoundryProvisioningProvider) planBYO(
 			Resources: onboarding.NewResourceChecker(p.credential, p.armClientOptions),
 			Access:    onboarding.NewAuthorizer(p.credential, p.armClientOptions),
 			Resolve: func(ctx context.Context, plan onboarding.Plan) (onboarding.Plan, error) {
+				if names.ParentResolved {
+					if names.Group != nil {
+						return onboarding.ApplyExistingParent(plan, names.Group.Tags), nil
+					}
+					return plan, nil
+				}
 				return onboarding.ResolveExistingParents(ctx, plan, p.credential, p.armClientOptions)
 			},
 		}
@@ -215,7 +224,7 @@ func (p *FoundryProvisioningProvider) planBYO(
 
 func (p *FoundryProvisioningProvider) bindBYOPlan(plan onboarding.Plan, data onboarding.DeploymentData) error {
 	if err := synthesis.ApplyBYOOnboarding(p.synthResult, synthesis.BYOOnboardingParameters{
-		Owner: plan.Owner, AccountName: onboarding.PlannedFoundryAccount(plan).Name,
+		DeploymentID: plan.DeploymentID, AccountName: onboarding.PlannedFoundryAccount(plan).Name,
 		ResourceGroupSupplied: data.ResourceGroupSupplied,
 		ClusterResourceID:     data.ClusterID, StorageAccountResourceID: data.StorageID,
 		StorageName: plan.Storage.Name, StorageSupplied: data.StorageSupplied, StorageSKU: data.StorageSKU,
@@ -310,22 +319,6 @@ func (p *FoundryProvisioningProvider) bindPlannedGroupTags(parameters map[string
 		merged = map[string]string{}
 	}
 	for key, value := range explicit {
-		if strings.EqualFold(key, "azd-byoaks-owner") {
-			var owner string
-			for observedKey, observedValue := range tags {
-				if strings.EqualFold(observedKey, key) {
-					owner = observedValue
-				}
-			}
-			if owner == "" || value != owner {
-				return exterrors.Validation(
-					exterrors.CodeInvalidServiceConfig,
-					"R01: explicit tags conflict with the private azd-byoaks-owner ownership marker",
-					"remove the ownership tag from the template parameters; azd preserves the observed ownership marker",
-				)
-			}
-			continue
-		}
 		for observedKey := range merged {
 			if strings.EqualFold(observedKey, key) {
 				delete(merged, observedKey)

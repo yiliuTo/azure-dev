@@ -67,7 +67,7 @@ func RecordPreflight(ctx context.Context, plan Plan, report Report, journal Jour
 		current.PreflightPassed = applicable && passed
 		progress[key] = current
 	}
-	state.Version, state.Owner = preparationJournalVersion, plan.Owner
+	state.Version, state.DeploymentID, state.Environment = preparationJournalVersion, plan.DeploymentID, plan.Environment
 	state.SubscriptionID, state.ResourceGroup, state.Location = plan.SubscriptionID, plan.ResourceGroup, plan.Location
 	state.ResourceProgress = progress
 	return journal.Save(ctx, state)

@@ -49,8 +49,7 @@ param tags object = {}
 @description('Optional salt to vary resource names across re-provisions.')
 param resourceTokenSalt string = ''
 
-param byoAccountName string = ''
-param byoOwner string = ''
+param byoDeploymentId string = ''
 
 @description('Foundry project name. 3-32 alphanumeric/hyphen chars.')
 @minLength(3)
@@ -124,7 +123,7 @@ var resourceToken = empty(resourceTokenSalt)
 
 var abbrs = loadJsonContent('../abbreviations.json')
 
-var foundryAccountName = empty(byoAccountName) ? '${abbrs.cognitiveServicesAccounts}${resourceToken}' : byoAccountName
+var foundryAccountName = '${abbrs.cognitiveServicesAccounts}${resourceToken}'
 
 // Egress: byo injects the agent into a customer subnet; managed uses the
 // Microsoft-managed network. Ingress: an account private endpoint is always
@@ -182,7 +181,7 @@ var agentNetworkInjections = useByoNetwork
 resource foundryAccount 'Microsoft.CognitiveServices/accounts@2026-07-15-preview' = {
   name: foundryAccountName
   location: location
-  tags: empty(byoOwner) ? tags : union(tags, { 'azd-byoaks-owner': byoOwner })
+  tags: tags
   sku: {
     name: 'S0'
   }
@@ -244,7 +243,6 @@ resource foundryAccount 'Microsoft.CognitiveServices/accounts@2026-07-15-preview
   resource project 'projects' = {
     name: foundryProjectName
     location: location
-    ...(!empty(byoOwner) ? { tags: { 'azd-byoaks-owner': byoOwner } } : {})
     identity: {
       type: 'SystemAssigned'
     }
@@ -290,7 +288,7 @@ module acr 'acr.bicep' = if (includeAcr) {
     enableNetworkIsolation: enableNetworkIsolation
     registryResourceId: containerRegistryResourceId
     registryABAC: containerRegistryABAC
-    owner: byoOwner
+    deploymentId: byoDeploymentId
   }
 }
 

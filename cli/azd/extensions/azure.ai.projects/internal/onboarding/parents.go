@@ -31,10 +31,16 @@ func ResolveExistingParents(
 	if err != nil {
 		return plan, fmt.Errorf("I03: discover existing resource-group parent: %w", err)
 	}
+	return ApplyExistingParent(plan, found.Tags), nil
+}
+
+// ApplyExistingParent narrows creation checks using an already observed target
+// resource group, without repeating discovery or retaining the caller's tag map.
+func ApplyExistingParent(plan Plan, tags map[string]*string) Plan {
 	subscription := "/subscriptions/" + plan.SubscriptionID
 	parent := subscription + "/resourceGroups/" + plan.ResourceGroup
 	plan.ResourceGroupSupplied = true
-	plan.ResourceGroupTags = maps.Clone(found.Tags)
+	plan.ResourceGroupTags = maps.Clone(tags)
 	for _, resource := range []*Resource{&plan.Hosting, &plan.Workload, &plan.Storage, &plan.Registry} {
 		if !resource.Supplied {
 			resource.Parent = parent
@@ -50,5 +56,5 @@ func ResolveExistingParents(
 			}
 		}
 	}
-	return plan, nil
+	return plan
 }

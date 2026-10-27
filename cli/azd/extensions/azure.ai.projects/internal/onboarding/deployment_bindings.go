@@ -27,6 +27,7 @@ type DeploymentData struct {
 	StorageCustomerSupplied           bool
 	RegistryID                        string
 	RegistrySupplied                  bool
+	RegistryCustomerSupplied          bool
 	RegistryABAC                      bool
 	KubeletObjectID                   string
 	StorageSKU                        string // Creation-only; reference branches never update the existing SKU.
@@ -57,9 +58,9 @@ func PlannedDeployment(plan Plan, facts Facts) (DeploymentData, error) {
 		return DeploymentData{}, fmt.Errorf(
 			"automatic hosting-subnet preparation is unsupported; retain old journals for cleanup")
 	}
-	if plan.Owner == "" || plan.Location == "" || facts.TenantID == "" || facts.KubeletObjectID == "" {
+	if plan.DeploymentID == "" || plan.Location == "" || facts.TenantID == "" || facts.KubeletObjectID == "" {
 		return DeploymentData{}, fmt.Errorf(
-			"deployment requires the planned owner/location and verified tenant/kubelet identity")
+			"deployment requires the official deployment scope/location and verified tenant/kubelet identity")
 	}
 	if strings.EqualFold(plan.Hosting.ID, plan.Workload.ID) {
 		return DeploymentData{}, fmt.Errorf("R04/R05: hosting and workload identities must be distinct")
@@ -103,8 +104,9 @@ func PlannedDeployment(plan Plan, facts Facts) (DeploymentData, error) {
 		StorageID: plan.Storage.ID, StorageSupplied: plan.Storage.Supplied,
 		StorageCustomerSupplied: plan.Storage.Supplied,
 		RegistryID:              plan.Registry.ID, RegistrySupplied: plan.Registry.Supplied,
-		RegistryABAC:    facts.RegistryABAC,
-		KubeletObjectID: facts.KubeletObjectID, StorageSKU: StorageSKU(plan.Location),
+		RegistryCustomerSupplied: plan.RegistryCustomerSupplied,
+		RegistryABAC:             facts.RegistryABAC,
+		KubeletObjectID:          facts.KubeletObjectID, StorageSKU: StorageSKU(plan.Location),
 		HostingIdentity: facts.HostingIdentity, WorkloadIdentity: facts.WorkloadIdentity,
 	}, nil
 }
@@ -126,12 +128,11 @@ func ResolveDeploymentBindings(
 		}
 		found, err := client.GetProperties(ctx, id.ResourceGroupName, id.Name, nil)
 		if err == nil {
-			if !strings.EqualFold(authString(found.ID), plan.Storage.ID) ||
-				authString(found.Tags[preparationOwnerTag]) != plan.Owner {
+			if !strings.EqualFold(authString(found.ID), plan.Storage.ID) {
 				return data, fmt.Errorf(
-					"R02: existing planned Storage is not the exact owner-tagged resource; refusing adoption")
+					"R02: existing planned Storage is not the exact target; refusing adoption")
 			}
-			// Lifecycle validation also requires the active R02 intent; an owner tag alone is not ownership.
+			// The lifecycle separately verifies the active intent and current creation provenance.
 			data.StorageSupplied = true
 		} else if !responseNotFound(err) {
 			return data, fmt.Errorf("R02: resolve existing owned Storage reference: %w", err)

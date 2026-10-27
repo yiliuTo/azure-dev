@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"azure.ai.projects/internal/exterrors"
 	"azure.ai.projects/internal/onboarding"
@@ -18,7 +19,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
 	"github.com/azure/azure-dev/cli/azd/pkg/grpcbroker"
-	"github.com/google/uuid"
 )
 
 func (p *FoundryProvisioningProvider) ownedBYOLifecycle() onboarding.Lifecycle {
@@ -119,12 +119,15 @@ func (p *FoundryProvisioningProvider) deployBYO(
 	if err != nil {
 		return nil, err
 	}
-	deployment.Tags["azd-byoaks-owner"] = new(plan.Owner)
 	if err := ctx.Err(); err != nil {
 		return nil, p.byoLifecycleError(err, exterrors.OpArmDeploymentCreate)
 	}
-	name := "azd-byo-" + uuid.NewString()
-	id := "/subscriptions/" + p.subID + "/providers/Microsoft.Resources/deployments/" + name
+	target, err := arm.ParseResourceID(plan.DeploymentID)
+	if err != nil || target.SubscriptionID != p.subID || target.ResourceGroupName != "" ||
+		!strings.EqualFold(target.ResourceType.String(), "Microsoft.Resources/deployments") {
+		return nil, fmt.Errorf("BYO-AKS requires its exact subscription deployment target")
+	}
+	name, id := target.Name, plan.DeploymentID
 	if err := lifecycle.Start(ctx, plan, p.byoSpec, id); err != nil {
 		return nil, p.byoLifecycleError(err, exterrors.OpArmDeploymentCreate)
 	}
@@ -141,13 +144,65 @@ func (p *FoundryProvisioningProvider) deployBYO(
 	if err := lifecycle.Observe(ctx, plan); err != nil {
 		return nil, p.byoLifecycleError(err, exterrors.OpArmDeploymentCreate)
 	}
+	outputs := deploymentOutputs(response.Properties)
+	if err := validateBYODeploymentOutputs(plan, p.byoSpec, outputs); err != nil {
+		return nil, p.byoLifecycleError(err, exterrors.OpArmDeploymentCreate)
+	}
 	progress("Foundry deployment complete")
 	return &azdext.ProvisioningDeployResult{
 		Deployment: &azdext.ProvisioningDeployment{
 			Parameters: armInputsToProto(source.parameters),
-			Outputs:    p.normalizeOutputs(p.withTenantOutput(armOutputsToProto(deploymentOutputs(response.Properties)))),
+			Outputs:    p.normalizeOutputs(p.withTenantOutput(armOutputsToProto(outputs))),
 		},
 	}, nil
+}
+
+func validateBYODeploymentOutputs(plan onboarding.Plan, spec onboarding.FoundrySpec, raw any) error {
+	project, err := arm.ParseResourceID(spec.ProjectID)
+	if err != nil {
+		return fmt.Errorf("invalid planned Foundry project target: %w", err)
+	}
+	expected := map[string]string{
+		"AZURE_AI_ACCOUNT_NAME":                onboarding.PlannedFoundryAccount(plan).Name,
+		"AZURE_AI_PROJECT_NAME":                project.Name,
+		"AZURE_AI_PROJECT_ID":                  spec.ProjectID,
+		"AZURE_CONTAINER_REGISTRY_RESOURCE_ID": plan.Registry.ID,
+	}
+	outputs, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("BYO-AKS deployment lacks outputs required to verify its exact targets")
+	}
+	seen := map[string]bool{}
+	for name, value := range outputs {
+		key := canonicalizeOutputName(name)
+		want, required := expected[key]
+		if !required {
+			continue
+		}
+		if seen[key] {
+			return fmt.Errorf("BYO-AKS deployment returned ambiguous %s outputs", key)
+		}
+		seen[key] = true
+		entry, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("BYO-AKS deployment returned invalid %s output", key)
+		}
+		actual, isString := entry["value"].(string)
+		kind, _ := entry["type"].(string)
+		matches := actual == want
+		if strings.HasSuffix(key, "_ID") {
+			matches = strings.EqualFold(actual, want)
+		}
+		if !isString || !strings.EqualFold(kind, "String") || want == "" || !matches {
+			return fmt.Errorf("BYO-AKS deployment %s does not match the exact planned target", key)
+		}
+	}
+	for key := range expected {
+		if !seen[key] {
+			return fmt.Errorf("BYO-AKS deployment is missing required %s output", key)
+		}
+	}
+	return nil
 }
 
 func (p *FoundryProvisioningProvider) byoLifecycleError(cause error, operation string) error {

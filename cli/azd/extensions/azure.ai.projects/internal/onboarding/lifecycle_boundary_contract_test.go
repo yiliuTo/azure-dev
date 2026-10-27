@@ -21,11 +21,14 @@ func lifecycleBoundaryLedger() PreparationState {
 	registry := "/subscriptions/" + registrySubscription +
 		"/resourceGroups/customer-rg/providers/Microsoft.ContainerRegistry/registries/customer"
 	plan := Plan{
-		Owner: "0123456789abcdef", SubscriptionID: subscription, ResourceGroup: "owned-rg", Location: "eastus",
+		DeploymentID: "/subscriptions/" + subscription + "/providers/Microsoft.Resources/deployments/attempt-a",
+		Environment:  "dev", SubscriptionID: subscription, ResourceGroup: "owned-rg", Location: "eastus",
+		Account: Resource{ID: parent + "/providers/Microsoft.CognitiveServices/accounts/cog-official", Name: "cog-official"},
 	}
 	account := PlannedFoundryAccount(plan)
 	return PreparationState{
-		Version: 2, Owner: plan.Owner, SubscriptionID: subscription, ResourceGroup: plan.ResourceGroup, Location: plan.Location,
+		Version: preparationJournalVersion, DeploymentID: plan.DeploymentID, Environment: plan.Environment,
+		SubscriptionID: subscription, ResourceGroup: plan.ResourceGroup, Location: plan.Location,
 		Resources: map[string]OwnedResource{
 			"R01": {ID: parent, Complete: true},
 			"R04": {ID: parent + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/hosting", Complete: true},
@@ -44,6 +47,7 @@ func lifecycleBoundaryLedger() PreparationState {
 			Spec: FoundrySpec{
 				AccountID: account.ID, ProjectID: account.ID + "/projects/project",
 				RegistryID: registry, Location: plan.Location, ModelNames: []string{"model-a"},
+				Deployment: &DeploymentData{},
 			},
 			Attempts: []FoundryAttempt{{
 				ID:            "/subscriptions/" + subscription + "/providers/Microsoft.Resources/deployments/attempt-a",
@@ -79,7 +83,7 @@ func TestCleanupPlanPreservesExactPersistedScopeAndHistory(t *testing.T) {
 			plan, err := CleanupPlan(state)
 
 			require.NoError(t, err)
-			assert.Equal(t, state.Owner, plan.Owner)
+			assert.Equal(t, state.DeploymentID, plan.DeploymentID)
 			assert.Equal(t, state.SubscriptionID, plan.SubscriptionID)
 			assert.Equal(t, state.ResourceGroup, plan.ResourceGroup)
 			assert.Equal(t, state.Location, plan.Location)
@@ -98,8 +102,8 @@ func TestCleanupPlanRejectsAmbiguousPersistedOwnership(t *testing.T) {
 		{"absent version", func(s *PreparationState) { s.Version = 0 }},
 		{"legacy without Foundry", func(s *PreparationState) { s.Version, s.Foundry = 1, nil }},
 		{"legacy with Foundry", func(s *PreparationState) { s.Version = 1 }},
-		{"future version", func(s *PreparationState) { s.Version = 3 }},
-		{"missing owner", func(s *PreparationState) { s.Owner = "" }},
+		{"future version", func(s *PreparationState) { s.Version = 4 }},
+		{"missing deployment", func(s *PreparationState) { s.DeploymentID = "" }},
 		{"missing subscription", func(s *PreparationState) { s.SubscriptionID = "" }},
 		{"missing group", func(s *PreparationState) { s.ResourceGroup = "" }},
 		{"missing location", func(s *PreparationState) { s.Location = "" }},
@@ -134,7 +138,7 @@ func TestCleanupPlanRejectsAmbiguousPersistedOwnership(t *testing.T) {
 		}},
 		{"account target mismatch", func(s *PreparationState) { s.Foundry.Spec.AccountID += "-other" }},
 		{"project parent mismatch", func(s *PreparationState) {
-			s.Foundry.Spec.ProjectID = strings.Replace(s.Foundry.Spec.ProjectID, "/ais-", "/other-", 1)
+			s.Foundry.Spec.ProjectID = strings.Replace(s.Foundry.Spec.ProjectID, "/cog-", "/other-", 1)
 		}},
 		{"account location mismatch", func(s *PreparationState) { s.Foundry.Spec.Location = "westus" }},
 		{"model name contains child path", func(s *PreparationState) { s.Foundry.Spec.ModelNames = []string{"model/child"} }},
@@ -159,7 +163,7 @@ func TestPlannedFoundryAccountIsExactAndNotSupplied(t *testing.T) {
 
 	account := PlannedFoundryAccount(plan)
 
-	assert.Equal(t, "ais-"+state.Owner, account.Name)
+	assert.Equal(t, "cog-official", account.Name)
 	assert.Equal(t, "/subscriptions/"+state.SubscriptionID+"/resourceGroups/"+state.ResourceGroup, account.Parent)
 	assert.Equal(t, account.Parent+"/providers/Microsoft.CognitiveServices/accounts/"+account.Name, account.ID)
 	assert.Equal(t, state.Foundry.Spec.AccountID, account.ID)
@@ -171,24 +175,23 @@ func TestPlannedFoundryAccountIsExactAndNotSupplied(t *testing.T) {
 }
 
 func TestLifecycleAttemptIntentIsDurableBeforeARM(t *testing.T) {
-	state := lifecycleBoundaryLedger()
-	plan, err := CleanupPlan(state)
+	f := newCleanupARM(t, false, false)
+	f.deploy(t)
+	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	journal := &memoryPreparationJournal{}
-	require.NoError(t, journal.Save(t.Context(), state))
-	spec := state.Foundry.Spec
-	spec.ModelNames = []string{"MODEL-A", "model-b"}
-	id := "/subscriptions/" + plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/attempt-b"
-
-	require.NoError(t, NewLifecycle(nil, nil, journal).Start(t.Context(), plan, spec, id))
-
-	saved, err := journal.Load(t.Context())
+	spec := f.spec
+	spec.ModelNames = []string{"owned-model", "model-b"}
+	id := f.base.plan.DeploymentID
+	require.NoError(t, f.lifecycle.Start(t.Context(), f.base.plan, spec, id))
+	saved, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	require.Len(t, saved.Foundry.Attempts, 2)
-	assert.Equal(t, state.Foundry.Attempts[0], saved.Foundry.Attempts[0])
-	assert.Equal(t, FoundryAttempt{ID: id}, saved.Foundry.Attempts[1],
+	assert.True(t, saved.Foundry.Attempts[0].Archived)
+	assert.Equal(t, state.Foundry.Attempts[0].Evidence, saved.Foundry.Attempts[0].Evidence)
+	assert.Equal(t, FoundryAttempt{ID: id, TemplateHash: spec.TemplateHash, TemplateDigest: spec.TemplateDigest},
+		saved.Foundry.Attempts[1],
 		"a new intent must not inherit a terminal state or correlation from an earlier attempt")
-	assert.Equal(t, []string{"model-a", "model-b"}, saved.Foundry.Spec.ModelNames)
+	assert.Equal(t, []string{"owned-model", "model-b"}, saved.Foundry.Spec.ModelNames)
 	assert.Equal(t, state.Resources, saved.Resources)
 	assert.Equal(t, state.Assignments, saved.Assignments)
 }
@@ -199,8 +202,8 @@ func TestLifecycleAttemptRejectsAmbiguousJournalWithoutSaving(t *testing.T) {
 		mutate func(*PreparationState, *string)
 	}{
 		{"legacy without Foundry", func(s *PreparationState, _ *string) { s.Version, s.Foundry = 1, nil }},
-		{"unknown version", func(s *PreparationState, _ *string) { s.Version = 3 }},
-		{"different environment", func(s *PreparationState, _ *string) { s.Owner = "another-environment" }},
+		{"unknown version", func(s *PreparationState, _ *string) { s.Version = 4 }},
+		{"different environment", func(s *PreparationState, _ *string) { s.Environment = "another-environment" }},
 		{"unfinished cleanup", func(s *PreparationState, _ *string) { s.CleanupStarted = true }},
 		{"latest attempt unresolved", func(s *PreparationState, _ *string) {
 			s.Foundry.Attempts = append(s.Foundry.Attempts, FoundryAttempt{
@@ -237,14 +240,13 @@ func TestLifecycleAttemptRejectsAmbiguousJournalWithoutSaving(t *testing.T) {
 }
 
 func TestLifecycleAttemptCancellationAndSaveFailureKeepPriorEvidence(t *testing.T) {
-	state := lifecycleBoundaryLedger()
-	plan, err := CleanupPlan(state)
+	f := newCleanupARM(t, false, false)
+	f.deploy(t)
+	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	journal := &memoryPreparationJournal{}
-	require.NoError(t, journal.Save(t.Context(), state))
+	plan, journal, lifecycle := f.base.plan, f.base.journal, f.lifecycle
 	before := slices.Clone(journal.data)
-	lifecycle := NewLifecycle(nil, nil, journal)
-	id := "/subscriptions/" + plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/attempt-b"
+	id := plan.DeploymentID
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 

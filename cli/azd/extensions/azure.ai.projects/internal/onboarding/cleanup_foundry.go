@@ -41,7 +41,6 @@ func (l *ownedLifecycle) cleanupFoundry(
 	if err == nil {
 		if state.Foundry == nil || state.Foundry.AccountDeleted ||
 			!strings.EqualFold(authString(observed.ID), target.ID) ||
-			authString(observed.Tags[preparationOwnerTag]) != state.Owner ||
 			!strings.EqualFold(authString(observed.Location), state.Foundry.Spec.Location) {
 			return fmt.Errorf("Foundry account ownership/location is unknown or changed")
 		}
@@ -58,6 +57,9 @@ func (l *ownedLifecycle) cleanupFoundry(
 			return err
 		}
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := l.verifyResourceSources(ctx, plan, state); err != nil {
 			return err
 		}
 		if progress != nil {
@@ -106,8 +108,11 @@ func (l *ownedLifecycle) cleanupFoundry(
 		if err != nil {
 			return fmt.Errorf("read soft-deleted owned Foundry account: %w", err)
 		}
-		if authString(softDeleted.Tags[preparationOwnerTag]) != state.Owner ||
-			!strings.EqualFold(authString(softDeleted.Location), state.Foundry.Spec.Location) {
+		source := state.Sources[strings.ToLower(state.Foundry.Spec.AccountID)]
+		if !strings.EqualFold(authString(softDeleted.ID), state.Foundry.Spec.AccountID) ||
+			!strings.EqualFold(authString(softDeleted.Location), state.Foundry.Spec.Location) ||
+			softDeleted.SystemData == nil || softDeleted.SystemData.CreatedAt == nil ||
+			source.CreatedTime.IsZero() || !source.CreatedTime.Equal(*softDeleted.SystemData.CreatedAt) {
 			return fmt.Errorf("soft-deleted account ownership/location changed; refusing irreversible purge")
 		}
 		if err := ctx.Err(); err != nil {

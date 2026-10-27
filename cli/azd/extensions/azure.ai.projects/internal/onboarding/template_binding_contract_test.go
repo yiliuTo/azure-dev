@@ -163,7 +163,7 @@ func TestTemplateDigestCanonicalizesOnlyARMDeclarationTypes(t *testing.T) {
 	}
 }
 
-func TestLegacyAttemptRecoversDifferentARMHashWithoutRewritingJournal(t *testing.T) {
+func TestMissingContentDigestCannotRecoverOwnership(t *testing.T) {
 	f := newCleanupARM(t, false, false)
 	f.deploy(t)
 	state, err := f.base.journal.Load(t.Context())
@@ -189,16 +189,16 @@ func TestLegacyAttemptRecoversDifferentARMHashWithoutRewritingJournal(t *testing
 	before, err := json.Marshal(state)
 	require.NoError(t, err)
 	_, err = ResolveRecoveryContext(t.Context(), f.base.plan, contractCredential{}, f.options, f.base.journal)
-	require.NoError(t, err)
+	require.Error(t, err)
 	after, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	encoded, err := json.Marshal(after)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(before), string(encoded), "read-only recovery must not rewrite the old hash or progress")
-	require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
+	require.Error(t, f.lifecycle.Observe(t.Context(), f.base.plan))
 	confirmed, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, hash, confirmed.Foundry.Attempts[0].TemplateHash, "preserve the old generator-version binding")
-	assert.Equal(t, "6828760392490666086", confirmed.Foundry.Attempts[0].ARMTemplateHash,
-		"persist ARM's independent hash only after actual exported content and lifecycle evidence are verified")
+	assert.Empty(t, confirmed.Foundry.Attempts[0].ARMTemplateHash,
+		"missing source evidence cannot be repaired by accepting a new ARM generation")
 }

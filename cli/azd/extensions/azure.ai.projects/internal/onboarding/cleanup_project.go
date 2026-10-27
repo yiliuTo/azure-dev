@@ -60,7 +60,7 @@ func (l *ownedLifecycle) inventoryProjectConnections(
 	}
 	created := map[string]bool{}
 	plan := Plan{SubscriptionID: state.SubscriptionID, ResourceGroup: state.ResourceGroup,
-		Location: state.Location, Owner: state.Owner}
+		Location: state.Location, DeploymentID: state.DeploymentID, Environment: state.Environment}
 	if _, err := l.deploymentGrantTargets(ctx, plan, state.Foundry, nil, created); err != nil {
 		return nil, err
 	}

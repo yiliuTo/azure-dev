@@ -420,26 +420,46 @@ F01 uses its actual managed identity to grant ACR pull access, then the registry
 connection depends on that grant. No SDK resource/grant-creation stage runs
 before ARM, and no second deployment is needed for the connection.
 Supplied Storage/ACR/UAMIs are referenced rather than rewritten.
-New BYO Storage and identity names use the final effective `foundryProjectName`,
-including an explicit template parameter when supplied. Lowercase that project
-name, retain only ASCII `a-z` and `0-9`, then take at most the first six remaining
-characters as `foundryPart`. A name with no remaining characters is rejected.
+The Foundry account uses the standard `cog-{resourceToken}` name. Bicep computes
+`resourceToken` with ARM `uniqueString` over the subscription ID, resource-group
+ID and location, adding `resourceTokenSalt` only when it is nonempty. The effective
+template parameters determine the target; the project name does not override the
+account name. Terraform retains its own standard SHA-1 resource-token algorithm.
+
+BYO provisioning evaluates this expression with azd-managed Bicep, including
+when using the built-in ARM template. On first use, azd downloads its supported
+Bicep version into the writable azd configuration directory; this requires
+network access to the official Bicep download service. Subsequent naming
+evaluations reuse that cached executable without download access. This does not
+make provisioning offline: Azure resource reads and deployment still require
+connectivity. Tool acquisition or evaluation failures stop provisioning without
+an alternative naming algorithm. This requirement does not extend to non-BYO
+built-in ARM provisioning, static Bicep/Terraform export, or Terraform provisioning.
+
+Default BYO Storage and identity names use that exact Foundry account target.
+`accountPart` is the lowercased account name with only ASCII `a-z` and `0-9`
+retained. `namingToken` is the first ten lowercase hexadecimal characters of
+`SHA256(UTF8(lowercase(accountResourceId)))`, using the full account ARM ID.
 
 | Resource | Generated name | Maximum length |
 |---|---|---|
-| Hosted-agent Storage | `sa{foundryPart}{ownerToken}` | 24 |
-| Hosting identity | `hosting-{foundryPart}{ownerToken}` | 30 |
-| Workload identity | `workload-{foundryPart}{ownerToken}` | 31 |
+| Hosted-agent Storage | First at most 14 characters of `accountPart`, followed by `namingToken` | 24 |
+| Hosting identity | `{lowercase(accountName)}-hosting-mi` | Account name length + 11 |
+| Workload identity | `{lowercase(accountName)}-workload-mi` | Account name length + 12 |
 
-`ownerToken` is the 16 lowercase hexadecimal characters encoding the first eight
-bytes of `SHA256(UTF8(lowercase(parentResourceGroupId) + "|" + environmentName + "|" + projectPath))`.
-Only the parent resource-group ID is lowercased; the environment name and raw
-project-path string are not trimmed, lowercased, cleaned or made absolute.
-The Foundry name and location are not part of the hash. For example,
-`Sample-Project_123` produces `foundryPart=sample`. Supplied Storage keeps its
-ARM ID and name; ACR and Foundry account/project naming remain unchanged.
-Retries retain exact journaled ownership: a conflicting earlier name is not
-adopted or replaced, and cleanup uses the persisted resource IDs.
+The Storage prefix is not padded when shorter than 14 characters. Hosting and
+workload identities are separate resources. Explicit Storage and identity ARM IDs
+take precedence and keep their original names. Retries retain exact journaled
+targets and source provenance; an active lifecycle cannot switch targets, and
+cleanup uses persisted resource IDs rather than recomputing names.
+
+The default BYO registry name remains `azd{registryNamingToken}`.
+`registryNamingToken` is the first 16 lowercase hexadecimal characters of
+`SHA256(UTF8(lowercase(resourceGroupId) + "|" + environmentName + "|" + projectPath))`.
+The environment name and raw project path are not normalized. This calculation
+is used only for the registry name, not as an environment identity, ownership
+marker or authorization/deletion proof. An explicit registry ARM ID takes
+precedence.
 
 New BYO Storage explicitly sets `StorageV2`, the Hot tier, HNS disabled,
 public network access enabled and firewall default action `Allow`, with
@@ -475,47 +495,55 @@ credentials or proof of data-plane propagation. Its separate `resourceProgress`
 map has exactly `storageAccount`, `containerRegistry`, `hostingIdentity` and
 `workloadIdentity`. Each entry records `resourceId`, original user-source
 `supplied`, current-round `preflightPassed` and `preparationComplete`. Missing
-legacy fields remain unconfirmed. Preflight always reruns, including after a
+evidence remains unconfirmed. Preflight always reruns, including after a
 previous pass; preview never saves progress. Progress is not an ownership ledger.
 
 Completion requires actual resource configuration and the selected preparation
 operations: Storage plus workload access; hosting identity plus both AKS roles and
 hosting-to-workload access; workload identity plus federation and Storage access;
 ACR readiness/mode plus kubelet/project access and the project registry connection.
-Existence or an owner tag alone is insufficient. Control-plane readback does not
+Existence or an environment tag alone is insufficient. Control-plane readback does not
 prove RBAC propagation or data-plane reachability. Valid deployment intent and
 actual resources allow recovery after a successful cloud write and failed local
 save; missing grant evidence remains incomplete.
 
-Template binding preserves existing resource-group
-tags across retries while honoring explicit customer tag changes. Conflicting
-private ownership tags, including case-insensitive aliases, are rejected.
-The private account target, deployment attempts and ownership markers are
-persisted for recovery.
+Template binding preserves existing resource-group tags across retries while
+honoring explicit customer tag changes. The exact account target, environment,
+deployment scope and per-attempt provenance are persisted for recovery.
+Lifecycle ownership does not depend on a private owner token or resource tag.
 BYO on-disk Bicep must retain the standard deployment resource bindings;
 supported selections belong in configuration or parameter inputs. Altered
 templates are rejected before deployment. Each new attempt records a SHA-256
 digest of the submitted template content. Recovery and cleanup read the exact
-deployment's exported template and verify that digest, along with ownership,
-target parameters, correlation and terminal state. Template-level metadata and
+deployment's exported template and verify that digest, along with exact target
+parameters, correlation and terminal state. Template-level metadata and
 ARM declaration-type capitalization are normalized; resource configuration,
 including resource metadata, remains bound. The Bicep generator hash is not
-compared with ARM's independently calculated service hash. Older attempts without
-a content digest require the exported content to match the trusted built-in
-standard template version identified by their recorded generator hash.
+compared with ARM's independently calculated service hash.
 The independently observed ARM hash is retained after verification; changed or
 unreadable evidence blocks recovery. A planned account's absence alone is not
-sufficient evidence. Explicit resource-group and
+sufficient evidence. Owned resources require recorded initial absence, exact
+successful Create evidence and the current resource's authoritative creation
+time within that deployment generation. Grants additionally bind their creation
+time, scope, principal, role and deployment-reference description. Matching tags
+do not permit adoption of a pre-existing or replaced resource.
+
+The root uses the provider's stable subscription deployment name. Before another
+submission can overwrite that record, the previous terminal generation is
+verified and its root, nested deployment and operation evidence is archived with
+an integrity digest in the environment journal. Archiving and the next pending
+intent are saved together before ARM submission. Archived generations are not
+reconstructed from subsequently overwritten nested deployment records. Active,
+unknown or unverifiable generations block retries. Explicit resource-group and
 location parameters must agree with the environment's resolved target.
-When the Project API omits ownership tags, observation, retry and teardown
-require an exact succeeded Project Create reached through succeeded Create
-operations in that verified deployment graph, plus the exact owner-tagged parent
-account. The project's ID, location, succeeded state, system-assigned identity
-and tenant must match; an explicitly conflicting tag or changed recorded
-principal still blocks recovery and cascading deletion.
+Observation, retry and teardown require an exact succeeded Project Create reached
+through succeeded Create operations in the verified deployment graph, plus the
+verified exact parent account. The project's ID, location, succeeded state,
+system-assigned identity and tenant must match; a changed recorded principal
+still blocks recovery and cascading deletion.
 When Connection GET masks managed-identity credentials, registry preparation
 requires the exact succeeded connection Create in the content-bound deployment
-graph, the verified project's actual system-assigned principal and owner-tagged
+graph, the verified project's actual system-assigned principal and verified
 parent account, and its exact owned registry pull grant read back from ARM.
 The connection must still name the expected registry endpoint and resource ID
 and explicitly exclude workspace-managed identity. A read-only `listSecrets`

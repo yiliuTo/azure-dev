@@ -15,7 +15,7 @@ import (
 // Names and resource IDs come from onboarding.BuildPlan. Supplied principals are verified reads;
 // created identity principals are resolved by ARM.
 type BYOOnboardingParameters struct {
-	Owner                             string `json:"owner"`
+	DeploymentID                      string `json:"deploymentId"`
 	AccountName                       string `json:"accountName"`
 	ResourceGroupSupplied             bool   `json:"resourceGroupSupplied"`
 	ClusterResourceID                 string `json:"clusterResourceId"`
@@ -49,7 +49,7 @@ func ApplyBYOOnboarding(result *Result, plan BYOOnboardingParameters) error {
 		return fmt.Errorf("BYO onboarding requires a BYO-AKS synthesis result")
 	}
 	for name, value := range map[string]string{
-		"owner": plan.Owner, "accountName": plan.AccountName,
+		"deploymentId": plan.DeploymentID, "accountName": plan.AccountName,
 		"hostingIdentityName": plan.HostingIdentityName, "workloadIdentityName": plan.WorkloadIdentityName,
 		"kubeletObjectId": plan.KubeletObjectID, "federatedIdentityRoleDefinitionId": plan.FederatedIdentityRoleDefinitionID,
 	} {

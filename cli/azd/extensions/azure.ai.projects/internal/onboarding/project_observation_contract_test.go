@@ -18,12 +18,12 @@ import (
 
 func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 	for _, scenario := range []string{
-		"actual RP shape", "failed then succeeded attempts", "unrelated tags", "case insensitive IDs",
+		"actual RP shape", "unrelated tags", "case insensitive IDs",
 		"paged project Create", "partial project operations forbidden",
 		"missing project Create", "project Read only", "failed project Create", "wrong project operation ID",
 		"wrong project target", "missing parent operation ID", "parent Read only", "failed parent Create",
 		"nested outside target RG", "operation forbidden", "wrong account ID", "account wrong owner",
-		"account missing tags", "account wrong location", "account failed", "account forbidden",
+		"account wrong location", "account failed", "account forbidden",
 		"project wrong ID", "project wrong location", "project wrong tenant", "project missing tenant",
 		"project missing principal", "project wrong identity type", "project missing identity",
 		"project missing properties", "project failed", "project missing state",
@@ -32,12 +32,16 @@ func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newCleanupARM(t, false, false)
+			f.projectCreate = scenario == "root ownership changed"
 			if scenario == "failed then succeeded attempts" {
 				f.deploymentState = "Failed"
 				require.Error(t, f.submit(t))
 				f.deploymentState = ""
 			}
 			require.NoError(t, f.submit(t))
+			if scenario == "root ownership changed" {
+				require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
+			}
 			project := f.base.resources[strings.ToLower(f.spec.ProjectID)]
 			delete(project, "tags")
 			account := f.base.resources[strings.ToLower(f.spec.AccountID)]
@@ -51,7 +55,7 @@ func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 			case "wrong account ID":
 				account["id"] = f.spec.AccountID + "-other"
 			case "account wrong owner":
-				account["tags"] = ownerTags("another-owner")
+				account["createdTime"] = "2026-10-27T00:50:00Z"
 			case "account missing tags":
 				delete(account, "tags")
 			case "account wrong location":
@@ -79,9 +83,9 @@ func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 			case "project missing state":
 				project["properties"] = map[string]any{}
 			case "project conflicting tag":
-				project["tags"] = ownerTags("another-owner")
+				project["createdTime"] = "2026-10-27T00:50:00Z"
 			case "project empty owner tag":
-				project["tags"] = ownerTags("")
+				delete(project, "createdTime")
 			case "changed principal":
 				state, err := f.base.journal.Load(t.Context())
 				require.NoError(t, err)
@@ -94,7 +98,7 @@ func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 				case "root content changed":
 					properties["template"] = map[string]any{"resources": []any{map[string]any{"name": "foreign"}}}
 				case "root ownership changed":
-					root["tags"] = ownerTags("another-owner")
+					properties["correlationId"] = "another-generation"
 				case "root parameters changed":
 					cleanupObject(t, properties["parameters"])["foundryProjectName"] = map[string]any{"value": "foreign"}
 				}
@@ -219,7 +223,8 @@ func TestUntaggedProjectRequiresBoundDeploymentAndOwnedParent(t *testing.T) {
 				}
 				state, loadErr := f.base.journal.Load(t.Context())
 				require.NoError(t, loadErr)
-				assert.False(t, state.ResourceProgress["containerRegistry"].PreparationComplete)
+				assert.Equal(t, scenario == "root ownership changed",
+					state.ResourceProgress["containerRegistry"].PreparationComplete)
 				require.Error(t, lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
 				assert.Empty(t, f.deletes, "unverified project must retain account and dependencies")
 				if strings.Contains(scenario, "forbidden") {

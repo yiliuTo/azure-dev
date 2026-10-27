@@ -18,7 +18,8 @@ import (
 func onboardingContractPlan() BYOOnboardingParameters {
 	const parent = "/subscriptions/foundry-sub/resourceGroups/foundry-rg/providers/"
 	return BYOOnboardingParameters{
-		Owner: "0123456789abcdef", AccountName: "foundry-0123456789abcdef",
+		DeploymentID:             "/subscriptions/foundry-sub/providers/Microsoft.Resources/deployments/azd-foundry-test",
+		AccountName:              "cog-testaccount",
 		ClusterResourceID:        contractClusterID,
 		StorageAccountResourceID: parent + "Microsoft.Storage/storageAccounts/azd0123456789abcdef",
 		StorageName:              "azd0123456789abcdef", StorageSKU: "Standard_ZRS",
@@ -212,7 +213,7 @@ func TestBYOOnboardingSingleARMGraph(t *testing.T) {
 	} {
 		content, err := TemplatesFS().ReadFile("templates/modules/" + file)
 		require.NoError(t, err)
-		assert.Contains(t, string(content), "description: owner")
+		assert.Contains(t, string(content), "description: deploymentId")
 		assert.Contains(t, string(content), "principalType: 'ServicePrincipal'")
 	}
 	acr, err := TemplatesFS().ReadFile("templates/modules/acr.bicep")
@@ -276,7 +277,7 @@ func TestBYOOnboardingEvaluatesCreateOnlyResourceConditions(t *testing.T) {
 				params := filepath.Join(dir, "graph.bicepparam")
 				require.NoError(t, os.WriteFile(params, []byte(
 					"using './projection.json'\nparam location = 'eastus'\n"+
-						"param tags = { team: 'test', 'azd-byoaks-owner': 'not-the-owner' }\n"+
+						"param tags = { team: 'test' }\n"+
 						"param plan = loadJsonContent('./plan.json')\n"), 0o600))
 				//nolint:gosec // Bicep snapshot evaluates local ARM; it does not submit a deployment.
 				cmd := exec.CommandContext(t.Context(), bicep, "snapshot", params, "--mode", "Overwrite",
@@ -303,8 +304,8 @@ func TestBYOOnboardingEvaluatesCreateOnlyResourceConditions(t *testing.T) {
 				require.Len(t, snapshot.PredictedResources, expected,
 					"supplied resources must have no create/update declaration")
 				if expected > 0 {
-					assert.Contains(t, string(data), plan.Owner)
-					assert.NotContains(t, string(data), "not-the-owner")
+					assert.Contains(t, string(data), `"team": "test"`)
+					assert.NotContains(t, string(data), "azd-byoaks-owner")
 				}
 			})
 		}

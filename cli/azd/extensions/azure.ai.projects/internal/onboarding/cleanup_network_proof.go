@@ -119,24 +119,12 @@ func networkWindow(properties *armresources.DeploymentPropertiesExtended) (netwo
 func (l *ownedLifecycle) networkBirthWindows(
 	ctx context.Context, plan Plan, state *PreparationState,
 ) ([]networkBirthWindow, error) {
-	client, err := armresources.NewDeploymentsClient(plan.SubscriptionID, l.credential, l.options)
-	if err != nil {
-		return nil, err
-	}
 	var windows []networkBirthWindow
 	for _, attempt := range state.Foundry.Attempts {
-		id, err := subscriptionDeploymentID(attempt.ID, plan.SubscriptionID)
-		if err != nil {
+		if err := validateAttemptEvidence(attempt); err != nil {
 			return nil, err
 		}
-		found, err := client.GetAtSubscriptionScope(ctx, id.Name, nil)
-		if err != nil {
-			return nil, fmt.Errorf("read exact verified deployment network birth interval: %w", err)
-		}
-		if found.Properties == nil {
-			return nil, fmt.Errorf("verified deployment network properties are unavailable")
-		}
-		window, err := networkWindow(found.Properties)
+		window, err := networkWindow(attempt.Evidence.Properties)
 		if err != nil {
 			return nil, err
 		}

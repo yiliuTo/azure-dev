@@ -22,8 +22,9 @@ type Input struct {
 	ResourceGroup      string
 	Location           string
 	Environment        string
-	ProjectPath        string
-	FoundryName        string
+	FoundryAccountID   string // Exact account ID resolved by the standard template evaluator.
+	DeploymentID       string // Stable subscription deployment ID resolved by the provider.
+	RegistryName       string // Standard template's evaluated registry name; ignored for a supplied RegistryID.
 	HostingIdentityID  string
 	WorkloadIdentityID string
 }
@@ -60,32 +61,46 @@ func BuildPlan(in Input) (Plan, error) {
 	if in.SubscriptionID == "" || in.ResourceGroup == "" || in.Location == "" || in.Environment == "" {
 		return Plan{}, fmt.Errorf("I03: target subscription, resource group, location and environment are required")
 	}
+	account, err := ParseID(in.FoundryAccountID, "Microsoft.CognitiveServices/accounts")
+	if err != nil || !strings.EqualFold(account.SubscriptionID, in.SubscriptionID) ||
+		!strings.EqualFold(account.ResourceGroupName, in.ResourceGroup) {
+		return Plan{}, fmt.Errorf("I03: exact Foundry account ID must belong to the target subscription and resource group")
+	}
+	if _, err := subscriptionDeploymentID(in.DeploymentID, in.SubscriptionID); err != nil {
+		return Plan{}, fmt.Errorf("I03: exact subscription deployment ID is required")
+	}
+	if in.RegistryID == "" && (len(in.RegistryName) < 5 || len(in.RegistryName) > 50 ||
+		strings.IndexFunc(in.RegistryName, func(ch rune) bool {
+			return !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9')
+		}) >= 0) {
+		return Plan{}, fmt.Errorf("I03: standard-template evaluated registry name is required when registryResourceId is omitted")
+	}
 	var part strings.Builder
-	for _, ch := range strings.ToLower(in.FoundryName) {
+	for _, ch := range strings.ToLower(account.Name) {
 		if ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' {
 			part.WriteRune(ch)
-			if part.Len() == 6 {
+			if part.Len() == 14 {
 				break
 			}
 		}
 	}
 	if part.Len() == 0 {
-		return Plan{}, fmt.Errorf("I03: effective foundryProjectName must contain an ASCII letter or digit for resource naming")
+		return Plan{}, fmt.Errorf("I03: Foundry account name must contain an ASCII letter or digit for resource naming")
 	}
 	parent := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s", in.SubscriptionID, in.ResourceGroup)
-	sum := sha256.Sum256([]byte(strings.ToLower(parent) + "|" + in.Environment + "|" + in.ProjectPath))
-	token := fmt.Sprintf("%x", sum[:8])
-	storageName, hostingName, workloadName := "sa"+part.String()+token,
-		"hosting-"+part.String()+token, "workload-"+part.String()+token
+	sum := sha256.Sum256([]byte(strings.ToLower(in.FoundryAccountID)))
+	storageName := part.String() + fmt.Sprintf("%x", sum)[:10]
+	hostingName, workloadName := strings.ToLower(account.Name)+"-hosting-mi", strings.ToLower(account.Name)+"-workload-mi"
 	p := Plan{
 		SubscriptionID: in.SubscriptionID, ResourceGroup: in.ResourceGroup,
-		Location: in.Location, Environment: in.Environment, Owner: token,
+		Location: in.Location, Environment: in.Environment, DeploymentID: in.DeploymentID,
+		Account:                  Resource{ID: in.FoundryAccountID, Parent: account.Parent.String(), Name: account.Name},
 		RegistryCustomerSupplied: in.RegistryID != "",
 		Cluster:                  Resource{ID: in.ClusterID, Parent: cluster.Parent.String(), Name: cluster.Name, Supplied: true},
 		Storage: Resource{ID: parent + "/providers/Microsoft.Storage/storageAccounts/" + storageName,
 			Parent: parent, Name: storageName},
-		Registry: Resource{ID: parent + "/providers/Microsoft.ContainerRegistry/registries/azd" + token,
-			Parent: parent, Name: "azd" + token},
+		Registry: Resource{ID: parent + "/providers/Microsoft.ContainerRegistry/registries/" + in.RegistryName,
+			Parent: parent, Name: in.RegistryName},
 		Hosting: Resource{ID: parent + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + hostingName,
 			Parent: parent, Name: hostingName},
 		Workload: Resource{ID: parent + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + workloadName,

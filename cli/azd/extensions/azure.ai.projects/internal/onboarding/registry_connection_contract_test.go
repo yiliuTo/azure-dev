@@ -149,7 +149,7 @@ func TestRegistryConnectionMaskedCredentialContract(t *testing.T) {
 			case "Project UAMI":
 				identity["type"] = "UserAssigned"
 			case "wrong owner account":
-				f.base.resources[strings.ToLower(f.spec.AccountID)]["tags"] = ownerTags("foreign")
+				f.base.resources[strings.ToLower(f.spec.AccountID)]["createdTime"] = "2026-10-27T00:50:00Z"
 			}
 			grantID := ""
 			for id, resource := range f.base.resources {

@@ -56,6 +56,7 @@ type cleanupARM struct {
 	accountProjection   bool
 	keepProjection      bool
 	projectCreate       bool
+	submissions         int
 }
 
 func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, suppliedIdentities ...bool) *cleanupARM {
@@ -71,7 +72,7 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 	require.NoError(t, err)
 	account := PlannedFoundryAccount(base.plan)
 	f := &cleanupARM{
-		t: t, base: base, roots: map[string]map[string]any{}, accountStatus: http.StatusOK,
+		t: t, base: base, roots: map[string]map[string]any{}, accountStatus: http.StatusOK, projectCreate: true,
 		spec: FoundrySpec{AccountID: account.ID, ProjectID: account.ID + "/projects/project",
 			RegistryID: base.plan.Registry.ID, Location: base.plan.Location,
 			ModelNames: []string{"owned-model"}, TemplateHash: "offline-standard-template-hash",
@@ -127,12 +128,36 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 					if operationState == "" {
 						operationState = "Succeeded"
 					}
-					operations = append(operations, map[string]any{"properties": map[string]any{
-						"provisioningState": operationState,
-						"targetResource": map[string]any{
-							"id": id, "resourceType": "Microsoft.Authorization/roleAssignments",
-						},
-					}})
+					operations = append(operations, map[string]any{
+						"id": strings.TrimSuffix(request.URL.Path, "/operations") + "/operations/" +
+							id[strings.LastIndex(id, "/")+1:],
+						"properties": map[string]any{
+							"provisioningState": operationState, "provisioningOperation": "Create",
+							"targetResource": map[string]any{
+								"id": id, "resourceType": "Microsoft.Authorization/roleAssignments",
+							},
+						}})
+				}
+				for _, resource := range []Resource{base.plan.Account, base.plan.Storage, base.plan.Registry,
+					base.plan.Hosting, base.plan.Workload} {
+					if resource.Supplied {
+						continue
+					}
+					for _, name := range f.spec.ModelNames {
+						operations = append(operations, map[string]any{
+							"id": strings.TrimSuffix(request.URL.Path, "/operations") + "/operations/model-" + name,
+							"properties": map[string]any{"provisioningOperation": "Create", "provisioningState": "Succeeded",
+								"targetResource": map[string]any{"id": f.spec.AccountID + "/deployments/" + name,
+									"resourceType": "Microsoft.CognitiveServices/accounts/deployments"}},
+						})
+					}
+					parsed, err := arm.ParseResourceID(resource.ID)
+					require.NoError(t, err)
+					operations = append(operations, map[string]any{
+						"id": strings.TrimSuffix(request.URL.Path, "/operations") + "/operations/" + resource.Name,
+						"properties": map[string]any{"provisioningOperation": "Create", "provisioningState": "Succeeded",
+							"targetResource": map[string]any{"id": resource.ID, "resourceType": parsed.ResourceType.String()}},
+					})
 				}
 				return respond(200, map[string]any{"value": operations})
 			}
@@ -140,6 +165,12 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 			case http.MethodGet:
 				if root, exists := f.roots[path]; exists && !f.rootReadMissing {
 					return respond(200, root)
+				}
+				if strings.Contains(path, "/resourcegroups/") {
+					for _, root := range f.roots {
+						return respond(200, map[string]any{"id": request.URL.Path,
+							"properties": cleanupObject(t, root["properties"])})
+					}
 				}
 				return notFound()
 			case http.MethodPut:
@@ -152,26 +183,37 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 				require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
 				body["id"] = request.URL.Path
 				properties := cleanupObject(t, body["properties"])
-				properties["provisioningState"], properties["correlationId"] = "Succeeded", "correlation-"+path
+				f.submissions++
+				properties["provisioningState"], properties["correlationId"] = "Succeeded", fmt.Sprintf("correlation-%d", f.submissions)
+				properties["timestamp"], properties["duration"] = "2026-10-26T01:00:00Z", "PT1H"
+				outputs := []any{map[string]any{"id": f.spec.ProjectID}}
+				for _, resource := range []Resource{base.plan.Account, base.plan.Storage, base.plan.Registry,
+					base.plan.Hosting, base.plan.Workload} {
+					if !resource.Supplied {
+						outputs = append(outputs, map[string]any{"id": resource.ID})
+					}
+				}
+				properties["outputResources"] = outputs
+				for _, name := range f.spec.ModelNames {
+					outputs = append(outputs, map[string]any{"id": f.spec.AccountID + "/deployments/" + name})
+				}
+				properties["outputResources"] = outputs
 				if f.deploymentState != "" {
 					properties["provisioningState"] = f.deploymentState
 				}
 				properties["templateHash"] = "6828760392490666086"
 				properties["template"] = template
 				f.roots[path] = body
+				start := len(base.graphGrantWrites)
 				base.materializeGraph(f.spec)
-				for id, resource := range base.resources {
-					if strings.Contains(id, "/roleassignments/") &&
-						cleanupObject(t, resource["properties"])["description"] == base.plan.Owner {
-						f.operationTargets = append(f.operationTargets, id)
-					}
-				}
+				f.operationTargets = append([]string(nil), base.graphGrantWrites[start:]...)
+				f.operationStates = nil
 				base.resources[strings.ToLower(f.spec.AccountID)] = map[string]any{
-					"id": f.spec.AccountID, "location": f.spec.Location, "tags": ownerTags(base.plan.Owner),
+					"id": f.spec.AccountID, "location": f.spec.Location,
 					"properties": map[string]any{"provisioningState": "Succeeded"},
 				}
 				base.resources[strings.ToLower(f.spec.ProjectID)] = map[string]any{
-					"id": f.spec.ProjectID, "tags": ownerTags(base.plan.Owner), "location": f.spec.Location,
+					"id": f.spec.ProjectID, "location": f.spec.Location,
 					"properties": map[string]any{"provisioningState": "Succeeded"},
 					"identity": map[string]any{"type": "SystemAssigned",
 						"tenantId":    data.TenantID,
@@ -180,6 +222,11 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 				for _, name := range f.spec.ModelNames {
 					id := f.spec.AccountID + "/deployments/" + name
 					base.resources[strings.ToLower(id)] = map[string]any{"id": id, "name": name}
+				}
+				for _, resource := range sourceResources(base.plan, f.spec) {
+					if !resource.Supplied {
+						base.resources[strings.ToLower(resource.ID)]["createdTime"] = "2026-10-26T00:50:00Z"
+					}
 				}
 				if f.afterMaterialize != nil {
 					f.afterMaterialize()
@@ -202,7 +249,8 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 			}
 			if f.softDeleted {
 				return respond(200, map[string]any{
-					"id": f.spec.AccountID, "location": f.spec.Location, "tags": ownerTags(base.plan.Owner),
+					"id": f.spec.AccountID, "location": f.spec.Location,
+					"systemData": map[string]any{"createdAt": "2026-10-26T00:50:00Z"},
 				})
 			}
 			return notFound()
@@ -369,19 +417,26 @@ func (f *cleanupARM) submit(t *testing.T) error {
 	t.Helper()
 	client, err := armresources.NewDeploymentsClient(f.base.plan.SubscriptionID, contractCredential{}, f.options)
 	require.NoError(t, err)
-	for index := range 1 {
-		name := fmt.Sprintf("owned-attempt-%d", len(f.roots)+index)
-		id := "/subscriptions/" + f.base.plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/" + name
+	for range 1 {
+		id := f.base.plan.DeploymentID
+		name := id[strings.LastIndex(id, "/")+1:]
 		require.NoError(t, f.lifecycle.Start(t.Context(), f.base.plan, f.spec, id))
 		poller, err := client.BeginCreateOrUpdateAtSubscriptionScope(t.Context(), name, armresources.Deployment{
-			Location: new(f.spec.Location), Tags: ownerTags(f.base.plan.Owner),
+			Location: new(f.spec.Location),
 			Properties: &armresources.DeploymentProperties{
 				Mode: new(armresources.DeploymentModeIncremental), Template: map[string]any{},
 				Parameters: map[string]any{
 					"byoOnboarding": map[string]any{"value": map[string]any{
-						"owner": f.base.plan.Owner, "accountName": PlannedFoundryAccount(f.base.plan).Name,
-						"clusterResourceId":        f.base.plan.Cluster.ID,
-						"storageAccountResourceId": f.base.plan.Storage.ID, "registryResourceId": f.base.plan.Registry.ID,
+						"deploymentId": f.base.plan.DeploymentID, "accountName": PlannedFoundryAccount(f.base.plan).Name,
+						"resourceGroupSupplied": f.spec.Deployment.ResourceGroupSupplied,
+						"storageName":           f.base.plan.Storage.Name, "storageSupplied": f.spec.Deployment.StorageSupplied,
+						"storageSku": f.spec.Deployment.StorageSKU, "registryName": f.base.plan.Registry.Name,
+						"registrySupplied": f.spec.Deployment.RegistrySupplied, "registryABAC": f.spec.Deployment.RegistryABAC,
+						"kubeletObjectId":                   f.spec.Deployment.KubeletObjectID,
+						"federatedIdentityRoleDefinitionId": f.spec.Deployment.FederatedIdentityRoleDefinitionID,
+						"kubeletRoleAssignmentId":           f.spec.Deployment.KubeletRoleAssignmentID,
+						"clusterResourceId":                 f.base.plan.Cluster.ID,
+						"storageAccountResourceId":          f.base.plan.Storage.ID, "registryResourceId": f.base.plan.Registry.ID,
 						"hostingIdentityName": f.base.plan.Hosting.Name, "workloadIdentityName": f.base.plan.Workload.Name,
 						"hostingIdentityResourceId":  f.base.plan.Hosting.ID,
 						"workloadIdentityResourceId": f.base.plan.Workload.ID,
@@ -484,9 +539,9 @@ func TestOwnedCleanupSDKRejectsAmbiguousOrChangedOwnership(t *testing.T) {
 		mutate func(*cleanupARM)
 		want   string
 	}{
-		{"account owner changed", func(f *cleanupARM) {
-			f.base.resources[strings.ToLower(f.spec.AccountID)]["tags"] = ownerTags("another-owner")
-		}, "ownership"},
+		{"account replaced", func(f *cleanupARM) {
+			f.base.resources[strings.ToLower(f.spec.AccountID)]["createdTime"] = "2026-10-27T00:50:00Z"
+		}, "replaced"},
 		{"unknown deployment", func(f *cleanupARM) {
 			f.rootReadMissing = true
 			state, err := f.base.journal.Load(f.t.Context())
@@ -608,7 +663,7 @@ func TestOwnedCleanupSDKLiveRegionAndProjectOwnerAreBound(t *testing.T) {
 			f := newCleanupARM(t, true, true)
 			f.deploy(t)
 			if project {
-				f.base.resources[strings.ToLower(f.spec.ProjectID)]["tags"] = ownerTags("another-owner")
+				f.base.resources[strings.ToLower(f.spec.ProjectID)]["createdTime"] = "2026-10-27T00:50:00Z"
 			} else {
 				f.base.resources[strings.ToLower(f.spec.AccountID)]["location"] = "westus"
 				_, err := f.lifecycle.Check(t.Context(), f.base.plan, f.spec)

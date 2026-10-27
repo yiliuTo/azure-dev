@@ -115,10 +115,7 @@ func TestBYOProviderActualSDKSingleDeploymentCreateReuseAndNetworkSelections(t *
 							}
 							hosting := lifecycleObject(t, lifecycleObject(t, parameters["agentHosting"])["value"])
 							assert.NotContains(t, hosting, "agentSubnetResourceId")
-							output := `{"id":"` + request.URL.Path + `","properties":{"provisioningState":"Succeeded",` +
-								`"outputs":{"AZURE_AI_PROJECT_NAME":{"type":"String","value":"created-project"},` +
-								`"AZD_BYO_AKS_OWNERSHIP":{"type":"Object","value":{"owner":"` + p.byoPlan.Owner +
-								`","roleAssignments":[]}}}}}`
+							output := contractBYOSuccessBody(t, p, request.URL.Path)
 							return contractLifecycleResponse(request, 200, output), nil
 						}),
 					}}
@@ -131,13 +128,13 @@ func TestBYOProviderActualSDKSingleDeploymentCreateReuseAndNetworkSelections(t *
 							break
 						}
 						require.NoError(t, err)
-						assert.Equal(t, "created-project", deployed.Deployment.Outputs["AZURE_AI_PROJECT_NAME"].Value)
+						assert.Equal(t, p.foundryName, deployed.Deployment.Outputs["AZURE_AI_PROJECT_NAME"].Value)
 						ownership := deployed.Deployment.Outputs["AZD_BYO_AKS_OWNERSHIP"]
 						require.NotNil(t, ownership)
 						assert.Equal(t, "Object", ownership.Type)
 						var outputOwnership map[string]any
 						require.NoError(t, json.Unmarshal([]byte(ownership.Value), &outputOwnership))
-						assert.Equal(t, p.byoPlan.Owner, outputOwnership["owner"])
+						assert.Equal(t, p.byoPlan.DeploymentID, outputOwnership["deploymentId"])
 						assert.Equal(t, attempt+1, writes, "one top-level ARM submission per provision")
 						require.NotNil(t, p.byoPlan)
 						assert.Equal(t, subnetID, p.byoPlan.AgentSubnet.ID)
@@ -180,8 +177,7 @@ func TestBYORejectsBicepThatDeclaresButIgnoresPrivateOwnershipInputs(t *testing.
 	module := filepath.Join("modules", "resources.bicep")
 	raw, err := root.ReadFile(module)
 	require.NoError(t, err)
-	const binding = "var foundryAccountName = empty(byoAccountName) ? " +
-		"'${abbrs.cognitiveServicesAccounts}${resourceToken}' : byoAccountName"
+	const binding = "var foundryAccountName = '${abbrs.cognitiveServicesAccounts}${resourceToken}'"
 	require.Contains(t, string(raw), binding)
 	changed := strings.Replace(string(raw), binding, "var foundryAccountName = 'untracked-account'", 1)
 	require.NoError(t, root.WriteFile(module, []byte(changed), 0o600))
@@ -191,8 +187,9 @@ func TestBYORejectsBicepThatDeclaresButIgnoresPrivateOwnershipInputs(t *testing.
 	var template map[string]any
 	require.NoError(t, json.Unmarshal(compiled, &template))
 	parameters := lifecycleObject(t, template["parameters"])
-	require.Contains(t, parameters, "byoOwner")
-	require.Contains(t, parameters, "byoAccountName")
+	require.Contains(t, parameters, "byoOnboarding")
+	require.NotContains(t, parameters, "byoOwner")
+	require.NotContains(t, parameters, "byoAccountName")
 	p := byoContractProvider(t)
 	p.onDiskSource = &templateSource{mode: templateModeBicep, armTemplate: template, sourcePath: dir}
 	p.armClientOptions = &arm.ClientOptions{ClientOptions: policy.ClientOptions{

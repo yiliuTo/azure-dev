@@ -32,7 +32,9 @@ func newNetworkCleanupARM(t *testing.T) *networkCleanupARM {
 	base := "/subscriptions/" + f.base.plan.SubscriptionID + "/resourceGroups/" + f.base.plan.ResourceGroup
 	n := &networkCleanupARM{cleanupARM: f, births: map[string]string{}, records: map[string][]any{}}
 	n.pe = networkPrivateEndpointID(&PreparationState{
-		SubscriptionID: f.base.plan.SubscriptionID, ResourceGroup: f.base.plan.ResourceGroup, Owner: f.base.plan.Owner,
+		SubscriptionID: f.base.plan.SubscriptionID, ResourceGroup: f.base.plan.ResourceGroup,
+		DeploymentID: f.base.plan.DeploymentID, Environment: f.base.plan.Environment,
+		Foundry: &FoundryState{Spec: f.spec},
 	})
 	n.group = n.pe + "/privateDnsZoneGroups/" + PlannedFoundryAccount(f.base.plan).Name + "-dns-group"
 	n.nic = base + "/providers/" + privateNICType + "/service-owned-interface"
@@ -105,7 +107,8 @@ func newNetworkCleanupARM(t *testing.T) *networkCleanupARM {
 			parameters[name] = map[string]any{"value": value}
 		}
 		p["timestamp"], p["duration"] = "2026-10-26T00:52:00Z", "PT7M0S"
-		var outputs []any
+		outputs, ok := p["outputResources"].([]any)
+		require.True(t, ok)
 		for id := range n.births {
 			if id != strings.ToLower(n.nic) {
 				outputs = append(outputs, map[string]any{"id": id})
@@ -165,6 +168,11 @@ func newNetworkCleanupARM(t *testing.T) *networkCleanupARM {
 						values = append(values, copy)
 					}
 				}
+				for id, actual := range f.base.resources {
+					if _, network := n.births[id]; !network && actual["createdTime"] != nil {
+						values = append(values, actual)
+					}
+				}
 				return respond(map[string]any{"value": values})
 			}
 			if strings.HasSuffix(path, "/privateendpointconnections") {
@@ -204,6 +212,12 @@ func newNetworkCleanupARM(t *testing.T) *networkCleanupARM {
 		return response, err
 	}).Transport
 	f.lifecycle = NewLifecycle(contractCredential{}, f.options, f.base.journal)
+	state, err := f.base.journal.Load(t.Context())
+	require.NoError(t, err)
+	for index := range state.Foundry.Attempts {
+		state.Foundry.Attempts[index].Evidence = nil
+	}
+	require.NoError(t, f.base.journal.Save(t.Context(), state))
 	return n
 }
 

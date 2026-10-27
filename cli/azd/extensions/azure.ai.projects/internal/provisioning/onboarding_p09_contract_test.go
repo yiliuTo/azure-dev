@@ -29,7 +29,7 @@ func TestBYOP09RegistrySelectionSurvivesEnvironmentOutputOnRetry(t *testing.T) {
 	})
 	require.NoError(t, p.planBYO(t.Context(), func(string) {}, true))
 	state := onboarding.PreparationState{
-		Version: 2, Owner: first.Owner, SubscriptionID: first.SubscriptionID,
+		Version: 3, Environment: first.Environment, DeploymentID: first.DeploymentID, SubscriptionID: first.SubscriptionID,
 		ResourceGroup: first.ResourceGroup, Location: first.Location,
 		Resources: map[string]onboarding.OwnedResource{"R03": {ID: first.Registry.ID}},
 	}

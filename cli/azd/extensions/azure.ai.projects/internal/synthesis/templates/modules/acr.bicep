@@ -38,7 +38,7 @@ param registryResourceId string = ''
 param registryABAC bool = false
 
 @description('Internal ownership marker on managed role assignments.')
-param owner string = ''
+param deploymentId string = ''
 
 // Variables
 
@@ -89,7 +89,7 @@ resource foundryAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = i
     principalId: foundryProjectPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: acrPullRoleId
-    ...(!empty(owner) ? { description: owner } : {})
+    ...(!empty(deploymentId) ? { description: deploymentId } : {})
   }
 }
 
@@ -99,7 +99,7 @@ module preparedRegistryAccess 'acr-pull-role-assignment.bicep' = if (reuseRegist
   params: {
     registryName: effectiveName
     principalId: foundryProjectPrincipalId
-    owner: owner
+    deploymentId: deploymentId
     roleDefinitionId: subscriptionResourceId(
       split(registryResourceId, '/')[2],
       'Microsoft.Authorization/roleDefinitions',

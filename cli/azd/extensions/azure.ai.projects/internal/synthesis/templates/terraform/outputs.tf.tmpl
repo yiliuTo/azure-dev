@@ -46,7 +46,7 @@ output "AZURE_AI_PROJECT_ACR_CONNECTION_NAME" {
 
 output "AZD_BYO_AKS_OWNERSHIP" {
   value = local.byo_enabled ? {
-    owner = var.byo_onboarding.owner
+    deploymentId              = var.byo_onboarding.deploymentId
     hostingIdentityResourceId = local.hosting_identity_id
     workloadIdentityResourceId = local.workload_identity_id
     storageAccountResourceId = local.hosting_storage_id

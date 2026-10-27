@@ -77,8 +77,8 @@ func TestRecoveryMissingNestedDeploymentRequiresExactFailedCreateValidationEvide
 								"id": nested, "resourceType": "Microsoft.Resources/deployments",
 							},
 						}},
-						map[string]any{"properties": map[string]any{
-							"provisioningState": "Succeeded",
+						map[string]any{"id": root + "/operations/prereqs-create", "properties": map[string]any{
+							"provisioningState": "Succeeded", "provisioningOperation": "Create",
 							"targetResource": map[string]any{
 								"id": prerequisites, "resourceType": "Microsoft.Resources/deployments",
 							},
@@ -89,12 +89,17 @@ func TestRecoveryMissingNestedDeploymentRequiresExactFailedCreateValidationEvide
 				case strings.ToLower(nested):
 					status = tc.deploymentHTTP
 				case strings.ToLower(prerequisites + "/operations"):
-					body = map[string]any{"value": []any{map[string]any{"properties": map[string]any{
-						"provisioningState": "Succeeded",
-						"targetResource": map[string]any{
-							"id": grant, "resourceType": "Microsoft.Authorization/roleAssignments",
-						},
-					}}}}
+					body = map[string]any{"value": []any{map[string]any{
+						"id": prerequisites + "/operations/grant-create", "properties": map[string]any{
+							"provisioningState": "Succeeded", "provisioningOperation": "Create",
+							"targetResource": map[string]any{
+								"id": grant, "resourceType": "Microsoft.Authorization/roleAssignments",
+							},
+						}}}}
+				case strings.ToLower(prerequisites):
+					body = map[string]any{"id": prerequisites, "properties": map[string]any{
+						"correlationId": "unit-correlation", "templateHash": "nested-hash", "provisioningState": "Succeeded",
+					}}
 				default:
 					t.Fatalf("unexpected recovery read %s", request.URL.Path)
 				}
@@ -115,9 +120,13 @@ func TestRecoveryMissingNestedDeploymentRequiresExactFailedCreateValidationEvide
 			}
 			lifecycle := &ownedLifecycle{credential: contractCredential{}, options: options}
 			succeeded := map[string]bool{}
-			targets, err := lifecycle.deploymentGrantTargets(t.Context(), Plan{SubscriptionID: "target"}, &FoundryState{
-				Attempts: []FoundryAttempt{{ID: root, Terminal: tc.failedRoot, ProvisioningState: state}},
-			}, succeeded)
+			attempt, err := captureOperationContractAttempt(t, lifecycle, root, state, tc.failedRoot)
+			var targets map[string]bool
+			if err == nil {
+				targets, err = lifecycle.deploymentGrantTargets(t.Context(), Plan{SubscriptionID: "target"}, &FoundryState{
+					Attempts: []FoundryAttempt{attempt},
+				}, succeeded)
+			}
 			if tc.wantSuccess {
 				require.NoError(t, err)
 				assert.Equal(t, map[string]bool{strings.ToLower(grant): true}, targets)

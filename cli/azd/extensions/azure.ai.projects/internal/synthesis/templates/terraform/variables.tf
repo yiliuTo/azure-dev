@@ -95,7 +95,7 @@ variable "container_registry_abac" {
 variable "byo_onboarding" {
   description = "Internal read-only BYO-AKS deployment plan; names and IDs follow the onboarding plan."
   type = object({
-    owner                             = string
+    deploymentId                      = string
     accountName                       = string
     resourceGroupSupplied             = bool
     clusterResourceId                 = string

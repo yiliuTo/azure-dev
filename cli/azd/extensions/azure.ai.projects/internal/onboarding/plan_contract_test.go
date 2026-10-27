@@ -19,7 +19,10 @@ func contractPlanInput() Input {
 		AgentSubnetID: "/subscriptions/network-sub/resourceGroups/network-rg/providers/" +
 			"Microsoft.Network/virtualNetworks/network/subnets/agents",
 		SubscriptionID: "foundry-sub", ResourceGroup: "new-foundry-rg", Location: "eastus",
-		Environment: "dev", ProjectPath: "project", FoundryName: "foundry-project",
+		Environment: "dev", RegistryName: "azdofficialregistry",
+		FoundryAccountID: "/subscriptions/foundry-sub/resourceGroups/new-foundry-rg/providers/" +
+			"Microsoft.CognitiveServices/accounts/cog-official",
+		DeploymentID: "/subscriptions/foundry-sub/providers/Microsoft.Resources/deployments/azd-foundry-dev",
 	}
 }
 

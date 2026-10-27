@@ -4,7 +4,9 @@
 package provisioning
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -19,13 +21,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBYONamingUsesEffectiveFoundryProjectParameter(t *testing.T) {
+func TestBYONamingUsesAccountTargetIndependentlyOfProjectName(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
 		t.Run(map[bool]string{false: "environment name", true: "explicit template name"}[explicit], func(t *testing.T) {
 			p := byoContractProvider(t)
-			wantName, wantPart := p.foundryName, "contra"
+			wantName := p.foundryName
 			if explicit {
-				wantName, wantPart = "Sample-Project_123", "sample"
+				wantName = "Sample-Project_123"
 				p.onDiskSource = &templateSource{
 					armTemplate: p.armTemplate,
 					parameters:  map[string]any{"foundryProjectName": map[string]any{"value": wantName}},
@@ -52,8 +54,7 @@ func TestBYONamingUsesEffectiveFoundryProjectParameter(t *testing.T) {
 					requestParameters = body.Properties.Parameters
 					return &http.Response{
 						StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
-						Body: io.NopCloser(strings.NewReader(`{"id":"` + request.URL.Path +
-							`","properties":{"provisioningState":"Succeeded","outputs":{}}}`)),
+						Body:    io.NopCloser(strings.NewReader(contractBYOSuccessBody(t, p, request.URL.Path))),
 						Request: request,
 					}, nil
 				}),
@@ -62,10 +63,11 @@ func TestBYONamingUsesEffectiveFoundryProjectParameter(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 1, requests)
 			require.NotNil(t, p.byoPlan)
-			owner := p.byoPlan.Owner
-			assert.Equal(t, "sa"+wantPart+owner, p.byoPlan.Storage.Name)
-			assert.Equal(t, "hosting-"+wantPart+owner, p.byoPlan.Hosting.Name)
-			assert.Equal(t, "workload-"+wantPart+owner, p.byoPlan.Workload.Name)
+			account := p.byoPlan.Account
+			sum := sha256.Sum256([]byte(strings.ToLower(account.ID)))
+			assert.Equal(t, "cog6ufu4rgx47p"+fmt.Sprintf("%x", sum[:5]), p.byoPlan.Storage.Name)
+			assert.Equal(t, account.Name+"-hosting-mi", p.byoPlan.Hosting.Name)
+			assert.Equal(t, account.Name+"-workload-mi", p.byoPlan.Workload.Name)
 			assert.True(t, strings.HasSuffix(p.byoSpec.ProjectID, "/projects/"+wantName))
 			source, err := p.resolveTemplate(t.Context(), func(string) {})
 			require.NoError(t, err)
@@ -83,15 +85,16 @@ func TestBYONamingUsesEffectiveFoundryProjectParameter(t *testing.T) {
 			assert.Equal(t, p.byoPlan.Storage.Name, bindings["storageName"])
 			assert.Equal(t, p.byoPlan.Hosting.Name, bindings["hostingIdentityName"])
 			assert.Equal(t, p.byoPlan.Workload.Name, bindings["workloadIdentityName"])
-			assert.Equal(t, owner, bindings["owner"])
-			assert.Equal(t, "azd"+owner, bindings["registryName"])
-			assert.Equal(t, "ais-"+owner, bindings["accountName"])
+			assert.Equal(t, p.byoPlan.DeploymentID, bindings["deploymentId"])
+			assert.NotContains(t, bindings, "owner")
+			assert.Equal(t, byoRegistryName(p.subID, p.rgName, p.envName, p.projectPath), bindings["registryName"])
+			assert.Equal(t, account.Name, bindings["accountName"])
 		})
 	}
 }
 
 func TestBYONamingRejectsInvalidEffectiveProjectBeforePreflight(t *testing.T) {
-	for _, value := range []any{"", "---中_", 42} {
+	for _, value := range []any{"", 42} {
 		p := byoContractProvider(t)
 		p.onDiskSource = &templateSource{
 			armTemplate: p.armTemplate,

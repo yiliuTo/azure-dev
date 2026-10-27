@@ -25,6 +25,17 @@ func (l *ownedLifecycle) Cleanup(ctx context.Context, plan Plan, purge bool, pro
 	if err := validateCleanupLedger(plan, state); err != nil {
 		return err
 	}
+	if state.Foundry == nil && (len(state.Resources) > 0 || len(state.Assignments) > 0) {
+		return fmt.Errorf("cleanup requires the exact source deployment provenance; dependencies retained")
+	}
+	if state.Foundry == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		state.CleanupStarted, state.CleanupComplete = true, true
+		state.ResourceProgress = nil
+		return l.journal.Save(ctx, state)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -43,6 +54,9 @@ func (l *ownedLifecycle) Cleanup(ctx context.Context, plan Plan, purge bool, pro
 		}
 	}
 	if !wasComplete && state.Foundry != nil {
+		if err := l.verifyAssignmentInventory(ctx, state); err != nil {
+			return err
+		}
 		if err := l.inventoryFoundryNetwork(ctx, plan, &state); err != nil {
 			return fmt.Errorf("owned network inventory is unverified; dependencies retained: %w", err)
 		}
@@ -92,7 +106,7 @@ func (l *ownedLifecycle) Cleanup(ctx context.Context, plan Plan, purge bool, pro
 }
 
 func validateCleanupLedger(plan Plan, state PreparationState) error {
-	if state.Owner == "" && (len(state.Resources) > 0 || len(state.Assignments) > 0 || state.Foundry != nil) {
+	if state.DeploymentID == "" && (len(state.Resources) > 0 || len(state.Assignments) > 0 || state.Foundry != nil) {
 		return fmt.Errorf("cleanup requires recorded environment ownership")
 	}
 	types := map[string]string{
@@ -151,7 +165,9 @@ func (l *ownedLifecycle) cleanupAssignment(ctx context.Context, state *Preparati
 		if !strings.EqualFold(authString(observed.ID), record.ID) ||
 			!compatibleGrant(observed.RoleAssignment, grantRequest{
 				scope: record.Scope, principalID: record.PrincipalID, roleID: record.RoleID,
-			}) || authString(observed.Properties.Description) != state.Owner {
+			}) || !strings.EqualFold(authString(observed.Properties.Description), state.DeploymentID) ||
+			observed.Properties.CreatedOn == nil || record.CreatedOn.IsZero() ||
+			!record.CreatedOn.Equal(*observed.Properties.CreatedOn) {
 			return fmt.Errorf("owned assignment %s ownership/configuration changed", record.ID)
 		}
 		if err := ctx.Err(); err != nil {
@@ -175,6 +191,9 @@ func (l *ownedLifecycle) cleanupAssignment(ctx context.Context, state *Preparati
 func (l *ownedLifecycle) cleanupResource(
 	ctx context.Context, plan Plan, state *PreparationState, step string, record OwnedResource,
 ) error {
+	if err := l.verifyResourceSources(ctx, plan, state); err != nil {
+		return err
+	}
 	if step == "R06Subnet" {
 		return l.cleanupSubnet(ctx, state, record)
 	}

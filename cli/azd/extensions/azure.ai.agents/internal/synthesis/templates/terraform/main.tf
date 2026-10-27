@@ -18,7 +18,7 @@ locals {
     var.resource_token_salt,
   ]))), 0, 13)
 
-  foundry_account_name = local.byo_enabled ? var.byo_onboarding.accountName : "cog-${local.resource_token}"
+  foundry_account_name = "cog-${local.resource_token}"
 
   # Project name. Falls back to a sanitized environment_name (3-32 chars) when
   # not provided.

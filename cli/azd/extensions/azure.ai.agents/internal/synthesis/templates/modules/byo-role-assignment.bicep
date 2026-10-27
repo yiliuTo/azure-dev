@@ -3,7 +3,7 @@ targetScope = 'resourceGroup'
 param resourceName string
 param principalId string
 param roleDefinitionId string
-param owner string
+param deploymentId string
 
 resource target 'Microsoft.ContainerService/managedClusters@2025-01-01' existing = {
   name: resourceName
@@ -16,7 +16,7 @@ resource assignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     principalId: principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: roleDefinitionId
-    description: owner
+    description: deploymentId
   }
 }
 

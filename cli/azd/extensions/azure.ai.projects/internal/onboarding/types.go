@@ -145,7 +145,8 @@ type Plan struct {
 	ResourceGroupTags        map[string]*string
 	Location                 string
 	Environment              string
-	Owner                    string
+	DeploymentID             string
+	Account                  Resource
 	Cluster                  Resource
 	Storage                  Resource
 	Registry                 Resource

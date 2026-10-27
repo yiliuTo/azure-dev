@@ -402,7 +402,7 @@ func TestNetworkRetryRejectsOldDefaultsWithoutLosingCleanup(t *testing.T) {
 			plan, err := BuildPlan(input)
 			require.NoError(t, err)
 			journal := &memoryPreparationJournal{}
-			state := PreparationState{Version: preparationJournalVersion, Owner: plan.Owner,
+			state := PreparationState{Version: preparationJournalVersion, DeploymentID: plan.DeploymentID, Environment: plan.Environment,
 				SubscriptionID: plan.SubscriptionID, ResourceGroup: plan.ResourceGroup, Location: plan.Location,
 				Resources: map[string]OwnedResource{}}
 			switch scenario {

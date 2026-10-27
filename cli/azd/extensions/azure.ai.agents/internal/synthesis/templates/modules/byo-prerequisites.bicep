@@ -4,7 +4,6 @@ param location string
 param tags object
 param plan object
 
-var ownershipTags = union(tags, { 'azd-byoaks-owner': plan.owner })
 var clusterParts = split(plan.clusterResourceId, '/')
 var storageParts = split(plan.storageAccountResourceId, '/')
 var registryParts = split(plan.registryResourceId, '/')
@@ -16,19 +15,19 @@ var workloadPrincipalId = plan.workloadIdentitySupplied ? plan.workloadPrincipal
 resource hosting 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (!plan.hostingIdentitySupplied) {
   name: plan.hostingIdentityName
   location: location
-  tags: ownershipTags
+  tags: tags
 }
 
 resource workload 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (!plan.workloadIdentitySupplied) {
   name: plan.workloadIdentityName
   location: location
-  tags: ownershipTags
+  tags: tags
 }
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!plan.storageSupplied) {
   name: plan.storageName
   location: location
-  tags: ownershipTags
+  tags: tags
   kind: 'StorageV2'
   sku: { name: plan.storageSku }
   properties: {
@@ -48,7 +47,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!plan.stor
 resource registry 'Microsoft.ContainerRegistry/registries@2025-03-01-preview' = if (!plan.registrySupplied) {
   name: plan.registryName
   location: location
-  tags: ownershipTags
+  tags: tags
   sku: { name: 'Premium' }
   properties: {
     roleAssignmentMode: 'LegacyRegistryPermissions'
@@ -67,7 +66,7 @@ module clusterGrants 'byo-role-assignment.bicep' = [for role in [
     resourceName: last(clusterParts)
     principalId: hostingPrincipalId
     roleDefinitionId: subscriptionResourceId(clusterParts[2], 'Microsoft.Authorization/roleDefinitions', role)
-    owner: plan.owner
+    deploymentId: plan.deploymentId
   }
 }]
 
@@ -78,7 +77,7 @@ module federationGrant 'byo-identity-role-assignment.bicep' = if (plan.createFed
     resourceName: last(workloadParts)
     principalId: hostingPrincipalId
     roleDefinitionId: plan.federatedIdentityRoleDefinitionId
-    owner: plan.owner
+    deploymentId: plan.deploymentId
   }
   dependsOn: [workload]
 }
@@ -90,7 +89,7 @@ module storageGrant 'byo-storage-role-assignment.bicep' = if (plan.createStorage
     resourceName: last(storageParts)
     principalId: workloadPrincipalId
     roleDefinitionId: subscriptionResourceId(storageParts[2], 'Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
-    owner: plan.owner
+    deploymentId: plan.deploymentId
   }
   dependsOn: [storage]
 }
@@ -102,13 +101,13 @@ module kubeletGrant 'acr-pull-role-assignment.bicep' = if (empty(plan.kubeletRol
     registryName: last(registryParts)
     principalId: plan.kubeletObjectId
     roleDefinitionId: subscriptionResourceId(registryParts[2], 'Microsoft.Authorization/roleDefinitions', registryRole)
-    owner: plan.owner
+    deploymentId: plan.deploymentId
   }
   dependsOn: [registry]
 }
 
 output ownership object = {
-  owner: plan.owner
+  deploymentId: plan.deploymentId
   hostingIdentityResourceId: plan.hostingIdentityResourceId
   workloadIdentityResourceId: plan.workloadIdentityResourceId
   storageAccountResourceId: plan.storageAccountResourceId

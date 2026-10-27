@@ -58,10 +58,12 @@ func networkAPIVersion(kind string) string {
 }
 
 func networkPrivateEndpointID(state *PreparationState) string {
+	account, err := ParseID(state.Foundry.Spec.AccountID, "Microsoft.CognitiveServices/accounts")
+	if err != nil {
+		return ""
+	}
 	return "/subscriptions/" + state.SubscriptionID + "/resourceGroups/" + state.ResourceGroup +
-		"/providers/Microsoft.Network/privateEndpoints/" + PlannedFoundryAccount(Plan{
-		Owner: state.Owner, SubscriptionID: state.SubscriptionID, ResourceGroup: state.ResourceGroup,
-	}).Name + "-private-endpoint"
+		"/providers/Microsoft.Network/privateEndpoints/" + account.Name + "-private-endpoint"
 }
 
 func networkZoneIDs(state *PreparationState) []string {
@@ -169,9 +171,6 @@ func (l *ownedLifecycle) observeNetworkTarget(
 	}
 	if recorded && !record.CreatedTime.IsZero() && !record.CreatedTime.Equal(*actual.CreatedTime) {
 		return fmt.Errorf("network resource %s creation identity changed; refusing deletion", id)
-	}
-	if owner, present := found.Tags[preparationOwnerTag]; present && authString(owner) != state.Owner {
-		return fmt.Errorf("network resource %s has a conflicting owner", id)
 	}
 	if err := verifyNetworkResource(state, kind, found); err != nil {
 		return fmt.Errorf("network resource %s binding is unverified: %w", id, err)

@@ -1,7 +1,7 @@
 locals {
   byo_enabled          = var.byo_onboarding != null
   byo_rg_supplied      = local.byo_enabled ? var.byo_onboarding.resourceGroupSupplied : false
-  byo_tags             = merge(var.tags, { "azd-byoaks-owner" = local.byo_enabled ? var.byo_onboarding.owner : "" })
+  byo_tags = var.tags
   hosting_identity_id  = local.byo_enabled ? var.byo_onboarding.hostingIdentityResourceId : var.agent_hosting.hostingManagementIdentityResourceId
   workload_identity_id = local.byo_enabled ? var.byo_onboarding.workloadIdentityResourceId : var.agent_hosting.workloadIdentityResourceId
   byo_hosting_principal = local.byo_enabled ? (
@@ -111,7 +111,7 @@ resource "azapi_resource" "byo_grant" {
       principalId      = each.value.principal
       principalType    = "ServicePrincipal"
       roleDefinitionId = each.value.role
-      description      = var.byo_onboarding.owner
+      description        = var.byo_onboarding.deploymentId
     }
   }
   depends_on = [azapi_resource.byo_storage, azapi_resource.byo_registry]

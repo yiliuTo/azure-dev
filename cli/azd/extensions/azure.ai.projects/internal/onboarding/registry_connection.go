@@ -36,8 +36,10 @@ type registryConnectionProperties struct {
 func (l *ownedLifecycle) verifyMaskedRegistryConnection(
 	ctx context.Context, state *PreparationState, connectionID, endpoint string,
 ) error {
-	plan := Plan{SubscriptionID: state.SubscriptionID, ResourceGroup: state.ResourceGroup,
-		Location: state.Location, Owner: state.Owner}
+	plan, err := CleanupPlan(*state)
+	if err != nil {
+		return err
+	}
 	if err := l.verifyAttempts(ctx, plan, state.Foundry); err != nil {
 		return err
 	}
@@ -103,7 +105,7 @@ func (l *ownedLifecycle) verifyMaskedRegistryConnection(
 			return fmt.Errorf("verify masked registry connection's exact Project pull grant: %w", err)
 		}
 		if !strings.EqualFold(authString(actual.ID), record.ID) || !compatibleGrant(actual.RoleAssignment, expected) ||
-			authString(actual.Properties.Description) != state.Owner {
+			!strings.EqualFold(authString(actual.Properties.Description), state.DeploymentID) {
 			return fmt.Errorf("masked registry connection's Project pull grant ownership or configuration changed")
 		}
 		return l.verifyCurrentRegistryConnection(ctx, state, connectionID, endpoint)
