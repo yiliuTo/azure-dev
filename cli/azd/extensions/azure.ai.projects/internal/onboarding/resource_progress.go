@@ -19,6 +19,9 @@ func selectedProgress(plan Plan) map[string]ResourceProgress {
 }
 
 func validateProgressSelection(plan Plan, state PreparationState) error {
+	if state.AgentStateCleanupPending {
+		return fmt.Errorf("deleted Project agent state cleanup is pending; resume azd down before provisioning")
+	}
 	if state.CleanupComplete {
 		return nil
 	}

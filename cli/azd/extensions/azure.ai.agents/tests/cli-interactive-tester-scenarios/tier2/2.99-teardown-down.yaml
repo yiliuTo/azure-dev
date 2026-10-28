@@ -8,10 +8,12 @@ cwd: "~/working/azd-agents-shared/{shared_agent_name}"
 tags: ["tier:2", "cmd:down", "serial-only"]
 
 goals:
+  - "If the active environment has a v3 BYO-AKS preparation journal, record its verified Project endpoint before teardown. Inventory saved remote context for that exact Project and saved local or other-Project context without changing it."
   - "Run 'azd down --force --purge' in the shared project directory."
   - "A 'Select a tenant' prompt may not appear when the signed-in user has access to only one tenant. If it appears, select the tenant provided with this scenario run. If no tenant was provided, report a failure and do not answer the prompt."
   - "Wait for the full teardown to complete — all resources (Foundry account/project, model deployment, container resources) should be deleted and purged."
   - "Confirm the command reports success and no resources are left behind."
+  - "For a v3 BYO-AKS teardown, confirm all cached remote versions for the deleted Project are removed, local and other-Project context is unchanged, and the retained journal has cleanupComplete=true with agentStateCleanupPending absent or false. This cleanup completes at the Foundry provider boundary, not a core postdown event."
   - "Take a screenshot of the completed teardown."
   - "Only after teardown succeeds, run `cd ~/working/azd-agents-shared && rm -rf -- \"{shared_agent_name}\" && test ! -e \"{shared_agent_name}\"` to remove and verify removal of this run's local project directory. Do not remove the directory if teardown fails; its state is required for recovery. Other run directories must remain intact."
-  - "Report a finding if teardown fails, leaves orphaned resources, hangs, or if the successful teardown's local directory cleanup fails."
+  - "Report a finding if teardown fails, leaves orphaned resources, hangs, reports success after local Agents cleanup fails, or if the successful teardown's local directory cleanup fails. A local cleanup failure must retain the Project identity, endpoint and pending journal for another azd down attempt; do not remove the directory after any failure."

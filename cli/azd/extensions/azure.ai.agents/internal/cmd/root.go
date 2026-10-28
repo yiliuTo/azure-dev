@@ -56,7 +56,7 @@ func NewRootCommand() *cobra.Command {
 		}
 		operation := telemetryOperation(cmd.CommandPath())
 		switch operation {
-		case "deploy", "init", "listen", "metadata", "version":
+		case "deploy", "init", "listen", "metadata", "version", "internal-cleanup-project-state":
 		default:
 			telemetryReporter.reportProject(cmd.Context(), operation)
 		}
@@ -110,6 +110,7 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newInvocationsCommand(extCtx))
 	rootCmd.AddCommand(newSampleCommand(extCtx))
 	rootCmd.AddCommand(newDoctorCommand())
+	rootCmd.AddCommand(newCleanupProjectStateCommand())
 
 	rootCmd.AddCommand(newCodeCommand(extCtx))
 	rootCmd.AddCommand(newEvalCommand())

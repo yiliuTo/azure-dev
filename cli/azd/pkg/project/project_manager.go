@@ -24,14 +24,12 @@ const (
 	ProjectEventPackage   ext.Event = "package"
 	ProjectEventPublish   ext.Event = "publish"
 	ProjectEventDeploy    ext.Event = "deploy"
-	ProjectEventDown      ext.Event = "down"
 )
 
 var (
 	ProjectEvents []ext.Event = []ext.Event{
 		ProjectEventProvision,
 		ProjectEventDeploy,
-		ProjectEventDown,
 	}
 	ErrNoDefaultService = errors.New("no default service selection matches the working directory")
 )

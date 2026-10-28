@@ -39,6 +39,8 @@ type PreparationState struct {
 	Sources          map[string]ResourceSource   `json:"sources,omitempty"`
 	CleanupStarted   bool                        `json:"cleanupStarted,omitempty"`
 	CleanupComplete  bool                        `json:"cleanupComplete,omitempty"`
+
+	AgentStateCleanupPending bool `json:"agentStateCleanupPending,omitempty"`
 }
 
 // ResourceProgress records preparation evidence, independently of the owned cleanup ledger.

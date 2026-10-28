@@ -396,6 +396,34 @@ func TestCloudSuccessLocalObservationFailureRecoversAllProgress(t *testing.T) {
 	assert.NotContains(t, state.Resources, "R05")
 }
 
+func TestPendingAgentStateCleanupPreservesEvidenceBeforeProvisioning(t *testing.T) {
+	f := newCleanupARM(t, false, false)
+	f.deploy(t)
+	require.NoError(t, f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
+	state, err := f.base.journal.Load(t.Context())
+	require.NoError(t, err)
+	require.True(t, state.CleanupComplete)
+	state.AgentStateCleanupPending = true
+	require.NoError(t, f.base.journal.Save(t.Context(), state))
+	before := append([]byte(nil), f.base.journal.data...)
+	for _, changed := range []bool{false, true} {
+		plan, spec := f.base.plan, f.spec
+		if changed {
+			plan.Account.ID += "-next"
+			spec.AccountID = plan.Account.ID
+			spec.ProjectID = plan.Account.ID + "/projects/project-next"
+		}
+		_, err := f.lifecycle.Check(t.Context(), plan, spec)
+		require.ErrorContains(t, err, "agent state cleanup is pending")
+		require.ErrorContains(t, f.lifecycle.Start(t.Context(), plan, spec, plan.DeploymentID),
+			"agent state cleanup is pending")
+		_, err = ResolveRecoveryContext(t.Context(), plan, contractCredential{}, f.options, f.base.journal)
+		require.ErrorContains(t, err, "agent state cleanup is pending")
+		require.ErrorContains(t, RecordPreflight(t.Context(), plan, nil, f.base.journal),
+			"agent state cleanup is pending")
+		assert.Equal(t, before, f.base.journal.data, "pending Project and endpoint evidence must not be overwritten")
+	}
+}
 func TestRecoveryDiscoveryRejectsActiveAndUnknownAttemptsBeforeIdentityChecks(t *testing.T) {
 	for _, state := range []string{"Running", "unknown"} {
 		t.Run(state, func(t *testing.T) {

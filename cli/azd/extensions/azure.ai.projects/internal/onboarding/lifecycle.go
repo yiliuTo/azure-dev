@@ -195,6 +195,9 @@ func (l *ownedLifecycle) Check(ctx context.Context, plan Plan, spec FoundrySpec)
 	if err != nil {
 		return fail(err)
 	}
+	if err := validateProgressSelection(plan, state); err != nil {
+		return fail(err)
+	}
 	if spec.Deployment != nil {
 		if err := validateDeploymentData(plan, spec, state); err != nil {
 			return fail(err)
@@ -286,6 +289,9 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	}
 	state, err := l.load(ctx, plan)
 	if err != nil {
+		return err
+	}
+	if err := validateProgressSelection(plan, state); err != nil {
 		return err
 	}
 	if state.DeploymentID == "" && spec.Deployment == nil {

@@ -7,14 +7,76 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
-	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
+	"github.com/spf13/cobra"
 )
+
+type deletedProjectEvidence struct {
+	Version         int    `json:"version"`
+	Environment     string `json:"environment"`
+	DeploymentID    string `json:"deploymentId"`
+	ProjectID       string `json:"projectId"`
+	ProjectEndpoint string `json:"projectEndpoint"`
+	CleanupComplete bool   `json:"cleanupComplete"`
+	ProjectDeleted  bool   `json:"projectDeleted"`
+	AccountDeleted  bool   `json:"accountDeleted"`
+}
+
+func newCleanupProjectStateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use: "internal-cleanup-project-state", Hidden: true, Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var evidence deletedProjectEvidence
+			decoder := json.NewDecoder(io.LimitReader(cmd.InOrStdin(), 16384))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&evidence); err != nil {
+				return fmt.Errorf("invalid Project deletion evidence; saved agent contexts retained")
+			}
+			if err := decoder.Decode(new(any)); err != io.EOF {
+				return fmt.Errorf("Project deletion evidence must contain one object")
+			}
+			endpoint, err := evidence.endpoint()
+			if err != nil {
+				return err
+			}
+			store, err := newAgentStateStore()
+			if err != nil {
+				return err
+			}
+			return store.deleteProjectRemoteVersions(cmd.Context(), endpoint)
+		},
+	}
+}
+
+func (e deletedProjectEvidence) endpoint() (string, error) {
+	if e.Version != 3 || e.Environment == "" || !e.CleanupComplete || !e.ProjectDeleted || !e.AccountDeleted {
+		return "", fmt.Errorf("completed owned Project deletion evidence is unverified; saved agent contexts retained")
+	}
+	id, err := arm.ParseResourceID(e.ProjectID)
+	if err != nil || id.ResourceGroupName == "" ||
+		!strings.EqualFold(id.ResourceType.String(), "Microsoft.CognitiveServices/accounts/projects") {
+		return "", fmt.Errorf("deleted Project identity is invalid; saved agent contexts retained")
+	}
+	deployment, err := arm.ParseResourceID(e.DeploymentID)
+	if err != nil || deployment.ResourceGroupName != "" ||
+		!strings.EqualFold(deployment.ResourceType.String(), "Microsoft.Resources/deployments") ||
+		!strings.EqualFold(deployment.SubscriptionID, id.SubscriptionID) {
+		return "", fmt.Errorf("deleted Project deployment scope is unverified; saved agent contexts retained")
+	}
+	u, err := url.Parse(e.ProjectEndpoint)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		u.Port() != "" || !isFoundryHost(u.Hostname()) || u.Path != projectEndpointPathPrefix+id.Name {
+		return "", fmt.Errorf("deleted Project API endpoint is unverified; saved agent contexts retained")
+	}
+	u.RawPath = ""
+	return u.String(), nil
+}
 
 func stateTargetFromDeployedEndpoint(endpoint string) (*stateStoreTarget, error) {
 	u, err := url.Parse(endpoint)
@@ -30,21 +92,14 @@ func stateTargetFromDeployedEndpoint(endpoint string) (*stateStoreTarget, error)
 	return stateStoreTargetFromEndpoint(u.String())
 }
 
-// A successful Project deletion invalidates all remote versions, not just the
-// version currently selected by AGENT_*_ENDPOINT. Other delete flows stay scoped
-// to their selected version.
-func (s *agentStateStore) deleteRemoteVersions(ctx context.Context, agentKey string) error {
-	agentKey = normalizeEndpoint(agentKey)
-	target, err := stateTargetFromDeployedEndpoint("https://" + strings.TrimSuffix(agentKey, "/remote"))
-	if err != nil {
-		return fmt.Errorf("identify deleted project's exact agent state: %w", err)
-	}
-	base := target.agentKey
+// Project deletion invalidates every cached remote agent version in that
+// Project, without relying on currently configured services or environment outputs.
+func (s *agentStateStore) deleteProjectRemoteVersions(ctx context.Context, projectEndpoint string) error {
 	entries, err := os.ReadDir(s.agentsDir)
 	if err != nil {
 		return fmt.Errorf("inventory saved agent versions: %w", err)
 	}
-	keys := map[string]bool{agentKey: true, base: true, base + "/remote": true}
+	keys := map[string]bool{}
 	for _, entry := range entries {
 		if filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -60,19 +115,17 @@ func (s *agentStateStore) deleteRemoteVersions(ctx context.Context, agentKey str
 		if err := json.Unmarshal(raw, &record); err != nil {
 			return fmt.Errorf("decode saved agent version inventory: %w", err)
 		}
-		remainder, versioned := strings.CutPrefix(record.AgentKey, base+"/versions/")
-		matches := record.AgentKey == base || record.AgentKey == base+"/remote"
-		if versioned && strings.HasSuffix(remainder, "/remote") {
-			version := strings.TrimSuffix(remainder, "/remote")
-			matches = version != "" && !strings.ContainsAny(version, "/\\?#")
-		}
-		if !matches {
+		target, err := stateTargetFromDeployedEndpoint("https://" + strings.TrimSuffix(record.AgentKey, "/remote"))
+		if err != nil || normalizeEndpoint(target.ProjectEndpoint) != normalizeEndpoint(projectEndpoint) ||
+			(record.AgentKey != target.agentKey && !strings.HasSuffix(record.AgentKey, "/remote")) {
 			continue
 		}
 		if entry.Name() != agentStateKeyHash(record.AgentKey)+".json" || record.Version != agentStateSchemaVersion {
 			return fmt.Errorf("saved agent version identity or schema does not match its file")
 		}
 		keys[record.AgentKey] = true
+		keys[target.agentKey] = true
+		keys[target.agentKey+"/remote"] = true
 	}
 	for key := range keys {
 		if err := s.withLock(ctx, key, func(path string) error {
@@ -85,77 +138,4 @@ func (s *agentStateStore) deleteRemoteVersions(ctx context.Context, agentKey str
 		}
 	}
 	return nil
-}
-
-func cleanupDeletedProjectAgentState(
-	ctx context.Context, client *azdext.AzdClient, envName string, services map[string]*azdext.ServiceConfig,
-) (bool, error) {
-	value, err := client.Environment().GetValue(ctx, &azdext.GetEnvRequest{
-		EnvName: envName, Key: "AZD_FOUNDRY_BYO_AKS_PREPARATION",
-	})
-	if err != nil {
-		return false, fmt.Errorf("read owned Project deletion evidence for agent state cleanup: %w", err)
-	}
-	if value == nil || value.Value == "" {
-		return false, nil
-	}
-	var journal struct {
-		Version         int  `json:"version"`
-		CleanupComplete bool `json:"cleanupComplete"`
-		Foundry         *struct {
-			Spec struct {
-				ProjectID string `json:"projectId"`
-			} `json:"spec"`
-			ProjectEndpoint string `json:"projectEndpoint"`
-			ProjectDeleted  bool   `json:"projectDeleted"`
-			AccountDeleted  bool   `json:"accountDeleted"`
-		} `json:"foundry"`
-	}
-	if err := json.Unmarshal([]byte(value.Value), &journal); err != nil {
-		return true, fmt.Errorf("decode owned Project deletion evidence: %w", err)
-	}
-	if !journal.CleanupComplete {
-		return true, nil
-	}
-	if journal.Version != 3 || journal.Foundry == nil ||
-		!journal.Foundry.ProjectDeleted || !journal.Foundry.AccountDeleted {
-		return true, fmt.Errorf("completed owned Project deletion evidence is unverified; saved agent contexts retained")
-	}
-	foundry := journal.Foundry
-	id, err := arm.ParseResourceID(foundry.Spec.ProjectID)
-	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.CognitiveServices/accounts/projects") {
-		return true, fmt.Errorf("deleted Project identity is invalid; saved agent contexts retained")
-	}
-	for _, service := range services {
-		if service.GetHost() != AiAgentHost {
-			continue
-		}
-		current, err := client.Environment().GetValue(ctx, &azdext.GetEnvRequest{
-			EnvName: envName, Key: "AGENT_" + toServiceKey(service.Name) + "_ENDPOINT",
-		})
-		if err != nil {
-			return true, fmt.Errorf("read deployed agent endpoint for scoped state cleanup: %w", err)
-		}
-		if current == nil || current.Value == "" {
-			continue
-		}
-		target, err := stateTargetFromDeployedEndpoint(current.Value)
-		if err != nil {
-			return true, fmt.Errorf("identify deployed agent for scoped state cleanup: %w", err)
-		}
-		if foundry.ProjectEndpoint == "" {
-			return true, fmt.Errorf("deleted Project API endpoint is unverified; saved agent contexts retained")
-		}
-		if !strings.EqualFold(normalizeEndpoint(target.ProjectEndpoint), normalizeEndpoint(foundry.ProjectEndpoint)) {
-			continue
-		}
-		store, err := newAgentStateStoreForClient(client)
-		if err != nil {
-			return true, err
-		}
-		if err := store.deleteRemoteVersions(ctx, buildRemoteAgentKeyFromEndpoint(current.Value)); err != nil {
-			return true, err
-		}
-	}
-	return true, nil
 }

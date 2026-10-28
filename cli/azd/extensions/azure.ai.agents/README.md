@@ -1506,14 +1506,19 @@ Details:
 
 ### Saved context after owned Project teardown
 
-After successful BYO-AKS `azd down`, the Agents `postdown` lifecycle uses the
-completed v3 preparation journal and the deleted Project's verified API endpoint to
+After the Foundry provider completes owned BYO-AKS cloud teardown, Projects
+explicitly calls the installed Agents extension's internal local cleanup command.
+It passes completed v3 deletion evidence and the deleted Project's verified API endpoint to
 remove saved remote sessions, conversations, responses, invocations and State
-Store selection for each configured agent, across all cached remote versions.
+Store selection for every agent in that Project, across all cached remote versions.
 This includes older versions no longer selected by `AGENT_<SERVICE>_ENDPOINT`.
-Failed or incomplete teardown preserves context. Other Projects, other agents,
-local sessions and other extensions' state are not removed. Scoped cleanup
-errors are reported rather than presented as success. Individual agent/version
+Failed or incomplete cloud teardown preserves context. Other Projects,
+local sessions and other extensions' state are not removed. Cleanup is scoped to
+this provider: a later infrastructure layer can fail after this deleted Project's
+context has been cleared. Local cleanup errors fail `azd down`, retain the journal
+and prevent provisioning from replacing it; retry `azd down` after resolving the
+error. Projects and Agents must be installed as matching releases supporting this
+internal command; no core `postdown` dispatch is required. Individual agent/version
 delete commands retain their existing narrower cleanup behavior.
 
 ## Customize infrastructure

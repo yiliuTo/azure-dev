@@ -678,11 +678,17 @@ or an in-use/changed subnet stops cleanup and retains the recoverable journal.
 Progress survives permission failures and interruption; retry `azd down` after
 resolving the reported condition. Successful cleanup invalidates resource progress;
 failed cleanup preserves the recovery journal.
-After confirmed owned Project/account and complete dependency cleanup, the Agents
-extension's successful `postdown` lifecycle removes saved remote context for all
-versions of each configured agent in that exact deleted Project, using its
-verified API endpoint. Failed teardown and other Projects, agents and local
-contexts retain their saved bindings.
+After confirmed owned Project/account and complete dependency cleanup, the
+provider explicitly calls the installed Agents extension's internal local cleanup
+command with the verified Project identity and deletion evidence. Agents removes
+saved remote context for every agent and version in that exact deleted Project,
+using its verified API endpoint and existing state locks. Other Projects and
+local contexts retain their saved bindings. Cloud teardown failure never invokes
+local cleanup. Local cleanup failure fails `azd down` and retains pending evidence;
+retrying `azd down` resumes it, and provisioning cannot replace that journal while
+local cleanup is pending. This boundary is provider-scoped: later infrastructure
+layers may fail after the deleted Project's context has been cleared. Matching
+Projects and Agents releases are required; core `postdown` dispatch is not used.
 
 Normal account deletion is soft deletion and can reserve the name for 48 hours.
 Only explicit `azd down --purge` requests irreversible purge; model deployments
