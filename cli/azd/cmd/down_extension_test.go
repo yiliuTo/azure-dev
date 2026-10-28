@@ -60,6 +60,7 @@ func TestDownActionAgentsExtensionStateCleanup(t *testing.T) {
 		name                                          string
 		failed, skipped, selected, partial, noJournal bool
 		badProof                                      bool
+		unsupportedJournal                            bool
 	}{
 		{name: "completed owned project"},
 		{name: "already absent retry"},
@@ -69,6 +70,7 @@ func TestDownActionAgentsExtensionStateCleanup(t *testing.T) {
 		{name: "partial owned journal", partial: true},
 		{name: "no BYO journal retains legacy version scope", noJournal: true},
 		{name: "extension error prevents success", badProof: true},
+		{name: "unsupported journal retains contexts", unsupportedJournal: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			provider := &mockDownProvider{mockRefreshProvider: &mockRefreshProvider{},
@@ -97,8 +99,12 @@ func TestDownActionAgentsExtensionStateCleanup(t *testing.T) {
 				if test.badProof {
 					proofEndpoint = ""
 				}
+				journalVersion := 3
+				if test.unsupportedJournal {
+					journalVersion = 2
+				}
 				journal, err := json.Marshal(map[string]any{
-					"version": 2, "cleanupComplete": !test.partial,
+					"version": journalVersion, "cleanupComplete": !test.partial,
 					"foundry": map[string]any{
 						"spec": map[string]any{"projectId": "/subscriptions/00000000-0000-0000-0000-000000000001/" +
 							"resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct/projects/project"},
@@ -181,7 +187,7 @@ func TestDownActionAgentsExtensionStateCleanup(t *testing.T) {
 				t.Fatal("Agents extension did not register and signal readiness")
 			}
 			result, runErr := action.Run(ctx)
-			if test.failed || test.badProof {
+			if test.failed || test.badProof || test.unsupportedJournal {
 				require.Error(t, runErr)
 				assert.Nil(t, result)
 				if test.badProof {
@@ -194,6 +200,7 @@ func TestDownActionAgentsExtensionStateCleanup(t *testing.T) {
 				sum := sha256.Sum256([]byte(key))
 				path := filepath.Join(cacheDir, hex.EncodeToString(sum[:])+".json")
 				deleted := !test.failed && !test.skipped && !test.selected && !test.partial && !test.badProof &&
+					!test.unsupportedJournal &&
 					(key == agent || key == owned[2] || (key == owned[1] && !test.noJournal))
 				if deleted {
 					_, err := os.Stat(path)

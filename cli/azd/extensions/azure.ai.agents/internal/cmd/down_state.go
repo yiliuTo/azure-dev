@@ -117,7 +117,7 @@ func cleanupDeletedProjectAgentState(
 	if !journal.CleanupComplete {
 		return true, nil
 	}
-	if journal.Version != 2 || journal.Foundry == nil ||
+	if journal.Version != 3 || journal.Foundry == nil ||
 		!journal.Foundry.ProjectDeleted || !journal.Foundry.AccountDeleted {
 		return true, fmt.Errorf("completed owned Project deletion evidence is unverified; saved agent contexts retained")
 	}

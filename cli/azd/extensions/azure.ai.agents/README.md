@@ -1243,7 +1243,7 @@ Details:
 ### Saved context after owned Project teardown
 
 After successful BYO-AKS `azd down`, the Agents `postdown` lifecycle uses the
-completed ownership journal and the deleted Project's verified API endpoint to
+completed v3 preparation journal and the deleted Project's verified API endpoint to
 remove saved remote sessions, conversations, responses, invocations and State
 Store selection for each configured agent, across all cached remote versions.
 This includes older versions no longer selected by `AGENT_<SERVICE>_ENDPOINT`.

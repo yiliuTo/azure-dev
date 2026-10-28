@@ -23,22 +23,26 @@ func TestPostdownOwnedProjectClearsAllRemoteVersionsOnly(t *testing.T) {
 	)
 	for _, test := range []struct {
 		name                                     string
+		version                                  int
 		complete, projectDeleted, accountDeleted bool
 		recordedEndpoint                         string
 		wantDeleted, wantError                   bool
 	}{
-		{"completed", true, true, true, endpoint, true, false},
-		{"failed-down", false, false, false, endpoint, false, false},
-		{"partial-child-delete", false, true, false, endpoint, false, false},
-		{"unconfirmed-project", true, false, true, endpoint, false, true},
-		{"unconfirmed-account", true, true, false, endpoint, false, true},
-		{"missing-endpoint-proof", true, true, true, "", false, true},
-		{"other-project", true, true, true, endpoint + "-other", false, false},
+		{"completed", 3, true, true, true, endpoint, true, false},
+		{"failed-down", 3, false, false, false, endpoint, false, false},
+		{"partial-child-delete", 3, false, true, false, endpoint, false, false},
+		{"unconfirmed-project", 3, true, false, true, endpoint, false, true},
+		{"unconfirmed-account", 3, true, true, false, endpoint, false, true},
+		{"missing-endpoint-proof", 3, true, true, true, "", false, true},
+		{"other-project", 3, true, true, true, endpoint + "-other", false, false},
+		{"legacy-journal", 2, true, true, true, endpoint, false, true},
+		{"unknown-journal", 4, true, true, true, endpoint, false, true},
+		{"missing-journal-version", 0, true, true, true, endpoint, false, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			journal, err := json.Marshal(map[string]any{
-				"version": 2, "cleanupComplete": test.complete,
+				"version": test.version, "cleanupComplete": test.complete,
 				"foundry": map[string]any{
 					"spec":            map[string]any{"projectId": projectID},
 					"projectEndpoint": test.recordedEndpoint,
