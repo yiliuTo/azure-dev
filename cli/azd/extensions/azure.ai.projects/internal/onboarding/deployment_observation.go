@@ -306,9 +306,6 @@ func (l *ownedLifecycle) observeDeployment(ctx context.Context, plan Plan, state
 			return err
 		}
 	}
-	for index := range state.Foundry.Attempts {
-		state.Foundry.Attempts[index].OwnershipObserved = true
-	}
 	if !state.CleanupStarted {
 		if err := l.observeProgress(ctx, recovered, state, grants, observedGrants, observedIdentities); err != nil {
 			return err
@@ -364,7 +361,7 @@ func (l *ownedLifecycle) observeGrant(
 			if expected.principalID == "" {
 				continue // A grant's own value cannot establish the expected principal.
 			}
-			if expected.principalID == "" || !compatibleGrant(*assignment, expected) {
+			if !compatibleGrant(*assignment, expected) {
 				continue
 			}
 			actualID := authString(assignment.ID)
@@ -409,8 +406,8 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 	targets := map[string]bool{}
 	visited := map[string]bool{}
 	var evidence *AttemptEvidence
-	var read func(string, bool, bool, bool, bool) error
-	read = func(deploymentID string, observedBefore, failedAttempt, rejectedBeforeCreate, boundPath bool) error {
+	var read func(string, bool, bool) error
+	read = func(deploymentID string, failedAttempt, boundPath bool) error {
 		key := strings.ToLower(deploymentID)
 		if len(succeeded) > 1 {
 			key += fmt.Sprint("|bound=", boundPath)
@@ -430,9 +427,8 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 		boundPath = boundPath && strings.EqualFold(id.SubscriptionID, plan.SubscriptionID) &&
 			(id.ResourceGroupName == "" || strings.EqualFold(id.ResourceGroupName, plan.ResourceGroup))
 		var children []struct {
-			id       string
-			rejected bool
-			bound    bool
+			id    string
+			bound bool
 		}
 		collect := func(operations []*armresources.DeploymentOperation) error {
 			nested, err := nestedCreateOperations(operations, deploymentID)
@@ -441,11 +437,9 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 			}
 			for _, operation := range nested {
 				children = append(children, struct {
-					id       string
-					rejected bool
-					bound    bool
-				}{authString(operation.Properties.TargetResource.ID),
-					failedAttempt && nestedValidationRejected(operation, deploymentID), boundPath})
+					id    string
+					bound bool
+				}{authString(operation.Properties.TargetResource.ID), boundPath})
 			}
 			for _, operation := range operations {
 				if operation == nil || operation.Properties == nil || operation.Properties.TargetResource == nil {
@@ -508,7 +502,7 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 			return err
 		}
 		for _, child := range children {
-			if err := read(child.id, observedBefore, failedAttempt, child.rejected, child.bound); err != nil {
+			if err := read(child.id, failedAttempt, child.bound); err != nil {
 				return err
 			}
 		}
@@ -520,8 +514,7 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 		}
 		evidence = attempt.Evidence
 		clear(visited)
-		if err := read(attempt.ID, attempt.OwnershipObserved,
-			attempt.Terminal && attempt.ProvisioningState == "Failed", false, attempt.Terminal); err != nil {
+		if err := read(attempt.ID, attempt.Terminal && attempt.ProvisioningState == "Failed", attempt.Terminal); err != nil {
 			return nil, err
 		}
 	}

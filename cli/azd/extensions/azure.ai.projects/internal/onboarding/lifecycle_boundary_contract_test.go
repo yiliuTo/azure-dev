@@ -200,40 +200,41 @@ func TestLifecycleAttemptRejectsAmbiguousJournalWithoutSaving(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		mutate func(*PreparationState, *string)
+		want   string
 	}{
-		{"legacy without Foundry", func(s *PreparationState, _ *string) { s.Version, s.Foundry = 1, nil }},
-		{"unknown version", func(s *PreparationState, _ *string) { s.Version = 4 }},
-		{"different environment", func(s *PreparationState, _ *string) { s.Environment = "another-environment" }},
-		{"unfinished cleanup", func(s *PreparationState, _ *string) { s.CleanupStarted = true }},
+		{"legacy without Foundry", func(s *PreparationState, _ *string) { s.Version, s.Foundry = 1, nil },
+			"legacy/unknown journal"},
+		{"unknown version", func(s *PreparationState, _ *string) { s.Version = 4 }, "legacy/unknown journal"},
+		{"different environment", func(s *PreparationState, _ *string) { s.Environment = "another-environment" },
+			"another environment"},
+		{"unfinished cleanup", func(s *PreparationState, _ *string) { s.CleanupStarted = true }, "no pending cleanup"},
 		{"latest attempt unresolved", func(s *PreparationState, _ *string) {
 			s.Foundry.Attempts = append(s.Foundry.Attempts, FoundryAttempt{
 				ID: "/subscriptions/" + s.SubscriptionID + "/providers/Microsoft.Resources/deployments/unknown-attempt",
 			})
-		}},
-		{"terminal attempt ID reused", func(s *PreparationState, id *string) {
-			*id = strings.ToUpper(s.Foundry.Attempts[0].ID)
-		}},
+		}, "invalid or duplicate recorded Foundry deployment ID"},
 		{"different deployment subscription", func(s *PreparationState, id *string) {
 			*id = strings.Replace(*id, s.SubscriptionID, "55555555-5555-5555-5555-555555555555", 1)
-		}},
+		}, "exact subscription deployment ID"},
 		{"resource group deployment", func(s *PreparationState, id *string) {
 			*id = strings.Replace(*id, "/providers/", "/resourceGroups/"+s.ResourceGroup+"/providers/", 1)
-		}},
+		}, "exact subscription deployment ID"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			state := lifecycleBoundaryLedger()
-			plan, err := CleanupPlan(state)
+			f := newCleanupARM(t, false, false)
+			f.deploy(t)
+			state, err := f.base.journal.Load(t.Context())
 			require.NoError(t, err)
 			spec := state.Foundry.Spec
-			id := "/subscriptions/" + plan.SubscriptionID + "/providers/Microsoft.Resources/deployments/new-attempt"
+			id := f.base.plan.DeploymentID
 			tc.mutate(&state, &id)
-			journal := &memoryPreparationJournal{}
+			journal := f.base.journal
 			require.NoError(t, journal.Save(t.Context(), state))
 			before := slices.Clone(journal.data)
 
-			err = NewLifecycle(nil, nil, journal).Start(t.Context(), plan, spec, id)
+			err = f.lifecycle.Start(t.Context(), f.base.plan, spec, id)
 
-			require.Error(t, err)
+			require.ErrorContains(t, err, tc.want)
 			assert.Equal(t, before, journal.data, "an invalid lifecycle must not overwrite recovery evidence")
 		})
 	}

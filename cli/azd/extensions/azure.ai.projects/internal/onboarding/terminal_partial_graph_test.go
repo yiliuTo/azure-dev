@@ -304,7 +304,7 @@ func terminalPartialNetworkFixture(t *testing.T) (*terminalPartialGraph, *networ
 	state, err := n.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	attempt := &state.Foundry.Attempts[0]
-	attempt.Terminal, attempt.OwnershipObserved = false, false
+	attempt.Terminal = false
 	attempt.ProvisioningState, attempt.CorrelationID, attempt.ARMTemplateHash, attempt.Evidence = "", "", "", nil
 	state.Assignments = map[string]OwnedAssignment{}
 	require.NoError(t, n.base.journal.Save(t.Context(), state))

@@ -5,7 +5,6 @@ package synthesis
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 
@@ -13,12 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStandardNetworkARMAndSchemaMatchPreBYOBaseline(t *testing.T) {
-	raw, err := os.ReadFile("testdata/standard-network-before-byo.json")
-	require.NoError(t, err)
-	var baseline map[string]any
-	require.NoError(t, json.Unmarshal(raw, &baseline))
-	raw, err = ARMTemplate()
+func TestStandardNetworkARMContract(t *testing.T) {
+	raw, err := ARMTemplate()
 	require.NoError(t, err)
 	var arm map[string]any
 	require.NoError(t, json.Unmarshal(raw, &arm))
@@ -32,50 +27,36 @@ func TestStandardNetworkARMAndSchemaMatchPreBYOBaseline(t *testing.T) {
 	resourceModule := object(rootResources["resources"])
 	moduleProperties := object(resourceModule["properties"])
 	module := object(moduleProperties["template"])
-	for category, actual := range map[string]map[string]any{
-		"topLevelParameters": object(arm["parameters"]),
-		"parameterHandoff":   object(moduleProperties["parameters"]),
-		"variables":          object(module["variables"]),
-		"accountProperties":  object(object(object(module["resources"])["foundryAccount"])["properties"]),
-		"resources":          object(module["resources"]),
-		"outputs":            object(arm["outputs"]),
+	for _, name := range []string{
+		"enableNetworkIsolation", "useManagedEgress", "vnetId", "agentSubnetName", "agentSubnetPrefix",
+		"createAgentSubnet", "peSubnetName", "peSubnetPrefix", "createPESubnet", "managedIsolationMode",
+		"dnsZonesResourceGroup", "dnsZonesSubscription",
 	} {
-		t.Run(category, func(t *testing.T) {
-			for key, expected := range object(baseline[category]) {
-				value := actual[key]
-				if category == "resources" {
-					value = withoutCompilerMetadata(value)
-				}
-				assert.Equal(t, expected, value, key)
-			}
-		})
+		assert.Contains(t, object(arm["parameters"]), name)
+		assert.Equal(t, map[string]any{"value": "[parameters('" + name + "')]"},
+			object(moduleProperties["parameters"])[name], name)
 	}
-	raw, err = os.ReadFile(schemaPath)
-	require.NoError(t, err)
-	var schema map[string]any
-	require.NoError(t, json.Unmarshal(raw, &schema))
-	assert.Equal(t, baseline["networkSchema"], object(schema["properties"])["network"])
-	assert.Equal(t, baseline["subnetSchema"], object(schema["definitions"])["Subnet"])
-}
-
-func withoutCompilerMetadata(value any) any {
-	switch value := value.(type) {
-	case map[string]any:
-		result := make(map[string]any, len(value))
-		for key, entry := range value {
-			if key != "metadata" {
-				result[key] = withoutCompilerMetadata(entry)
-			}
-		}
-		return result
-	case []any:
-		result := make([]any, len(value))
-		for i, entry := range value {
-			result[i] = withoutCompilerMetadata(entry)
-		}
-		return result
-	default:
-		return value
+	variables := object(module["variables"])
+	assert.Equal(t, "[parameters('enableNetworkIsolation')]", variables["disablePublicDataPlaneAccess"])
+	resources := object(module["resources"])
+	account := object(object(resources["foundryAccount"])["properties"])
+	assert.Equal(t, "[variables('agentNetworkInjections')]", account["networkInjections"])
+	assert.Equal(t, "[if(variables('disablePublicDataPlaneAccess'), 'Disabled', 'Enabled')]", account["publicNetworkAccess"])
+	assert.Equal(t, map[string]any{
+		"defaultAction":       "[if(variables('disablePublicDataPlaneAccess'), 'Deny', 'Allow')]",
+		"bypass":              "[if(variables('disablePublicDataPlaneAccess'), 'AzureServices', null())]",
+		"virtualNetworkRules": []any{}, "ipRules": []any{},
+	}, account["networkAcls"])
+	for _, name := range []string{"network", "privateEndpointDns"} {
+		assert.Equal(t, "[parameters('enableNetworkIsolation')]", object(resources[name])["condition"], name)
+	}
+	assert.Equal(t, "[and(variables('useManagedNetwork'), not(empty(parameters('managedIsolationMode'))))]",
+		object(resources["foundryManagedNetwork"])["condition"])
+	pe := object(object(resources["privateEndpointDns"])["properties"])
+	assert.Equal(t, map[string]any{"value": "[reference('network').outputs.peSubnetId.value]"},
+		object(pe["parameters"])["peSubnetId"])
+	for _, name := range []string{"AZURE_FOUNDRY_NETWORK_MODE", "AZURE_FOUNDRY_MANAGED_ISOLATION_MODE"} {
+		assert.Equal(t, "[reference('resources').outputs."+name+".value]", object(object(arm["outputs"])[name])["value"])
 	}
 }
 

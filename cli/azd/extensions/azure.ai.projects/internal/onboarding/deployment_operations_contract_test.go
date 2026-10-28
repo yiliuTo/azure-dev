@@ -30,7 +30,6 @@ func TestRecoveryRequiresGrantIDInExactDeploymentOperationGraph(t *testing.T) {
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	state.Assignments = map[string]OwnedAssignment{}
-	state.Foundry.Attempts[0].OwnershipObserved = false
 	require.NoError(t, f.base.journal.Save(t.Context(), state))
 	require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
 	state, err = f.base.journal.Load(t.Context())

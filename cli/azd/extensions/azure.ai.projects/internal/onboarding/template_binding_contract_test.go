@@ -21,31 +21,22 @@ func TestTemplateBindingUsesExportedContentNotGeneratorOrARMHashEquality(t *test
 	require.NoError(t, err)
 	var standard map[string]any
 	require.NoError(t, json.Unmarshal(raw, &standard))
-	metadata := cleanupObject(t, standard["metadata"])
-	generator := cleanupObject(t, metadata["_generator"])
-	generatorHash, ok := generator["templateHash"].(string)
-	require.True(t, ok)
 	digest, err := TemplateDigest(standard)
 	require.NoError(t, err)
 	for _, tc := range []struct {
-		name, digest, version string
-		mutate                func(map[string]any)
-		status                int
-		wantError             string
+		name, digest string
+		mutate       func(map[string]any)
+		status       int
+		wantError    string
 	}{
-		{"legacy exact trusted standard", "", generatorHash, nil, 200, ""},
-		{"new content digest", digest, generatorHash, nil, 200, ""},
-		{"metadata is not ownership proof", "", generatorHash, func(template map[string]any) {
-			template["resources"] = map[string]any{}
-		}, 200, "actual template binding"},
-		{"new digest rejects changed content", digest, generatorHash, func(template map[string]any) {
+		{"new content digest", digest, nil, 200, ""},
+		{"new digest rejects changed content", digest, func(template map[string]any) {
 			template["outputs"] = map[string]any{}
 		}, 200, "actual template binding"},
-		{"legacy unknown version", "", "unknown-version", nil, 200, "no trusted standard version"},
-		{"export denied", digest, generatorHash, nil, 403, "read exact recorded deployment template"},
-		{"export missing", digest, generatorHash, nil, 404, "read exact recorded deployment template"},
-		{"export lacks template", digest, generatorHash, nil, 200, "template content is unavailable"},
-		{"generator metadata changes do not change content", digest, generatorHash, func(template map[string]any) {
+		{"export denied", digest, nil, 403, "read exact recorded deployment template"},
+		{"export missing", digest, nil, 404, "read exact recorded deployment template"},
+		{"export lacks template", digest, nil, 200, "template content is unavailable"},
+		{"generator metadata changes do not change content", digest, func(template map[string]any) {
 			delete(template, "metadata")
 		}, 200, ""},
 	} {
@@ -76,7 +67,7 @@ func TestTemplateBindingUsesExportedContentNotGeneratorOrARMHashEquality(t *test
 			client, err := armresources.NewDeploymentsClient("target", contractCredential{}, options)
 			require.NoError(t, err)
 			err = verifyAttemptTemplate(t.Context(), client, "exact",
-				FoundryAttempt{TemplateHash: tc.version, TemplateDigest: tc.digest})
+				FoundryAttempt{TemplateDigest: tc.digest})
 			if tc.wantError == "" {
 				require.NoError(t, err)
 			} else {

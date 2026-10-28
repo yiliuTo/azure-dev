@@ -37,7 +37,6 @@ type FoundryAttempt struct {
 	TemplateHash      string           `json:"templateHash,omitempty"`
 	TemplateDigest    string           `json:"templateDigest,omitempty"`
 	ARMTemplateHash   string           `json:"armTemplateHash,omitempty"`
-	OwnershipObserved bool             `json:"ownershipObserved,omitempty"`
 	ProvisioningState string           `json:"provisioningState,omitempty"`
 	Evidence          *AttemptEvidence `json:"evidence,omitempty"`
 	Archived          bool             `json:"archived,omitempty"`
@@ -198,10 +197,8 @@ func (l *ownedLifecycle) Check(ctx context.Context, plan Plan, spec FoundrySpec)
 	if err := validateProgressSelection(plan, state); err != nil {
 		return fail(err)
 	}
-	if spec.Deployment != nil {
-		if err := validateDeploymentData(plan, spec, state); err != nil {
-			return fail(err)
-		}
+	if err := validateDeploymentData(plan, spec, state); err != nil {
+		return fail(err)
 	}
 	if err := validateHistoricalNetwork(state); err != nil {
 		return fail(err)
@@ -274,13 +271,10 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	if err := validateFoundrySpec(plan, spec); err != nil {
 		return err
 	}
-	if spec.Deployment == nil {
-		return fmt.Errorf("deployment intent requires the exact standard graph bindings")
-	}
-	if spec.Deployment != nil && spec.TemplateHash == "" {
+	if spec.TemplateHash == "" {
 		return fmt.Errorf("deployment intent requires the generated template version before submission")
 	}
-	if spec.Deployment != nil && spec.TemplateDigest == "" {
+	if spec.TemplateDigest == "" {
 		return fmt.Errorf("deployment intent requires the actual template content digest before submission")
 	}
 	_, err := subscriptionDeploymentID(deploymentID, plan.SubscriptionID)
@@ -293,9 +287,6 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	}
 	if err := validateProgressSelection(plan, state); err != nil {
 		return err
-	}
-	if state.DeploymentID == "" && spec.Deployment == nil {
-		return fmt.Errorf("a new deployment requires internally planned graph bindings")
 	}
 	if state.CleanupStarted && !state.CleanupComplete {
 		return fmt.Errorf("Foundry attempt requires no pending cleanup")
@@ -316,13 +307,11 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 			state.Registry.Verified && state.Registry.ABAC != spec.RegistryABAC) {
 		return fmt.Errorf("Foundry attempt registry does not match the recorded binding")
 	}
-	if spec.Deployment != nil {
-		if err := l.checkDeploymentResources(ctx, plan, state); err != nil {
-			return err
-		}
-		if err := validateDeploymentData(plan, spec, state); err != nil {
-			return err
-		}
+	if err := l.checkDeploymentResources(ctx, plan, state); err != nil {
+		return err
+	}
+	if err := validateDeploymentData(plan, spec, state); err != nil {
+		return err
 	}
 	if state.CleanupComplete {
 		state.Resources = map[string]OwnedResource{}
@@ -348,18 +337,16 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	if state.Assignments == nil {
 		state.Assignments = map[string]OwnedAssignment{}
 	}
-	if spec.Deployment != nil {
-		for step, resource := range deploymentResources(plan) {
-			if resource.Supplied {
-				continue
+	for step, resource := range deploymentResources(plan) {
+		if resource.Supplied {
+			continue
+		}
+		if previous, exists := state.Resources[step]; exists {
+			if !strings.EqualFold(previous.ID, resource.ID) || previous.Deleted {
+				return fmt.Errorf("%s: planned resource differs from active ownership", step)
 			}
-			if previous, exists := state.Resources[step]; exists {
-				if !strings.EqualFold(previous.ID, resource.ID) || previous.Deleted {
-					return fmt.Errorf("%s: planned resource differs from active ownership", step)
-				}
-			} else {
-				state.Resources[step] = OwnedResource{ID: resource.ID}
-			}
+		} else {
+			state.Resources[step] = OwnedResource{ID: resource.ID}
 		}
 	}
 	state.Registry = &RegistryBinding{ID: spec.RegistryID, ABAC: spec.RegistryABAC}
@@ -371,7 +358,7 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	if !sameFoundrySpec(state.Foundry.Spec, spec) {
 		return fmt.Errorf("Foundry attempt does not match the journaled selections")
 	}
-	if spec.Deployment != nil && len(state.Foundry.Attempts) > 0 {
+	if len(state.Foundry.Attempts) > 0 {
 		if err := l.verifyAttempts(ctx, plan, state.Foundry); err != nil {
 			return err
 		}
@@ -482,88 +469,7 @@ func (l *ownedLifecycle) verifyAttempts(ctx context.Context, plan Plan, foundry 
 			}
 			parameters[key] = value
 		}
-		var owner, accountName string
-		if foundry.Spec.Deployment != nil {
-			var binding struct {
-				Value struct {
-					DeploymentID          string `json:"deploymentId"`
-					AccountName           string `json:"accountName"`
-					ClusterID             string `json:"clusterResourceId"`
-					StorageID             string `json:"storageAccountResourceId"`
-					RegistryID            string `json:"registryResourceId"`
-					HostingName           string `json:"hostingIdentityName"`
-					WorkloadName          string `json:"workloadIdentityName"`
-					HostingID             string `json:"hostingIdentityResourceId"`
-					WorkloadID            string `json:"workloadIdentityResourceId"`
-					HostingSupplied       *bool  `json:"hostingIdentitySupplied"`
-					WorkloadSupplied      *bool  `json:"workloadIdentitySupplied"`
-					HostingPrincipal      string `json:"hostingPrincipalId"`
-					WorkloadPrincipal     string `json:"workloadPrincipalId"`
-					CreateClusterGrants   *bool  `json:"createClusterGrants"`
-					CreateFederationGrant *bool  `json:"createFederationGrant"`
-					CreateStorageGrant    *bool  `json:"createStorageGrant"`
-				} `json:"value"`
-			}
-			if err := json.Unmarshal(values["byoOnboarding"], &binding); err != nil {
-				return fmt.Errorf("deployment graph ownership binding is unavailable: %w", err)
-			}
-			data := foundry.Spec.Deployment
-			for _, identity := range []struct {
-				id, expected, principal, actualPrincipal string
-				supplied                                 *bool
-				expectedSupplied                         bool
-			}{
-				{binding.Value.HostingID, data.Hosting.ID, binding.Value.HostingPrincipal,
-					data.HostingIdentity.PrincipalID, binding.Value.HostingSupplied, data.Hosting.Supplied},
-				{binding.Value.WorkloadID, data.Workload.ID, binding.Value.WorkloadPrincipal,
-					data.WorkloadIdentity.PrincipalID, binding.Value.WorkloadSupplied, data.Workload.Supplied},
-			} {
-				if identity.expectedSupplied && (identity.id == "" || identity.supplied == nil ||
-					!strings.EqualFold(identity.principal, identity.actualPrincipal)) ||
-					identity.id != "" && !strings.EqualFold(identity.id, identity.expected) ||
-					identity.supplied != nil && *identity.supplied != identity.expectedSupplied {
-					return fmt.Errorf("recorded deployment supplied-identity binding changed or is unavailable")
-				}
-			}
-			for _, operation := range []struct {
-				selected *bool
-				expected bool
-			}{
-				{binding.Value.CreateClusterGrants, !data.Hosting.Supplied},
-				{binding.Value.CreateFederationGrant, !data.Hosting.Supplied || !data.Workload.Supplied},
-				{binding.Value.CreateStorageGrant, !data.Workload.Supplied || !data.StorageCustomerSupplied},
-			} {
-				if operation.selected != nil && *operation.selected != operation.expected ||
-					operation.selected == nil && (data.Hosting.Supplied || data.Workload.Supplied) {
-					return fmt.Errorf("recorded deployment grant operation binding changed or is unavailable")
-				}
-			}
-			if !strings.EqualFold(binding.Value.ClusterID, data.ClusterID) ||
-				!strings.EqualFold(binding.Value.StorageID, data.StorageID) ||
-				!strings.EqualFold(binding.Value.RegistryID, data.RegistryID) ||
-				binding.Value.HostingName != data.Hosting.Name || binding.Value.WorkloadName != data.Workload.Name {
-				return fmt.Errorf("recorded deployment dependency graph changed")
-			}
-			owner, accountName = binding.Value.DeploymentID, binding.Value.AccountName
-		} else {
-			for _, key := range []string{"byoDeploymentId", "byoAccountName"} {
-				var value struct {
-					Value string `json:"value"`
-				}
-				if err := json.Unmarshal(values[key], &value); err != nil {
-					return fmt.Errorf("legacy deployment ownership parameter %s unavailable: %w", key, err)
-				}
-				if key == "byoDeploymentId" {
-					owner = value.Value
-				} else {
-					accountName = value.Value
-				}
-			}
-		}
-		account, err := ParseID(foundry.Spec.AccountID, "Microsoft.CognitiveServices/accounts")
-		if err != nil || !strings.EqualFold(owner, plan.DeploymentID) ||
-			accountName != account.Name ||
-			!strings.EqualFold(parameters["resourceGroupName"].Value, plan.ResourceGroup) ||
+		if !strings.EqualFold(parameters["resourceGroupName"].Value, plan.ResourceGroup) ||
 			!strings.EqualFold(parameters["location"].Value, plan.Location) {
 			return fmt.Errorf("recorded deployment target/ownership parameters changed")
 		}

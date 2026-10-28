@@ -576,20 +576,6 @@ services:
 		want       string
 	}{
 		{
-			name: "explicit hosting type",
-			yaml: strings.Replace(valid, "    agentHosting:\n",
-				"    agentHosting:\n      hostingType: ManagedCluster\n", 1),
-			synthesize: Synthesize,
-			want:       "services.project.agentHosting.hostingType: unsupported property",
-		},
-		{
-			name: "explicit hosting name",
-			yaml: strings.Replace(valid, "    agentHosting:\n",
-				"    agentHosting:\n      name: default\n", 1),
-			synthesize: Synthesize,
-			want:       "services.project.agentHosting.name: unsupported property",
-		},
-		{
 			name:       "wrong cluster resource type",
 			yaml:       strings.Replace(valid, "Microsoft.ContainerService/managedClusters", "Microsoft.Storage/storageAccounts", 1),
 			synthesize: Synthesize,
@@ -614,12 +600,6 @@ services:
 			_, err := tt.synthesize(Input{
 				RawAzureYAML: []byte(tt.yaml),
 				ServiceName:  "project",
-				Env: map[string]string{
-					"MANAGER_ID": "/subscriptions/sub/resourceGroups/rg/providers/" +
-						"Microsoft.ManagedIdentity/userAssignedIdentities/manager",
-					"WORKLOAD_ID": "/subscriptions/sub/resourceGroups/rg/providers/" +
-						"Microsoft.ManagedIdentity/userAssignedIdentities/workload",
-				},
 			})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.want)
@@ -994,27 +974,6 @@ func TestTerraformModule_DerivesNamesWhenEmpty(t *testing.T) {
 	assert.NotContains(t, string(vars), `variable "principal_id"`)
 	assert.NotContains(t, string(vars), `variable "principal_type"`)
 	assert.NotContains(t, string(main), `developer_cognitive_services_user`)
-}
-
-func TestTerraformModule_AgentHosting(t *testing.T) {
-	fs := TerraformTemplatesFS()
-
-	variables, err := fs.ReadFile("templates/terraform/variables.tf")
-	require.NoError(t, err)
-	assert.Contains(t, string(variables), `variable "agent_hosting"`)
-	assert.Contains(t, string(variables), "hostingManagementIdentityResourceId")
-	assert.NotContains(t, string(variables), "agentSubnetResourceId")
-
-	main, err := fs.ReadFile("templates/terraform/main.tf")
-	require.NoError(t, err)
-	text := string(main)
-	assert.Contains(t, text, "Microsoft.CognitiveServices/accounts@2026-07-15-preview")
-	assert.Contains(t, text, "schema_validation_enabled = false")
-	assert.Contains(t, text, `identity_ids = var.agent_hosting.enabled`)
-	assert.Contains(t, text, "agentHostingConfigurations")
-	assert.NotContains(t, text, "networkInjections")
-	assert.NotContains(t, text, "var.agent_hosting.agentSubnetResourceId")
-	assert.Contains(t, text, "workloadIdentityResourceId")
 }
 
 func TestARMTemplate_IsValidJSONWithExpectedShape(t *testing.T) {

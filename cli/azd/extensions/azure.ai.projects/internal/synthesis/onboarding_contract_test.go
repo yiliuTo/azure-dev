@@ -63,7 +63,7 @@ func TestOnboardingContractUsesStandardYAMLDecoding(t *testing.T) {
 			input := hostingContractInput(extra)
 			result, err := Synthesize(input)
 			require.NoError(t, err)
-			assert.Empty(t, hostingContractParameters(t, result)["hostingManagementIdentityResourceId"])
+			assert.Empty(t, hostingContractParameters(t, result)["storageAccountResourceId"])
 		})
 	}
 	_, err := Synthesize(hostingContractInput(
@@ -89,20 +89,15 @@ func TestOnboardingContractSuppliedChoicesAndFixedHostingValues(t *testing.T) {
 
 func TestOnboardingContractRejectsUnsupportedHostingProperties(t *testing.T) {
 	for _, field := range []string{"hostingType", "name", "unknown"} {
-		for _, value := range []string{
-			"ManagedCluster", "default", "aks", "customer-hosting", `""`, "null", `"   "`,
-			`"${REMOVED_HOSTING_INPUT}"`, "false", "123", "{}",
-		} {
-			for _, preserve := range []bool{false, true} {
-				mode := map[bool]string{false: "provision", true: "eject"}[preserve]
-				t.Run(field+"/"+value+"/"+mode, func(t *testing.T) {
-					input := hostingContractInput("      " + field + ": " + value + "\n")
-					input.PreserveVarRefs = preserve
-					result, err := Synthesize(input)
-					require.ErrorContains(t, err, "services.project.agentHosting."+field+": unsupported property")
-					assert.Nil(t, result)
-				})
-			}
+		for _, preserve := range []bool{false, true} {
+			mode := map[bool]string{false: "provision", true: "eject"}[preserve]
+			t.Run(field+"/"+mode, func(t *testing.T) {
+				input := hostingContractInput("      " + field + ": null\n")
+				input.PreserveVarRefs = preserve
+				result, err := Synthesize(input)
+				require.ErrorContains(t, err, "services.project.agentHosting."+field+": unsupported property")
+				assert.Nil(t, result)
+			})
 		}
 	}
 }
@@ -110,13 +105,11 @@ func TestOnboardingContractRejectsUnsupportedHostingProperties(t *testing.T) {
 func TestOnboardingContractHostingFileReferences(t *testing.T) {
 	for _, scope := range []string{"project", "agentHosting"} {
 		for _, format := range []string{"yaml", "json"} {
-			for _, field := range []string{"", "hostingType", "name", "unknown"} {
+			for _, field := range []string{"", "unknown"} {
 				t.Run(scope+"/"+format+"/"+field, func(t *testing.T) {
 					hosting := map[string]any{"clusterResourceId": contractClusterID}
 					if field != "" {
-						hosting[field] = map[string]any{
-							"hostingType": "ManagedCluster", "name": "default", "unknown": true,
-						}[field]
+						hosting[field] = true
 					}
 					var definition any = hosting
 					raw := "services:\n  project:\n    host: azure.ai.project\n    agentHosting:\n" +

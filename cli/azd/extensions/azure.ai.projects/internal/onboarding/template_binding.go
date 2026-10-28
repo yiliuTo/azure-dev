@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"strings"
 
-	"azure.ai.projects/internal/synthesis"
-
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 )
 
@@ -108,37 +106,7 @@ func verifyAttemptTemplate(
 	if err != nil {
 		return err
 	}
-	expected := attempt.TemplateDigest
-	if expected == "" {
-		// Old journals stored the Bicep generator hash, not ARM's independent service hash.
-		// Only this trusted standard version can recover an old journal without a content digest.
-		raw, err := synthesis.ARMTemplate()
-		if err != nil {
-			return err
-		}
-		var standard struct {
-			Metadata struct {
-				Generator struct {
-					TemplateHash string `json:"templateHash"`
-				} `json:"_generator"`
-			} `json:"metadata"`
-		}
-		if err := json.Unmarshal(raw, &standard); err != nil {
-			return err
-		}
-		if attempt.TemplateHash == "" || attempt.TemplateHash != standard.Metadata.Generator.TemplateHash {
-			return fmt.Errorf("recorded deployment's legacy template binding has no trusted standard version")
-		}
-		var template map[string]any
-		if err := json.Unmarshal(raw, &template); err != nil {
-			return err
-		}
-		expected, err = TemplateDigest(template)
-		if err != nil {
-			return err
-		}
-	}
-	if actual != expected {
+	if actual != attempt.TemplateDigest {
 		return fmt.Errorf("recorded deployment's actual template binding is unverified or changed")
 	}
 	return nil

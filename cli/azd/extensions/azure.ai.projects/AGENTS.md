@@ -27,6 +27,8 @@ Useful places to start:
 
 During the staged ownership migration, `internal/synthesis/` is also present in `azure.ai.agents` for `azd ai agent init --infra`. Keep the production files and templates byte-for-byte aligned until init moves.
 
+BYO onboarding synthesis contract tests live in Projects; its parity test checks both production copies and embedded templates. Run the Projects synthesis suite when changing either copy.
+
 ## Build and test
 
 From `cli/azd/extensions/azure.ai.projects`:

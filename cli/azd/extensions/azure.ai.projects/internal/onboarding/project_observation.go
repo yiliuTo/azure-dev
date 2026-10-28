@@ -48,12 +48,6 @@ func (l *ownedLifecycle) verifyDeployedProject(
 	if err := validateFoundrySpec(plan, spec); err != nil {
 		return err
 	}
-	if spec.Deployment == nil {
-		if !strings.EqualFold(authString(project.ID), spec.ProjectID) || project.Identity == nil {
-			return fmt.Errorf("legacy Foundry project ownership/identity is unverified")
-		}
-		return nil
-	}
 	if !strings.EqualFold(authString(project.ID), spec.ProjectID) ||
 		!strings.EqualFold(authString(project.Location), spec.Location) ||
 		project.Identity == nil || resourceValue(project.Identity.Type) != "SystemAssigned" ||
