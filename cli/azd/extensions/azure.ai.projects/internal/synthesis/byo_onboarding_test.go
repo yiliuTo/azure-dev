@@ -198,17 +198,46 @@ func TestBYOOnboardingSingleARMGraph(t *testing.T) {
 			}, resource["properties"])
 		case "Microsoft.ContainerRegistry/registries":
 			assert.Equal(t, "[not(parameters('plan').registrySupplied)]", resource["condition"])
-			assert.Equal(t, "2025-03-01-preview", resource["apiVersion"])
+			assert.Equal(t, "2023-07-01", resource["apiVersion"])
 			assert.Equal(t, map[string]any{"name": "Premium"}, resource["sku"])
 			assert.Equal(t, map[string]any{
-				"roleAssignmentMode": "LegacyRegistryPermissions",
-				"adminUserEnabled":   false, "publicNetworkAccess": "Enabled",
+				"adminUserEnabled": false, "publicNetworkAccess": "Enabled",
 			}, resource["properties"])
 		}
 	}
 	assert.Equal(t, 2, types["Microsoft.ManagedIdentity/userAssignedIdentities"])
 	assert.Equal(t, 1, types["Microsoft.Storage/storageAccounts"])
 	assert.Equal(t, 1, types["Microsoft.ContainerRegistry/registries"])
+	foundryTemplate, ok := foundryProperties["template"].(map[string]any)
+	require.True(t, ok)
+	foundryResources, ok := foundryTemplate["resources"].(map[string]any)
+	require.True(t, ok)
+	acrModule, ok := foundryResources["acr"].(map[string]any)
+	require.True(t, ok)
+	acrProperties, ok := acrModule["properties"].(map[string]any)
+	require.True(t, ok)
+	acrTemplate, ok := acrProperties["template"].(map[string]any)
+	require.True(t, ok)
+	acrResources, ok := acrTemplate["resources"].([]any)
+	require.True(t, ok)
+	var registries []map[string]any
+	for _, item := range acrResources {
+		resource, ok := item.(map[string]any)
+		require.True(t, ok)
+		if resource["type"] == "Microsoft.ContainerRegistry/registries" {
+			registries = append(registries, resource)
+		}
+	}
+	require.Len(t, registries, 1)
+	registry := registries[0]
+	assert.Equal(t, "2023-07-01", registry["apiVersion"])
+	assert.Equal(t, "[not(variables('reuseRegistry'))]", registry["condition"])
+	assert.Equal(t, map[string]any{"name": "Premium"}, registry["sku"])
+	assert.Equal(t, map[string]any{"type": "SystemAssigned"}, registry["identity"])
+	assert.Equal(t, map[string]any{
+		"adminUserEnabled": false, "zoneRedundancy": "Disabled",
+		"publicNetworkAccess": "[if(parameters('enableNetworkIsolation'), 'Disabled', 'Enabled')]",
+	}, registry["properties"])
 	for _, file := range []string{
 		"byo-role-assignment.bicep", "byo-identity-role-assignment.bicep",
 		"byo-storage-role-assignment.bicep", "acr-pull-role-assignment.bicep",

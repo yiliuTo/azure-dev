@@ -546,10 +546,10 @@ zone redundancy receive a non-blocking recommendation after the preflight
 report. An unavailable or unrecognized SKU produces an advisory uncertainty
 warning. Neither recommendation changes the account or relaxes the mandatory
 Storage type, Hot tier, HNS, security or network checks.
-New BYO ACR uses API `2025-03-01-preview` with
-`roleAssignmentMode: LegacyRegistryPermissions`, Premium SKU, the admin user
-disabled and public network access enabled. These creation settings apply only
-to the BYO prerequisite module; ordinary Foundry resource configuration is unchanged.
+New BYO and ordinary ACR creation use API `2023-07-01` and rely on the default
+registry RBAC mode without setting `roleAssignmentMode`. BYO ACR retains Premium
+SKU, the admin user disabled and public network access enabled. Ordinary Foundry
+network-isolation settings are unchanged.
 Supplied registries, including ABAC registries, are referenced without configuration
 updates. Retries retain the bound registry selection and authorization mode.
 ARM dependencies order configuration; they do not prove data-plane RBAC

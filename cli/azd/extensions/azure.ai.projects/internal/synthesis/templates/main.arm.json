@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.48.1.52935",
-      "templateHash": "15643173443773476466"
+      "templateHash": "2623687177426869301"
     }
   },
   "definitions": {
@@ -304,7 +304,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.48.1.52935",
-              "templateHash": "10197734613089738656"
+              "templateHash": "2301456100355857642"
             }
           },
           "parameters": {
@@ -369,7 +369,7 @@
             {
               "condition": "[not(parameters('plan').registrySupplied)]",
               "type": "Microsoft.ContainerRegistry/registries",
-              "apiVersion": "2025-03-01-preview",
+              "apiVersion": "2023-07-01",
               "name": "[parameters('plan').registryName]",
               "location": "[parameters('location')]",
               "tags": "[parameters('tags')]",
@@ -377,7 +377,6 @@
                 "name": "Premium"
               },
               "properties": {
-                "roleAssignmentMode": "LegacyRegistryPermissions",
                 "adminUserEnabled": false,
                 "publicNetworkAccess": "Enabled"
               }

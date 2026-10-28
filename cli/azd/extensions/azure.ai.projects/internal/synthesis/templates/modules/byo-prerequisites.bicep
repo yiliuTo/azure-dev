@@ -44,13 +44,12 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!plan.stor
   }
 }
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-03-01-preview' = if (!plan.registrySupplied) {
+resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = if (!plan.registrySupplied) {
   name: plan.registryName
   location: location
   tags: tags
   sku: { name: 'Premium' }
   properties: {
-    roleAssignmentMode: 'LegacyRegistryPermissions'
     adminUserEnabled: false
     publicNetworkAccess: 'Enabled'
   }
