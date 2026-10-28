@@ -620,7 +620,11 @@ contexts retain their saved bindings.
 
 Normal account deletion is soft deletion and can reserve the name for 48 hours.
 Only explicit `azd down --purge` requests irreversible purge; model deployments
-are removed first to avoid charges persisting through soft deletion. Journals
+are removed first to avoid charges persisting through soft deletion. The regional
+deleted-account scope and location must match the persisted Account. Its
+CognitiveServices birth timestamp and the retained ARM inventory birth must fall
+within the same verified successful Account Create; missing or inconsistent
+evidence blocks purge. Journals
 from versions without authoritative Foundry lifecycle evidence are rejected
 rather than used to infer account absence or delete dependencies.
 

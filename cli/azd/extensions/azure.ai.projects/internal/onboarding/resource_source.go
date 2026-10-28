@@ -18,9 +18,11 @@ import (
 // ResourceSource preserves initial absence and actual ARM birth evidence
 // independently of the mutable cleanup ledger and preparation progress.
 type ResourceSource struct {
-	ID              string    `json:"id"`
-	InitiallyAbsent bool      `json:"initiallyAbsent"`
-	CreatedTime     time.Time `json:"createdTime"`
+	ID                     string    `json:"id"`
+	InitiallyAbsent        bool      `json:"initiallyAbsent"`
+	CreatedTime            time.Time `json:"createdTime"`
+	AccountSystemCreatedAt time.Time `json:"accountSystemCreatedAt,omitzero"`
+	AccountDateCreated     time.Time `json:"accountDateCreated,omitzero"`
 }
 
 func sourceResources(plan Plan, spec FoundrySpec) []Resource {

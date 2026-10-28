@@ -404,7 +404,8 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 	ctx context.Context, plan Plan, foundry *FoundryState, succeeded ...map[string]bool,
 ) (map[string]bool, error) {
 	// Optional collectors record succeeded grants, path-bound successful resource Creates,
-	// and failed private-endpoint Create candidates. Candidates still need birth/topology proof.
+	// failed private-endpoint Create candidates, and exact path-bound successful resource operation IDs.
+	// Candidates still need birth/topology proof.
 	targets := map[string]bool{}
 	visited := map[string]bool{}
 	var evidence *AttemptEvidence
@@ -479,6 +480,9 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 					if len(succeeded) > 1 && succeeded[1] != nil &&
 						boundPath && succeededCreateOperation(operation, deploymentID) {
 						succeeded[1][strings.ToLower(targetID)] = true
+						if len(succeeded) > 3 && succeeded[3] != nil {
+							succeeded[3][strings.ToLower(authString(operation.ID))] = true
+						}
 					}
 					if len(succeeded) > 2 && succeeded[2] != nil && boundPath && failedAttempt &&
 						strings.EqualFold(authString(target.ResourceType), privateEndpointType) &&

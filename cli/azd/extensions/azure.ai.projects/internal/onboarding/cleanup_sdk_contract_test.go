@@ -156,6 +156,7 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 					operations = append(operations, map[string]any{
 						"id": strings.TrimSuffix(request.URL.Path, "/operations") + "/operations/" + resource.Name,
 						"properties": map[string]any{"provisioningOperation": "Create", "provisioningState": "Succeeded",
+							"timestamp": "2026-10-26T00:49:00Z", "duration": "PT2M",
 							"targetResource": map[string]any{"id": resource.ID, "resourceType": parsed.ResourceType.String()}},
 					})
 				}
@@ -210,7 +211,10 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 				f.operationStates = nil
 				base.resources[strings.ToLower(f.spec.AccountID)] = map[string]any{
 					"id": f.spec.AccountID, "location": f.spec.Location,
-					"properties": map[string]any{"provisioningState": "Succeeded"},
+					"systemData": map[string]any{"createdAt": "2026-10-26T00:50:00.0413256Z"},
+					"properties": map[string]any{
+						"provisioningState": "Succeeded", "dateCreated": "2026-10-26T00:50:01.8662485Z",
+					},
 				}
 				base.resources[strings.ToLower(f.spec.ProjectID)] = map[string]any{
 					"id": f.spec.ProjectID, "location": f.spec.Location,
@@ -248,9 +252,16 @@ func newCleanupARM(t *testing.T, suppliedStorage, suppliedRegistry bool, supplie
 				return respond(204, nil)
 			}
 			if f.softDeleted {
+				deletedID, err := deletedAccountResourceID(f.spec.AccountID, f.spec.Location)
+				require.NoError(t, err)
 				return respond(200, map[string]any{
-					"id": f.spec.AccountID, "location": f.spec.Location,
-					"systemData": map[string]any{"createdAt": "2026-10-26T00:50:00Z"},
+					"id": deletedID, "name": f.base.plan.Account.Name,
+					"type": "Microsoft.CognitiveServices/deletedAccounts", "location": f.spec.Location,
+					"systemData": map[string]any{"createdAt": "2026-10-26T00:50:00.0413256Z"},
+					"properties": map[string]any{
+						"provisioningState": "Succeeded", "dateCreated": "2026-10-26T00:50:01.8662485Z",
+						"deletionDate": "2026-10-26T02:00:00Z",
+					},
 				})
 			}
 			return notFound()

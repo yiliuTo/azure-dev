@@ -278,6 +278,7 @@ func TestTerminalPartialResourceBirthStillRequiresExactSuccessfulTimedCreate(t *
 				}
 			case "missing birth":
 				delete(g.base.resources[strings.ToLower(g.spec.AccountID)], "createdTime")
+				delete(g.base.resources[strings.ToLower(g.spec.AccountID)], "systemData")
 			case "missing initial absence", "replaced resource":
 				state, err := g.base.journal.Load(t.Context())
 				require.NoError(t, err)

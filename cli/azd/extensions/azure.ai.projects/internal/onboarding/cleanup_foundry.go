@@ -62,6 +62,16 @@ func (l *ownedLifecycle) cleanupFoundry(
 		if err := l.verifyResourceSources(ctx, plan, state); err != nil {
 			return err
 		}
+		if purge {
+			source, err := l.accountPurgeSource(ctx, plan, state, observed.Account)
+			if err != nil {
+				return err
+			}
+			state.Sources[strings.ToLower(target.ID)] = source
+			if err := l.journal.Save(ctx, *state); err != nil {
+				return err
+			}
+		}
 		if progress != nil {
 			progress(fmt.Sprintf("Deleting owned Foundry account %s...", target.ID))
 		}
@@ -108,12 +118,13 @@ func (l *ownedLifecycle) cleanupFoundry(
 		if err != nil {
 			return fmt.Errorf("read soft-deleted owned Foundry account: %w", err)
 		}
-		source := state.Sources[strings.ToLower(state.Foundry.Spec.AccountID)]
-		if !strings.EqualFold(authString(softDeleted.ID), state.Foundry.Spec.AccountID) ||
-			!strings.EqualFold(authString(softDeleted.Location), state.Foundry.Spec.Location) ||
-			softDeleted.SystemData == nil || softDeleted.SystemData.CreatedAt == nil ||
-			source.CreatedTime.IsZero() || !source.CreatedTime.Equal(*softDeleted.SystemData.CreatedAt) {
-			return fmt.Errorf("soft-deleted account ownership/location changed; refusing irreversible purge")
+		source, err := l.verifyDeletedAccount(ctx, plan, state, softDeleted.Account)
+		if err != nil {
+			return err
+		}
+		state.Sources[strings.ToLower(state.Foundry.Spec.AccountID)] = source
+		if err := l.journal.Save(ctx, *state); err != nil {
+			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return err
