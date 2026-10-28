@@ -403,7 +403,8 @@ func (l *ownedLifecycle) observeGrant(
 func (l *ownedLifecycle) deploymentGrantTargets(
 	ctx context.Context, plan Plan, foundry *FoundryState, succeeded ...map[string]bool,
 ) (map[string]bool, error) {
-	// Optional collectors record succeeded grants and path-bound child/network Creates, respectively.
+	// Optional collectors record succeeded grants, path-bound successful resource Creates,
+	// and failed private-endpoint Create candidates. Candidates still need birth/topology proof.
 	targets := map[string]bool{}
 	visited := map[string]bool{}
 	var evidence *AttemptEvidence
@@ -433,6 +434,18 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 			bound    bool
 		}
 		collect := func(operations []*armresources.DeploymentOperation) error {
+			nested, err := nestedCreateOperations(operations, deploymentID)
+			if err != nil {
+				return err
+			}
+			for _, operation := range nested {
+				children = append(children, struct {
+					id       string
+					rejected bool
+					bound    bool
+				}{authString(operation.Properties.TargetResource.ID),
+					failedAttempt && nestedValidationRejected(operation, deploymentID), boundPath})
+			}
 			for _, operation := range operations {
 				if operation == nil || operation.Properties == nil || operation.Properties.TargetResource == nil {
 					continue
@@ -453,15 +466,8 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 						succeeded[0][strings.ToLower(targetID)] = true
 					}
 				case strings.EqualFold(authString(target.ResourceType), "Microsoft.Resources/deployments"):
-					if !exactCreateOperation(operation, deploymentID) {
-						return fmt.Errorf("nested deployment source lacks an exact parent Create operation")
-					}
-					children = append(children, struct {
-						id       string
-						rejected bool
-						bound    bool
-					}{targetID, failedAttempt && nestedValidationRejected(operation, deploymentID),
-						boundPath && succeededCreateOperation(operation, deploymentID)})
+					// Module Reads only retrieve outputs; the exact paired Create supplies the graph edge.
+					continue
 				case strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/projects"),
 					strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/deployments"),
 					strings.EqualFold(authString(target.ResourceType), "Microsoft.CognitiveServices/accounts/projects/connections"),
@@ -473,6 +479,12 @@ func (l *ownedLifecycle) deploymentGrantTargets(
 					if len(succeeded) > 1 && succeeded[1] != nil &&
 						boundPath && succeededCreateOperation(operation, deploymentID) {
 						succeeded[1][strings.ToLower(targetID)] = true
+					}
+					if len(succeeded) > 2 && succeeded[2] != nil && boundPath && failedAttempt &&
+						strings.EqualFold(authString(target.ResourceType), privateEndpointType) &&
+						exactCreateOperation(operation, deploymentID) &&
+						authString(operation.Properties.ProvisioningState) == "Failed" {
+						succeeded[2][strings.ToLower(targetID)] = true
 					}
 				}
 			}
@@ -518,6 +530,12 @@ func succeededCreateOperation(operation *armresources.DeploymentOperation, deplo
 }
 
 func exactCreateOperation(operation *armresources.DeploymentOperation, deploymentID string) bool {
+	return exactDeploymentOperation(operation, deploymentID, armresources.ProvisioningOperationCreate)
+}
+
+func exactDeploymentOperation(
+	operation *armresources.DeploymentOperation, deploymentID string, kind armresources.ProvisioningOperation,
+) bool {
 	if operation == nil || operation.Properties == nil {
 		return false
 	}
@@ -527,7 +545,7 @@ func exactCreateOperation(operation *armresources.DeploymentOperation, deploymen
 		strings.EqualFold(id.Parent.String(), deploymentID) &&
 		operation.Properties != nil &&
 		operation.Properties.ProvisioningOperation != nil &&
-		*operation.Properties.ProvisioningOperation == armresources.ProvisioningOperationCreate
+		*operation.Properties.ProvisioningOperation == kind
 }
 
 func nestedValidationRejected(operation *armresources.DeploymentOperation, deploymentID string) bool {

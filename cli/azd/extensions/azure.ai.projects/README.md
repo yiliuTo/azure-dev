@@ -527,6 +527,10 @@ successful Create evidence and the current resource's authoritative creation
 time within that deployment generation. Grants additionally bind their creation
 time, scope, principal, role and deployment-reference description. Matching tags
 do not permit adoption of a pre-existing or replaced resource.
+A failed private endpoint can be recognized only with its exact failed Create,
+recorded initial absence, authoritative birth within the verified generation,
+and matching account, subnet and network-interface topology. This exception does
+not establish ownership of other failed resources or grants.
 
 The root uses the provider's stable subscription deployment name. Before another
 submission can overwrite that record, the previous terminal generation is
@@ -537,8 +541,11 @@ reconstructed from subsequently overwritten nested deployment records. Active,
 unknown or unverifiable generations block retries. Explicit resource-group and
 location parameters must agree with the environment's resolved target.
 Observation, retry and teardown require an exact succeeded Project Create reached
-through succeeded Create operations in the verified deployment graph, plus the
-verified exact parent account. The project's ID, location, succeeded state,
+through exact Create operations in the verified deployment graph, plus the
+verified exact parent account. Each nested deployment's terminal state must match
+its parent operation; a failed nested deployment can still prove its successful
+descendants. Duplicate Read operations require a matching Create in that same
+parent generation. The project's ID, location, succeeded state,
 system-assigned identity and tenant must match; a changed recorded principal
 still blocks recovery and cascading deletion.
 When Connection GET masks managed-identity credentials, registry preparation

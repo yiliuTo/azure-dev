@@ -200,6 +200,10 @@ func (l *ownedLifecycle) verifyResourceSources(ctx context.Context, plan Plan, s
 					output = true
 				}
 			}
+			if !output {
+				window, ok := partialResourceCreate(attempt, resource.ID, false)
+				output = ok && window.contains(*current.CreatedTime)
+			}
 			if output && !current.CreatedTime.Before(start) && !current.CreatedTime.After(end) {
 				proven = true
 				break

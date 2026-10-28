@@ -43,6 +43,7 @@ type FoundryNetworkResource struct {
 type networkBirthWindow struct {
 	start, end time.Time
 	outputs    map[string]bool
+	partial    map[string]partialCreateWindow
 	network    FoundryNetworkState
 }
 
@@ -129,6 +130,23 @@ func (l *ownedLifecycle) networkBirthWindows(
 			return nil, err
 		}
 		if window.network.VNetID != "" {
+			created, failedEndpoints := map[string]bool{}, map[string]bool{}
+			single := *state.Foundry
+			single.Attempts = []FoundryAttempt{attempt}
+			if _, err := l.deploymentGrantTargets(ctx, plan, &single, nil, created, failedEndpoints); err != nil {
+				return nil, err
+			}
+			window.partial = map[string]partialCreateWindow{}
+			for id := range created {
+				if birth, ok := partialResourceCreate(attempt, id, false); ok {
+					window.partial[id] = birth
+				}
+			}
+			for id := range failedEndpoints {
+				if birth, ok := partialResourceCreate(attempt, id, true); ok {
+					window.partial[id] = birth
+				}
+			}
 			windows = append(windows, window)
 		}
 	}
@@ -177,7 +195,13 @@ func proveNetworkBirth(
 	}
 	bound := false
 	for _, window := range windows {
-		if !window.outputs[strings.ToLower(binding)] || (!inferred && !window.outputs[strings.ToLower(id)]) {
+		output := window.outputs[strings.ToLower(binding)] && (inferred || window.outputs[strings.ToLower(id)])
+		if !output {
+			birth, exists := window.partial[strings.ToLower(binding)]
+			_, target := window.partial[strings.ToLower(id)]
+			output = exists && (inferred || target) && birth.contains(*actual.CreatedTime)
+		}
+		if !output {
 			continue
 		}
 		bound = true
@@ -192,9 +216,12 @@ func proveNetworkBirth(
 }
 
 func (l *ownedLifecycle) inventoryFoundryNetwork(ctx context.Context, plan Plan, state *PreparationState) error {
-	created := map[string]bool{}
-	if _, err := l.deploymentGrantTargets(ctx, plan, state.Foundry, nil, created); err != nil {
+	created, failedEndpoints := map[string]bool{}, map[string]bool{}
+	if _, err := l.deploymentGrantTargets(ctx, plan, state.Foundry, nil, created, failedEndpoints); err != nil {
 		return err
+	}
+	for id := range failedEndpoints {
+		created[id] = true
 	}
 	targets := map[string]string{}
 	for id := range created {

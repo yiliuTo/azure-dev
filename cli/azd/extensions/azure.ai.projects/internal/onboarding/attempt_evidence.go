@@ -58,10 +58,21 @@ func validateAttemptEvidence(attempt FoundryAttempt) error {
 	if e.Deployments == nil {
 		return fmt.Errorf("archived nested deployment generation evidence is missing")
 	}
-	for id := range e.Operations {
+	for id, operations := range e.Operations {
 		if !strings.EqualFold(id, attempt.ID) {
 			if _, exists := e.Deployments[id]; !exists {
 				return fmt.Errorf("archived operation source has no exact nested generation evidence")
+			}
+		}
+		children, err := nestedCreateOperations(operations, id)
+		if err != nil {
+			return err
+		}
+		for _, operation := range children {
+			properties, ok := e.Deployments[strings.ToLower(authString(operation.Properties.TargetResource.ID))]
+			if !ok || properties != nil && (properties.ProvisioningState == nil ||
+				string(*properties.ProvisioningState) != authString(operation.Properties.ProvisioningState)) {
+				return fmt.Errorf("nested deployment generation differs from its exact parent Create result")
 			}
 		}
 	}
@@ -150,30 +161,31 @@ func (l *ownedLifecycle) captureAttemptEvidence(
 			}
 			e.Operations[key] = append(e.Operations[key], page.Value...)
 		}
-		for _, operation := range e.Operations[key] {
-			if operation == nil || operation.Properties == nil || operation.Properties.TargetResource == nil {
-				continue
+		children, err := nestedCreateOperations(e.Operations[key], deploymentID)
+		if err != nil {
+			return err
+		}
+		for _, operation := range children {
+			target := authString(operation.Properties.TargetResource.ID)
+			if err := read(target, attempt.ProvisioningState == "Failed" &&
+				nestedValidationRejected(operation, deploymentID)); err != nil {
+				return err
 			}
-			if before != nil {
-				after, err := l.readNestedGeneration(ctx, deploymentID, attempt.CorrelationID)
-				if err != nil {
-					return err
-				}
-				old, _ := json.Marshal(before)
-				actual, _ := json.Marshal(after)
-				if string(old) != string(actual) {
-					return fmt.Errorf("nested deployment generation changed during provenance capture")
-				}
+			if properties := e.Deployments[strings.ToLower(target)]; properties != nil &&
+				(properties.ProvisioningState == nil ||
+					string(*properties.ProvisioningState) != authString(operation.Properties.ProvisioningState)) {
+				return fmt.Errorf("nested deployment generation differs from its exact parent Create result")
 			}
-			target := operation.Properties.TargetResource
-			if strings.EqualFold(authString(target.ResourceType), "Microsoft.Resources/deployments") {
-				if !exactCreateOperation(operation, deploymentID) {
-					return fmt.Errorf("nested deployment source lacks an exact parent Create operation")
-				}
-				if err := read(authString(target.ID), attempt.ProvisioningState == "Failed" &&
-					nestedValidationRejected(operation, deploymentID)); err != nil {
-					return err
-				}
+		}
+		if before != nil {
+			after, err := l.readNestedGeneration(ctx, deploymentID, attempt.CorrelationID)
+			if err != nil {
+				return err
+			}
+			old, _ := json.Marshal(before)
+			actual, _ := json.Marshal(after)
+			if string(old) != string(actual) {
+				return fmt.Errorf("nested deployment generation changed during provenance capture")
 			}
 		}
 		return nil

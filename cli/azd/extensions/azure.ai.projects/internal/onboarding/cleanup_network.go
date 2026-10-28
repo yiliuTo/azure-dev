@@ -172,14 +172,15 @@ func (l *ownedLifecycle) observeNetworkTarget(
 	if recorded && !record.CreatedTime.IsZero() && !record.CreatedTime.Equal(*actual.CreatedTime) {
 		return fmt.Errorf("network resource %s creation identity changed; refusing deletion", id)
 	}
-	if err := verifyNetworkResource(state, kind, found); err != nil {
+	failedEndpoint := kind == privateEndpointType && failedEndpointBirth(state, id, *actual.CreatedTime)
+	if err := verifyNetworkResource(state, kind, found, failedEndpoint); err != nil {
 		return fmt.Errorf("network resource %s binding is unverified: %w", id, err)
 	}
 	network.Resources[id] = FoundryNetworkResource{
 		ID: id, Type: kind, BirthResourceID: authString(actual.ID), CreatedTime: *actual.CreatedTime,
 	}
 	if kind == privateEndpointType {
-		p, err := decodeNetworkProperties(found)
+		p, err := decodeNetworkProperties(found, failedEndpoint)
 		if err != nil {
 			return err
 		}
@@ -192,7 +193,9 @@ func (l *ownedLifecycle) observeNetworkTarget(
 	return nil
 }
 
-func decodeNetworkProperties(found armresources.GenericResource) (cleanupNetworkProperties, error) {
+func decodeNetworkProperties(
+	found armresources.GenericResource, allowFailedEndpoint ...bool,
+) (cleanupNetworkProperties, error) {
 	var result cleanupNetworkProperties
 	raw, err := json.Marshal(found.Properties)
 	if err == nil {
@@ -201,14 +204,17 @@ func decodeNetworkProperties(found armresources.GenericResource) (cleanupNetwork
 	if err != nil {
 		return result, fmt.Errorf("decode network resource evidence: %w", err)
 	}
-	if result.ProvisioningState != "Succeeded" && result.ProvisioningState != "Deleting" {
+	if result.ProvisioningState != "Succeeded" && result.ProvisioningState != "Deleting" &&
+		!(result.ProvisioningState == "Failed" && len(allowFailedEndpoint) > 0 && allowFailedEndpoint[0]) {
 		return result, fmt.Errorf("network provisioning state is unverified")
 	}
 	return result, nil
 }
 
-func verifyNetworkResource(state *PreparationState, kind string, found armresources.GenericResource) error {
-	p, err := decodeNetworkProperties(found)
+func verifyNetworkResource(
+	state *PreparationState, kind string, found armresources.GenericResource, allowFailedEndpoint bool,
+) error {
+	p, err := decodeNetworkProperties(found, kind == privateEndpointType && allowFailedEndpoint)
 	if err != nil {
 		return err
 	}
@@ -303,7 +309,7 @@ func (l *ownedLifecycle) cleanupFoundryNetwork(
 				if kind == privateNICType {
 					return fmt.Errorf("RP-owned private endpoint NIC deletion is not confirmed; no direct NIC delete is permitted")
 				}
-				if err := verifyNetworkResource(state, kind, observed); err != nil {
+				if err := verifyNetworkResource(state, kind, observed, recordedFailedEndpoint(state, id)); err != nil {
 					return err
 				}
 				if kind == privateZoneType {

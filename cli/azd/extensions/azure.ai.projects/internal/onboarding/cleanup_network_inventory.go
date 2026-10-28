@@ -106,7 +106,7 @@ func (l *ownedLifecycle) verifyNetworkZoneChildren(
 	var zoneAddresses []string
 	var peGUID string
 	if peExists {
-		p, err := decodeNetworkProperties(pe)
+		p, err := decodeNetworkProperties(pe, recordedFailedEndpoint(state, networkPrivateEndpointID(state)))
 		if err != nil {
 			return err
 		}
