@@ -57,6 +57,51 @@ func TestHostingNetworkSelectionEvaluatesGeneratedARM(t *testing.T) {
 	}
 }
 
+func TestAccountHostingPropertiesEvaluateGeneratedARM(t *testing.T) {
+	bicep := lookupBicep(t)
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default account", true: "BYO account"}[enabled], func(t *testing.T) {
+			input := hostingContractInput("")
+			if !enabled {
+				input.RawAzureYAML = []byte("services:\n  project:\n    host: azure.ai.project\n")
+			}
+			result, err := Synthesize(input)
+			require.NoError(t, err)
+			var hosting map[string]any
+			if enabled {
+				hosting = hostingContractParameters(t, result)
+				for field, resource := range map[string]string{
+					"hostingManagementIdentityResourceId": "Microsoft.ManagedIdentity/userAssignedIdentities/hosting",
+					"storageAccountResourceId":            "Microsoft.Storage/storageAccounts/hostingstorage",
+					"workloadIdentityResourceId":          "Microsoft.ManagedIdentity/userAssignedIdentities/workload",
+				} {
+					hosting[field] = "/subscriptions/00000000-0000-0000-0000-000000000001/" +
+						"resourceGroups/test/providers/" + resource
+				}
+				result.Parameters["agentHosting"] = hosting
+			}
+			properties := evaluateHostingARM(t, bicep, result)
+			assert.Equal(t, true, properties["allowProjectManagement"])
+			if !enabled {
+				assert.NotContains(t, properties, "agentHostingConfigurations")
+				return
+			}
+			configurations, ok := properties["agentHostingConfigurations"].([]any)
+			require.True(t, ok)
+			require.Len(t, configurations, 1)
+			configuration, ok := configurations[0].(map[string]any)
+			require.True(t, ok)
+			expected := map[string]any{}
+			for key, value := range hosting {
+				if key != "enabled" {
+					expected[key] = value
+				}
+			}
+			assert.Equal(t, expected, configuration)
+		})
+	}
+}
+
 func TestHostingNetworkSelectionEvaluatesTerraformProperties(t *testing.T) {
 	terraform, err := exec.LookPath("terraform")
 	if err != nil {
@@ -130,7 +175,8 @@ func evaluateHostingARM(t *testing.T, bicep string, result *Result) map[string]a
 		Parameters  map[string]json.RawMessage
 		Variables   map[string]json.RawMessage
 		Resources   map[string]struct {
-			Properties map[string]json.RawMessage
+			APIVersion string `json:"apiVersion"`
+			Properties json.RawMessage
 		}
 	}
 	var source struct {
@@ -147,12 +193,14 @@ func evaluateHostingARM(t *testing.T, bicep string, result *Result) map[string]a
 	require.NoError(t, json.Unmarshal(source.Resources["resources"].Properties.Template, &module))
 	account := module.Resources["foundryAccount"].Properties
 	require.NotEmpty(t, account)
+	require.Equal(t, "2026-07-15-preview", module.Resources["foundryAccount"].APIVersion)
 	parameters := map[string]json.RawMessage{}
 	values := map[string]any{}
 	var parameterFile strings.Builder
 	parameterFile.WriteString("using './projection.json'\n")
 	for _, name := range []string{
 		"enableNetworkIsolation", "useManagedEgress", "vnetId", "agentSubnetName", "agentHosting",
+		"location", "resourceTokenSalt",
 	} {
 		require.Contains(t, module.Parameters, name)
 		parameters[name] = module.Parameters[name]
@@ -161,27 +209,12 @@ func evaluateHostingARM(t *testing.T, bicep string, result *Result) map[string]a
 			parameterFile.WriteString("param " + name + " = loadJsonContent('./values.json')." + name + "\n")
 		}
 	}
-	variables := map[string]json.RawMessage{}
-	for _, name := range []string{
-		"useByoNetwork", "useManagedNetwork", "agentSubnetArmId", "agentNetworkInjections",
-	} {
-		require.Contains(t, module.Variables, name)
-		variables[name] = module.Variables[name]
-	}
-	outputs := map[string]any{}
-	for _, name := range []string{"networkInjections", "agentHostingConfigurations"} {
-		require.Contains(t, account, name)
-		var expression string
-		require.NoError(t, json.Unmarshal(account[name], &expression))
-		outputs[name] = map[string]any{
-			"type": "object", "value": "[createObject('value'," + expression[1:len(expression)-1] + ")]",
-		}
-	}
+	outputs := map[string]any{"properties": map[string]any{"type": "object", "value": account}}
 	projection := map[string]any{
 		"$schema":        "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
 		"contentVersion": "1.0.0.0", "parameters": parameters,
 		"languageVersion": "2.0", "definitions": module.Definitions,
-		"variables": variables, "resources": map[string]any{}, "outputs": outputs,
+		"variables": module.Variables, "resources": map[string]any{}, "outputs": outputs,
 	}
 	dir := t.TempDir()
 	for name, value := range map[string]any{"projection.json": projection, "values.json": values} {
@@ -207,8 +240,6 @@ func evaluateHostingARM(t *testing.T, bicep string, result *Result) map[string]a
 	require.NoError(t, json.Unmarshal(snapshot, &evaluated))
 	require.Empty(t, evaluated.PredictedResources)
 	require.Empty(t, evaluated.Diagnostics)
-	return map[string]any{
-		"networkInjections":          evaluated.Outputs["networkInjections"]["value"],
-		"agentHostingConfigurations": evaluated.Outputs["agentHostingConfigurations"]["value"],
-	}
+	require.Contains(t, evaluated.Outputs, "properties")
+	return evaluated.Outputs["properties"]
 }

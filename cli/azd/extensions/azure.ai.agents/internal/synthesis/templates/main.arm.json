@@ -5,8 +5,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.46.1.21595",
-      "templateHash": "400837361906077555"
+      "version": "0.48.1.52935",
+      "templateHash": "15643173443773476466"
     }
   },
   "definitions": {
@@ -303,8 +303,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "11369860572098727294"
+              "version": "0.48.1.52935",
+              "templateHash": "10197734613089738656"
             }
           },
           "parameters": {
@@ -416,8 +416,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "18084625729537962669"
+                      "version": "0.48.1.52935",
+                      "templateHash": "288131888084645111"
                     }
                   },
                   "parameters": {
@@ -495,8 +495,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "1275376504687308611"
+                      "version": "0.48.1.52935",
+                      "templateHash": "2271355949592698592"
                     }
                   },
                   "parameters": {
@@ -575,8 +575,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "16586604919392971863"
+                      "version": "0.48.1.52935",
+                      "templateHash": "17743615941757546953"
                     }
                   },
                   "parameters": {
@@ -657,8 +657,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "13226235478796897884"
+                      "version": "0.48.1.52935",
+                      "templateHash": "9174526094747494968"
                     }
                   },
                   "parameters": {
@@ -817,8 +817,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "13963434369987047996"
+              "version": "0.48.1.52935",
+              "templateHash": "15658129254237411714"
             }
           },
           "definitions": {
@@ -1118,20 +1118,7 @@
               },
               "kind": "AIServices",
               "identity": "[if(parameters('agentHosting').enabled, createObject('type', 'SystemAssigned, UserAssigned', 'userAssignedIdentities', createObject(format('{0}', parameters('agentHosting').hostingManagementIdentityResourceId), createObject())), createObject('type', 'SystemAssigned'))]",
-              "properties": {
-                "allowProjectManagement": true,
-                "customSubDomainName": "[variables('foundryAccountName')]",
-                "publicNetworkAccess": "[if(variables('disablePublicDataPlaneAccess'), 'Disabled', 'Enabled')]",
-                "disableLocalAuth": true,
-                "networkAcls": {
-                  "defaultAction": "[if(variables('disablePublicDataPlaneAccess'), 'Deny', 'Allow')]",
-                  "bypass": "[if(variables('disablePublicDataPlaneAccess'), 'AzureServices', null())]",
-                  "virtualNetworkRules": [],
-                  "ipRules": []
-                },
-                "networkInjections": "[variables('agentNetworkInjections')]",
-                "agentHostingConfigurations": "[if(parameters('agentHosting').enabled, createArray(createObject('hostingType', parameters('agentHosting').hostingType, 'name', parameters('agentHosting').name, 'clusterResourceId', parameters('agentHosting').clusterResourceId, 'hostingManagementIdentityResourceId', parameters('agentHosting').hostingManagementIdentityResourceId, 'storageAccountResourceId', parameters('agentHosting').storageAccountResourceId, 'workloadIdentityResourceId', parameters('agentHosting').workloadIdentityResourceId)), null())]"
-              },
+              "properties": "[shallowMerge(createArray(createObject('allowProjectManagement', true(), 'customSubDomainName', variables('foundryAccountName'), 'publicNetworkAccess', if(variables('disablePublicDataPlaneAccess'), 'Disabled', 'Enabled'), 'disableLocalAuth', true(), 'networkAcls', createObject('defaultAction', if(variables('disablePublicDataPlaneAccess'), 'Deny', 'Allow'), 'bypass', if(variables('disablePublicDataPlaneAccess'), 'AzureServices', null()), 'virtualNetworkRules', createArray(), 'ipRules', createArray()), 'networkInjections', variables('agentNetworkInjections')), if(parameters('agentHosting').enabled, createObject('agentHostingConfigurations', createArray(createObject('hostingType', parameters('agentHosting').hostingType, 'name', parameters('agentHosting').name, 'clusterResourceId', parameters('agentHosting').clusterResourceId, 'hostingManagementIdentityResourceId', parameters('agentHosting').hostingManagementIdentityResourceId, 'storageAccountResourceId', parameters('agentHosting').storageAccountResourceId, 'workloadIdentityResourceId', parameters('agentHosting').workloadIdentityResourceId))), createObject())))]",
               "dependsOn": [
                 "network"
               ]
@@ -1189,8 +1176,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "10967961645819739964"
+                      "version": "0.48.1.52935",
+                      "templateHash": "1675403609570962535"
                     }
                   },
                   "parameters": {
@@ -1283,8 +1270,8 @@
                           "metadata": {
                             "_generator": {
                               "name": "bicep",
-                              "version": "0.46.1.21595",
-                              "templateHash": "10528013059105939935"
+                              "version": "0.48.1.52935",
+                              "templateHash": "13172875044587293551"
                             }
                           },
                           "parameters": {
@@ -1368,8 +1355,8 @@
                           "metadata": {
                             "_generator": {
                               "name": "bicep",
-                              "version": "0.46.1.21595",
-                              "templateHash": "10528013059105939935"
+                              "version": "0.48.1.52935",
+                              "templateHash": "13172875044587293551"
                             }
                           },
                           "parameters": {
@@ -1512,8 +1499,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "6998752455165744145"
+                      "version": "0.48.1.52935",
+                      "templateHash": "7474160571401566122"
                     }
                   },
                   "parameters": {
@@ -1677,8 +1664,8 @@
                           "metadata": {
                             "_generator": {
                               "name": "bicep",
-                              "version": "0.46.1.21595",
-                              "templateHash": "13226235478796897884"
+                              "version": "0.48.1.52935",
+                              "templateHash": "9174526094747494968"
                             }
                           },
                           "parameters": {
@@ -1793,8 +1780,8 @@
                   "metadata": {
                     "_generator": {
                       "name": "bicep",
-                      "version": "0.46.1.21595",
-                      "templateHash": "2415286770463307805"
+                      "version": "0.48.1.52935",
+                      "templateHash": "12830623367111962862"
                     }
                   },
                   "parameters": {

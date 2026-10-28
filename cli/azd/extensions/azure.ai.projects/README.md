@@ -249,6 +249,8 @@ services:
 ```
 
 BYO AKS requires explicit `network.agentSubnet` and `network.peSubnet`.
+When `agentHosting` is omitted, the account request omits
+`agentHostingConfigurations` entirely. BYO hosting adds exactly one configuration.
 The VNet must already exist; `vnet` is its full ARM resource ID and `name`
 is the subnet name, not a resource ID. Both descriptors must select the same
 VNet and different subnet names. Both `vnet` and `name` support azd environment

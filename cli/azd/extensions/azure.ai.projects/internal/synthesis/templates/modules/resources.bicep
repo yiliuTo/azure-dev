@@ -208,18 +208,18 @@ resource foundryAccount 'Microsoft.CognitiveServices/accounts@2026-07-15-preview
       ipRules: []
     }
     networkInjections: agentNetworkInjections
-    agentHostingConfigurations: agentHosting.enabled
-      ? [
-          {
-            hostingType: agentHosting.hostingType
-            name: agentHosting.name
-            clusterResourceId: agentHosting.clusterResourceId
-            hostingManagementIdentityResourceId: agentHosting.hostingManagementIdentityResourceId
-            storageAccountResourceId: agentHosting.storageAccountResourceId
-            workloadIdentityResourceId: agentHosting.workloadIdentityResourceId
-          }
-        ]
-      : null
+    ...(agentHosting.enabled ? {
+      agentHostingConfigurations: [
+        {
+          hostingType: agentHosting.hostingType
+          name: agentHosting.name
+          clusterResourceId: agentHosting.clusterResourceId
+          hostingManagementIdentityResourceId: agentHosting.hostingManagementIdentityResourceId
+          storageAccountResourceId: agentHosting.storageAccountResourceId
+          workloadIdentityResourceId: agentHosting.workloadIdentityResourceId
+        }
+      ]
+    } : {})
   }
 
   // The account injects into the agent subnet via a deterministic id (above),

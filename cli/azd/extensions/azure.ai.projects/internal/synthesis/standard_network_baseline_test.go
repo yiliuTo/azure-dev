@@ -39,14 +39,15 @@ func TestStandardNetworkARMContract(t *testing.T) {
 	variables := object(module["variables"])
 	assert.Equal(t, "[parameters('enableNetworkIsolation')]", variables["disablePublicDataPlaneAccess"])
 	resources := object(module["resources"])
-	account := object(object(resources["foundryAccount"])["properties"])
-	assert.Equal(t, "[variables('agentNetworkInjections')]", account["networkInjections"])
-	assert.Equal(t, "[if(variables('disablePublicDataPlaneAccess'), 'Disabled', 'Enabled')]", account["publicNetworkAccess"])
-	assert.Equal(t, map[string]any{
-		"defaultAction":       "[if(variables('disablePublicDataPlaneAccess'), 'Deny', 'Allow')]",
-		"bypass":              "[if(variables('disablePublicDataPlaneAccess'), 'AzureServices', null())]",
-		"virtualNetworkRules": []any{}, "ipRules": []any{},
-	}, account["networkAcls"])
+	account, ok := object(resources["foundryAccount"])["properties"].(string)
+	require.True(t, ok)
+	assert.Contains(t, account, "'networkInjections', variables('agentNetworkInjections')")
+	assert.Contains(t, account,
+		"'publicNetworkAccess', if(variables('disablePublicDataPlaneAccess'), 'Disabled', 'Enabled')")
+	assert.Contains(t, account, "'networkAcls', createObject("+
+		"'defaultAction', if(variables('disablePublicDataPlaneAccess'), 'Deny', 'Allow'), "+
+		"'bypass', if(variables('disablePublicDataPlaneAccess'), 'AzureServices', null()), "+
+		"'virtualNetworkRules', createArray(), 'ipRules', createArray())")
 	for _, name := range []string{"network", "privateEndpointDns"} {
 		assert.Equal(t, "[parameters('enableNetworkIsolation')]", object(resources[name])["condition"], name)
 	}
