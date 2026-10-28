@@ -137,13 +137,10 @@ func assertNetworkRejectsAgentSubnetWithIsolationMode(t *testing.T, allOf []json
 
 // TestARMTemplate_MatchesBicepBuild fails if templates/main.arm.json is stale
 // relative to main.bicep. AGENTS guidance forbids hand-editing the ARM JSON;
-// this catches a forgotten `bicep build`. Skipped when the bicep CLI is not on
-// PATH (e.g. minimal CI images) so it never produces a phantom failure.
+// this catches a forgotten `bicep build`. Skipped when no supported Bicep is
+// discovered; an invalid explicit tool override fails.
 func TestARMTemplate_MatchesBicepBuild(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("bicep CLI not found on PATH; skipping ARM drift check")
-	}
+	bicep := lookupBicep(t)
 
 	templatesDir := "templates"
 	committed, err := os.ReadFile(filepath.Join(templatesDir, "main.arm.json"))
@@ -171,12 +168,9 @@ func TestARMTemplate_MatchesBicepBuild(t *testing.T) {
 
 // TestExistingProjectARMTemplate_MatchesBicepBuild is the existing-project.bicep counterpart
 // of TestARMTemplate_MatchesBicepBuild: it catches a forgotten `bicep build` after
-// editing the existing-project template. Skipped when bicep is absent.
+// editing the existing-project template. Uses the same supported-tool requirement.
 func TestExistingProjectARMTemplate_MatchesBicepBuild(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("bicep CLI not found on PATH; skipping ARM drift check")
-	}
+	bicep := lookupBicep(t)
 
 	templatesDir := "templates"
 	committed, err := os.ReadFile(filepath.Join(templatesDir, "existing-project.arm.json"))
@@ -233,21 +227,4 @@ func stripBicepGeneratorMetadata(value any) {
 			stripBicepGeneratorMetadata(child)
 		}
 	}
-}
-
-// lookupBicep returns a usable bicep binary path, preferring PATH and falling
-// back to the az-bundled location.
-func lookupBicep() string {
-	if p, err := exec.LookPath("bicep"); err == nil {
-		return p
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, name := range []string{"bicep", "bicep.exe"} {
-			azBicep := filepath.Join(home, ".azure", "bin", name)
-			if _, err := os.Stat(azBicep); err == nil {
-				return azBicep
-			}
-		}
-	}
-	return ""
 }

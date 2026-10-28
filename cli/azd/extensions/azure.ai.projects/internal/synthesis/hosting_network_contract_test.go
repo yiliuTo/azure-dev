@@ -16,10 +16,7 @@ import (
 )
 
 func TestHostingNetworkSelectionEvaluatesGeneratedARM(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("Bicep CLI is required to evaluate generated ARM expressions")
-	}
+	bicep := lookupBicep(t)
 	const vnet = "/subscriptions/network-sub/resourceGroups/network-rg/providers/Microsoft.Network/virtualNetworks/network"
 	for _, choice := range []string{"none", "managed", "customer subnet", "created customer subnet"} {
 		t.Run(choice, func(t *testing.T) {

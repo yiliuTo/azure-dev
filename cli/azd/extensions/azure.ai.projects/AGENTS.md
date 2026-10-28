@@ -44,6 +44,8 @@ go build
 go test ./... -count=1
 ```
 
+Native Bicep synthesis tests require at least the minimum exported by the referenced azd SDK's `pkg/tools/bicep.Version`. They use `AZD_BICEP_TOOL_PATH` when set, otherwise search PATH and the Azure CLI bundled location. Missing or unsupported automatically discovered tools skip with a diagnostic; an invalid explicit override fails. These helpers never install or upgrade tools.
+
 If extension work depends on a new azd core change, plan for two PRs:
 
 1. Land the core change in `cli/azd` first.

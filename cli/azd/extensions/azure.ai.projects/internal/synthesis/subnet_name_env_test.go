@@ -93,11 +93,8 @@ func TestSubnetNameExpansionInlineAndReferencedProject(t *testing.T) {
 			assert.Equal(t, "foundry-agent-e2e", result.Parameters["agentSubnetName"])
 			assert.Equal(t, "foundry-pe-e2e", result.Parameters["peSubnetName"])
 			assert.Equal(t, vnet, result.Parameters["vnetId"])
-			bicep := lookupBicep()
 			t.Run("ARM injection", func(t *testing.T) {
-				if bicep == "" {
-					t.Skip("Bicep CLI is required for ARM network injection evaluation")
-				}
+				bicep := lookupBicep(t)
 				selection := evaluateHostingARM(t, bicep, result)
 				assert.Equal(t, []any{map[string]any{
 					"scenario": "agent", "subnetArmId": vnet + "/subnets/foundry-agent-e2e",

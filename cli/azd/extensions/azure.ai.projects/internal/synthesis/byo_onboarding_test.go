@@ -4,12 +4,14 @@
 package synthesis
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -227,10 +229,7 @@ func TestBYOOnboardingSingleARMGraph(t *testing.T) {
 }
 
 func TestBYOOnboardingEvaluatesCreateOnlyResourceConditions(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("Bicep CLI is required for offline ARM evaluation")
-	}
+	bicep := lookupBicep(t)
 	raw, err := ARMTemplate()
 	require.NoError(t, err)
 	var graph struct {
@@ -312,20 +311,36 @@ func TestBYOOnboardingEvaluatesCreateOnlyResourceConditions(t *testing.T) {
 	}
 }
 
-func TestBYOOnboardingEvaluatesTerraformGrants(t *testing.T) {
+func TestBYOOnboardingEvaluatesTerraformGrantsAndOwnership(t *testing.T) {
 	terraform, err := exec.LookPath("terraform")
 	if err != nil {
 		t.Skip("Terraform CLI is required for resource-free expression evaluation")
 	}
-	template, err := TerraformTemplatesFS().ReadFile("templates/terraform/byo-onboarding.tf")
+	onboardingSource, err := TerraformTemplatesFS().ReadFile("templates/terraform/byo-onboarding.tf")
 	require.NoError(t, err)
 	variables, err := TerraformTemplatesFS().ReadFile("templates/terraform/variables.tf")
 	require.NoError(t, err)
-	locals, _, found := strings.Cut(string(template), "\nresource ")
+	locals, _, found := strings.Cut(string(onboardingSource), "\nresource ")
 	require.True(t, found)
 	locals = strings.ReplaceAll(locals, "azapi_resource.byo_identity", "local.mock_identity")
+	outputSource, err := TerraformTemplatesFS().ReadFile("templates/terraform/outputs.tf.tmpl")
+	require.NoError(t, err)
+	outputTemplate, err := template.New("outputs.tf").Parse(string(outputSource))
+	require.NoError(t, err)
+	var rendered bytes.Buffer
+	require.NoError(t, outputTemplate.Execute(&rendered, struct{ IncludeAcr, Layer bool }{IncludeAcr: true}))
+	_, ownership, found := strings.Cut(rendered.String(), `output "AZD_BYO_AKS_OWNERSHIP" {`)
+	require.True(t, found)
+	ownership = strings.TrimPrefix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(ownership), "}")), "value = ")
+	ownership = strings.NewReplacer(
+		"azapi_resource.byo_identity", "local.mock_identity",
+		"azapi_resource.project", "local.mock_project",
+		"azapi_resource.byo_grant", "local.mock_grants",
+		"azurerm_role_assignment.foundry_acr_pull", "local.mock_project_grant",
+	).Replace(ownership)
 	for _, choice := range []string{
 		"disabled", "create", "reference ABAC", "supplied hosting", "supplied workload", "supplied both",
+		"missing owned identity",
 	} {
 		t.Run(choice, func(t *testing.T) {
 			plan := onboardingContractPlan()
@@ -371,17 +386,31 @@ func TestBYOOnboardingEvaluatesTerraformGrants(t *testing.T) {
 			for name, identity := range map[string]string{
 				"hosting": plan.HostingIdentityName, "workload": plan.WorkloadIdentityName,
 			} {
+				if name == "hosting" && plan.HostingIdentitySupplied || name == "workload" && plan.WorkloadIdentitySupplied {
+					continue
+				}
 				mockIdentity[name] = map[string]any{
 					"id": "/subscriptions/foundry-sub/resourceGroups/foundry-rg/providers/" +
 						"Microsoft.ManagedIdentity/userAssignedIdentities/" + identity,
 					"output": map[string]any{"properties": map[string]any{"principalId": name + "-principal"}},
 				}
 			}
+			if choice == "missing owned identity" {
+				delete(mockIdentity, "hosting")
+			}
 			identities, err := json.Marshal(mockIdentity)
 			require.NoError(t, err)
 			for name, data := range map[string][]byte{
 				"variables.tf": variables, "values.tfvars.json": values, "identities.json": identities,
-				"main.tf": []byte(locals + "\nlocals {\nmock_identity = jsondecode(file(\"identities.json\"))\n}\n"),
+				"main.tf": []byte(locals + `
+locals {
+  mock_identity = jsondecode(file("identities.json"))
+  registry_id = var.byo_onboarding == null ? "" : var.byo_onboarding.registryResourceId
+  project_principal_id = "project-principal"
+  mock_project = { output = { identity = { principalId = local.project_principal_id } } }
+  mock_grants = {}
+  mock_project_grant = { id = "project-grant", role_definition_id = "project-role" }
+  ownership = ` + ownership + "\n}\n"),
 			} {
 				require.NoError(t, os.WriteFile(filepath.Join(dir, name), data, 0o600))
 			}
@@ -390,15 +419,24 @@ func TestBYOOnboardingEvaluatesTerraformGrants(t *testing.T) {
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "TF_IN_AUTOMATION=1", "CHECKPOINT_DISABLE=1", "TF_CLI_ARGS=",
 				"TF_CLI_ARGS_console=", "TF_DATA_DIR="+filepath.Join(dir, ".terraform"))
-			cmd.Stdin = strings.NewReader("jsonencode(local.byo_grants)\n")
+			cmd.Stdin = strings.NewReader("jsonencode({ grants = local.byo_grants, ownership = local.ownership })\n")
 			out, err := cmd.CombinedOutput()
+			if choice == "missing owned identity" {
+				assert.Contains(t, string(out), "Invalid index")
+				return
+			}
 			require.NoError(t, err, "%s", out)
 			var encoded string
-			require.NoError(t, json.Unmarshal(out, &encoded))
-			var grants map[string]map[string]string
-			require.NoError(t, json.Unmarshal([]byte(encoded), &grants))
+			require.NoError(t, json.Unmarshal(out, &encoded), "%s", out)
+			var evaluated struct {
+				Grants    map[string]map[string]string
+				Ownership map[string]any
+			}
+			require.NoError(t, json.Unmarshal([]byte(encoded), &evaluated))
+			grants := evaluated.Grants
 			require.Len(t, grants, expectedGrants)
 			if expectedGrants == 0 {
+				assert.Nil(t, evaluated.Ownership)
 				return
 			}
 			hostingPrincipal, workloadPrincipal := "hosting-principal", "workload-principal"
@@ -408,6 +446,12 @@ func TestBYOOnboardingEvaluatesTerraformGrants(t *testing.T) {
 			if plan.WorkloadIdentitySupplied {
 				workloadPrincipal = plan.WorkloadPrincipalID
 			}
+			assert.Equal(t, plan.DeploymentID, evaluated.Ownership["deploymentId"])
+			assert.Equal(t, plan.HostingIdentityResourceID, evaluated.Ownership["hostingIdentityResourceId"])
+			assert.Equal(t, plan.WorkloadIdentityResourceID, evaluated.Ownership["workloadIdentityResourceId"])
+			assert.Equal(t, hostingPrincipal, evaluated.Ownership["hostingPrincipalId"])
+			assert.Equal(t, workloadPrincipal, evaluated.Ownership["workloadPrincipalId"])
+			assert.Equal(t, "project-principal", evaluated.Ownership["projectPrincipalId"])
 			if plan.CreateClusterGrants {
 				assert.Equal(t, plan.ClusterResourceID, grants["cluster_reader"]["scope"])
 				assert.Equal(t, hostingPrincipal, grants["cluster_extension"]["principal"])
@@ -436,10 +480,7 @@ func TestBYOOnboardingEvaluatesTerraformGrants(t *testing.T) {
 }
 
 func TestBYOOnboardingEvaluatesDeterministicHostingIDs(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("Bicep CLI is required for resource-free ARM evaluation")
-	}
+	bicep := lookupBicep(t)
 	raw, err := ARMTemplate()
 	require.NoError(t, err)
 	var graph map[string]json.RawMessage

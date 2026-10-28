@@ -73,10 +73,7 @@ func TestOptionalIdentityRejectsExplicitEmptyNullOrInvalidValues(t *testing.T) {
 }
 
 func TestCompiledARMIdentityCreationAndGrantSelection(t *testing.T) {
-	bicep := lookupBicep()
-	if bicep == "" {
-		t.Skip("Bicep CLI is required for offline identity resource evaluation")
-	}
+	bicep := lookupBicep(t)
 	raw, err := ARMTemplate()
 	require.NoError(t, err)
 	var graph struct {

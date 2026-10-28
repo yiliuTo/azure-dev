@@ -53,8 +53,8 @@ output "AZD_BYO_AKS_OWNERSHIP" {
     registryResourceId = var.byo_onboarding.registryResourceId
     ownedStorage = !var.byo_onboarding.storageSupplied
     ownedRegistry = !var.byo_onboarding.registrySupplied
-    hostingPrincipalId = azapi_resource.byo_identity["hosting"].output.properties.principalId
-    workloadPrincipalId = azapi_resource.byo_identity["workload"].output.properties.principalId
+    hostingPrincipalId = local.byo_hosting_principal
+    workloadPrincipalId = local.byo_workload_principal
     kubeletPrincipalId = var.byo_onboarding.kubeletObjectId
     projectPrincipalId = azapi_resource.project.output.identity.principalId
     roleAssignments = concat([for key, grant in azapi_resource.byo_grant : {
