@@ -67,22 +67,19 @@ func (a *scopedAuthorizer) suppliedIdentityChecks(ctx context.Context, plan Plan
 func (a *scopedAuthorizer) identityGrantAllows(
 	ctx context.Context, subscription string, grant grantRequest,
 ) (Status, string, error) {
-	roleID, err := resolveGrantRole(ctx, a.credential, a.options, subscription, grant)
+	reads := a.evidence()
+	roleID, err := reads.resolveGrantRole(ctx, subscription, grant)
 	if err != nil {
 		return Unverified, "required role definition is unavailable", err
 	}
-	definitions, err := armauthorization.NewRoleDefinitionsClient(a.credential, a.options)
-	if err != nil {
-		return Unverified, "role definition client is unavailable", err
-	}
-	required, err := definitions.GetByID(ctx, roleID, nil)
+	required, err := reads.roleDefinition(ctx, roleID)
 	if err != nil {
 		return Unverified, "required role definition cannot be read", err
 	}
 	if required.Properties == nil || len(required.Properties.Permissions) == 0 {
 		return Unverified, "required role permission evidence is missing", nil
 	}
-	assignments, err := applicableAssignments(ctx, a.credential, a.options, grant.scope)
+	assignments, err := reads.filteredAssignments(ctx, grant.scope, "atScope()")
 	if err != nil {
 		return Unverified, "supplied identity role assignments cannot be read", err
 	}
@@ -111,7 +108,7 @@ func (a *scopedAuthorizer) identityGrantAllows(
 		}
 		role := required.RoleDefinition
 		if !strings.EqualFold(*p.RoleDefinitionID, roleID) {
-			result, readErr := definitions.GetByID(ctx, *p.RoleDefinitionID, nil)
+			result, readErr := reads.roleDefinition(ctx, *p.RoleDefinitionID)
 			if readErr != nil {
 				return Unverified, "supplied identity role definition cannot be read", readErr
 			}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -20,6 +21,7 @@ import (
 )
 
 type storageNetworkContract struct {
+	mu      sync.Mutex
 	base    *networkARMContract
 	account *armstorage.Account
 	bodies  map[string]any
@@ -45,7 +47,9 @@ func (f *storageNetworkContract) checker() *sdkResourceChecker {
 	return &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(contractARMOptions(
 		func(r *http.Request) (*http.Response, error) {
 			require.Equal(f.base.t, http.MethodGet, r.Method)
+			f.mu.Lock()
 			f.reads = append(f.reads, r.URL.Path)
+			f.mu.Unlock()
 			if status, ok := f.errors[r.URL.Path]; ok {
 				code := "AuthorizationFailed"
 				if status == 404 {
@@ -217,7 +221,8 @@ func TestStoragePublicBaselineAndSkippedTopologies(t *testing.T) {
 			var report Report
 			pipeline := Pipeline{
 				Resources: contractResources(func(ctx context.Context, plan Plan) (Facts, Report, error) {
-					report = checker.networkChecks(ctx, plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.account)
+					report = checker.networkChecks(ctx, plan, &f.base.fixture.Cluster,
+						f.base.fixture.Pools, f.base.fixture.SKUs, f.account)
 					return Facts{}, report, report.Err()
 				}),
 				Access: contractAccess(func(context.Context, Plan, Facts) (Report, error) { return nil, nil }),
@@ -252,7 +257,7 @@ func TestStorageSkippedNetworkReadFailuresDoNotBlock(t *testing.T) {
 				}[resource]
 				f.errors[path] = status
 				report := f.checker().networkChecks(
-					t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.account)
+					t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.base.fixture.SKUs, f.account)
 				require.NoError(t, report.Err())
 				check := resourceRuleContractCheck(t, report, "S03")
 				assert.Equal(t, NotApplicable, check.Status)
@@ -395,7 +400,7 @@ func TestStoragePublicOnlyNeedsNoAgentPool(t *testing.T) {
 				}
 				expected = NotApplicable
 			}
-			report := f.checker().networkChecks(t.Context(), f.base.plan, nil, nil, f.account)
+			report := f.checker().networkChecks(t.Context(), f.base.plan, nil, nil, nil, f.account)
 			require.NoError(t, report.Err())
 			check := resourceRuleContractCheck(t, report, "S03")
 			assert.Equal(t, expected, check.Status)
@@ -422,7 +427,7 @@ func TestStorageSkipDoesNotSkipBasicSubnetN02(t *testing.T) {
 		}},
 	}}
 	report := f.checker().networkChecks(
-		t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.account)
+		t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.base.fixture.SKUs, f.account)
 	check := resourceRuleContractCheck(t, report, "S03")
 	assert.Equal(t, NotApplicable, check.Status)
 	assert.False(t, check.Mandatory)

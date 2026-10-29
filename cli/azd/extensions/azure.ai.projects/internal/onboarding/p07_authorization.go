@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -19,20 +20,25 @@ const repositoryReadAction = "Microsoft.ContainerRegistry/registries/repositorie
 
 var operatorObjectIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$`)
 
-func applicableAssignments(
-	ctx context.Context, credential azcore.TokenCredential, options *arm.ClientOptions, scope string,
+func (e *authorizationEvidence) filteredAssignments(
+	ctx context.Context, scope, filter string,
 ) ([]*armauthorization.RoleAssignment, error) {
-	return filteredAssignments(ctx, credential, options, scope, "atScope()")
+	return e.assignments.get(strings.ToLower(scope)+"|"+filter, func() ([]*armauthorization.RoleAssignment, error) {
+		return e.readAssignments(ctx, scope, filter)
+	})
 }
 
-func filteredAssignments(
-	ctx context.Context, credential azcore.TokenCredential, options *arm.ClientOptions, scope, filter string,
+func (e *authorizationEvidence) readAssignments(
+	ctx context.Context, scope, filter string,
 ) ([]*armauthorization.RoleAssignment, error) {
 	id, err := arm.ParseResourceID(scope)
 	if err != nil || id.SubscriptionID == "" {
 		return nil, fmt.Errorf("authorization requires a complete subscription scope: %s", scope)
 	}
-	client, err := armauthorization.NewRoleAssignmentsClient(id.SubscriptionID, credential, options)
+	client, err := e.assignmentClients.get(strings.ToLower(id.SubscriptionID),
+		func() (*armauthorization.RoleAssignmentsClient, error) {
+			return armauthorization.NewRoleAssignmentsClient(id.SubscriptionID, e.credential, e.options)
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -49,9 +55,7 @@ func filteredAssignments(
 	return assignments, nil
 }
 
-func pullRoleAllows(
-	ctx context.Context, credential azcore.TokenCredential, options *arm.ClientOptions, roleID string, abac bool,
-) (bool, error) {
+func (e *authorizationEvidence) pullRoleAllows(ctx context.Context, roleID string, abac bool) (bool, error) {
 	id, err := arm.ParseResourceID(roleID)
 	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Authorization/roleDefinitions") {
 		return false, fmt.Errorf("kubelet assignment has an invalid role-definition ID")
@@ -60,11 +64,7 @@ func pullRoleAllows(
 		!abac && strings.EqualFold(id.Name, "8311e382-0749-4cb8-b61a-304f252e45ec") { // AcrPush includes pull.
 		return true, nil
 	}
-	client, err := armauthorization.NewRoleDefinitionsClient(credential, options)
-	if err != nil {
-		return false, err
-	}
-	role, err := client.GetByID(ctx, roleID, nil)
+	role, err := e.roleDefinition(ctx, roleID)
 	if err != nil {
 		return false, fmt.Errorf("read kubelet role definition: %w", err)
 	}
@@ -102,10 +102,14 @@ func existingKubeletPullGrant(
 	ctx context.Context, credential azcore.TokenCredential, options *arm.ClientOptions,
 	plan Plan, facts Facts,
 ) (string, error) {
+	return newAuthorizationEvidence(credential, options).existingKubeletPullGrant(ctx, plan, facts)
+}
+
+func (e *authorizationEvidence) existingKubeletPullGrant(ctx context.Context, plan Plan, facts Facts) (string, error) {
 	if facts.KubeletObjectID == "" {
 		return "", fmt.Errorf("AKS kubelet object ID is unavailable")
 	}
-	assignments, err := applicableAssignments(ctx, credential, options, plan.Registry.ID)
+	assignments, err := e.filteredAssignments(ctx, plan.Registry.ID, "atScope()")
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +135,7 @@ func existingKubeletPullGrant(
 		if !strings.EqualFold(parsed.Parent.String(), *p.Scope) {
 			return "", fmt.Errorf("kubelet assignment ID and scope do not match")
 		}
-		allowed, err := pullRoleAllows(ctx, credential, options, *p.RoleDefinitionID, facts.RegistryABAC)
+		allowed, err := e.pullRoleAllows(ctx, *p.RoleDefinitionID, facts.RegistryABAC)
 		if err != nil {
 			return "", err
 		}
@@ -174,7 +178,8 @@ func operatorAssignmentApplies(assignment *armauthorization.RoleAssignment, scop
 func (a *scopedAuthorizer) basicAction(
 	ctx context.Context, scope string, caller callerIdentity, action string, unconditionalOnly bool,
 ) (Status, string, error) {
-	assignments, err := applicableAssignments(ctx, a.credential, a.options, scope)
+	reads := a.evidence()
+	assignments, err := reads.filteredAssignments(ctx, scope, "atScope()")
 	if err != nil {
 		return Unverified, "operator role assignments could not be read", err
 	}
@@ -183,7 +188,7 @@ func (a *scopedAuthorizer) basicAction(
 		if !operatorObjectIDPattern.MatchString(caller.objectID) {
 			return Unverified, "operator object ID is invalid for ARM group-assignment evidence", nil
 		}
-		proven, err := filteredAssignments(ctx, a.credential, a.options, scope,
+		proven, err := reads.filteredAssignments(ctx, scope,
 			"assignedTo('"+caller.objectID+"')")
 		if err != nil {
 			return Unverified, "ARM operator group-assignment evidence could not be read", err
@@ -191,11 +196,7 @@ func (a *scopedAuthorizer) basicAction(
 		for _, assignment := range proven {
 			provenAssignments[assignment] = true
 		}
-		assignments = append(assignments, proven...)
-	}
-	client, err := armauthorization.NewRoleDefinitionsClient(a.credential, a.options)
-	if err != nil {
-		return Unverified, "operator role definition client unavailable", err
+		assignments = append(slices.Clone(assignments), proven...)
 	}
 	operator := "operator"
 	if unconditionalOnly {
@@ -222,7 +223,7 @@ func (a *scopedAuthorizer) basicAction(
 		if !operatorAssignmentApplies(assignment, scope) {
 			continue
 		}
-		role, err := client.GetByID(ctx, *p.RoleDefinitionID, nil)
+		role, err := reads.roleDefinition(ctx, *p.RoleDefinitionID)
 		if err != nil {
 			return Unverified, "operator role definition could not be read", err
 		}
@@ -252,7 +253,7 @@ func (a *scopedAuthorizer) checkP07(
 		return check
 	}
 	if plan.Registry.Supplied {
-		id, err := existingKubeletPullGrant(ctx, a.credential, a.options, plan, facts)
+		id, err := a.evidence().existingKubeletPullGrant(ctx, plan, facts)
 		if err != nil {
 			check.Observed, check.Cause = "existing kubelet registry authorization could not be read", err
 			return check

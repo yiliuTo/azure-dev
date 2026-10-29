@@ -22,8 +22,9 @@ import (
 )
 
 type sdkResourceChecker struct {
-	credential azcore.TokenCredential
-	options    *arm.ClientOptions
+	credential  azcore.TokenCredential
+	options     *arm.ClientOptions
+	readClients *resourceClients
 }
 
 // NewResourceChecker constructs typed, read-only ARM adapters using an already resolved user-access-tenant credential.
@@ -136,39 +137,22 @@ func (c *sdkResourceChecker) subscriptionTenants(ctx context.Context, plan Plan)
 		keys = append(keys, subscription)
 	}
 	slices.Sort(keys)
-	for _, subscription := range keys {
-		scope := "/subscriptions/" + subscription
-		request, err := runtime.NewRequest(ctx, http.MethodGet,
-			strings.TrimRight(client.Endpoint(), "/")+scope+"?api-version=2022-12-01")
-		if err != nil {
-			report = append(report, readFailure("I02", scope, "Microsoft.Resources/subscriptions/read", err))
-			continue
-		}
-		response, err := client.Pipeline().Do(request)
-		if err == nil && !runtime.HasStatusCode(response, http.StatusOK) {
-			err = runtime.NewResponseError(response)
-		}
-		if err != nil {
-			report = append(report, readFailure("I02", scope, "Microsoft.Resources/subscriptions/read", err))
-			continue
-		}
-		var result struct {
-			TenantID string `json:"tenantId"`
-		}
-		err = runtime.UnmarshalAsJSON(response, &result)
-		if err != nil {
-			report = append(report, readFailure("I02", scope, "top-level subscription tenantId", err))
-			continue
-		}
-		check := resourceCheck("I02", scope, "all referenced and target subscriptions have the same top-level tenantId")
-		if result.TenantID == "" {
-			check.Observed = "subscription response has no top-level tenantId; managedByTenants is not ownership"
-		} else {
+	checks := make(Report, len(keys))
+	tenants := make([]string, len(keys))
+	tasks := make([]func(), 0, len(keys))
+	for i, subscription := range keys {
+		tasks = append(tasks, func() {
+			tenants[i], checks[i] = readSubscriptionTenant(ctx, client, subscription)
+		})
+	}
+	parallelReads(tasks...)
+	for i, check := range checks {
+		if tenants[i] != "" {
 			if tenant == "" {
-				tenant = result.TenantID
+				tenant = tenants[i]
 			}
-			check = resourceKnown(check, true, strings.EqualFold(tenant, result.TenantID),
-				"subscription owning tenantId="+result.TenantID)
+			check = resourceKnown(check, true, strings.EqualFold(tenant, tenants[i]),
+				"subscription owning tenantId="+tenants[i])
 		}
 		report = append(report, check)
 	}
@@ -178,7 +162,38 @@ func (c *sdkResourceChecker) subscriptionTenants(ctx context.Context, plan Plan)
 	return tenant, report
 }
 
+func readSubscriptionTenant(ctx context.Context, client *arm.Client, subscription string) (string, Check) {
+	scope := "/subscriptions/" + subscription
+	request, err := runtime.NewRequest(ctx, http.MethodGet,
+		strings.TrimRight(client.Endpoint(), "/")+scope+"?api-version=2022-12-01")
+	if err != nil {
+		return "", readFailure("I02", scope, "Microsoft.Resources/subscriptions/read", err)
+	}
+	response, err := client.Pipeline().Do(request)
+	if err == nil && !runtime.HasStatusCode(response, http.StatusOK) {
+		err = runtime.NewResponseError(response)
+	}
+	if err != nil {
+		return "", readFailure("I02", scope, "Microsoft.Resources/subscriptions/read", err)
+	}
+	var result struct {
+		TenantID string `json:"tenantId"`
+	}
+	err = runtime.UnmarshalAsJSON(response, &result)
+	if err != nil {
+		return "", readFailure("I02", scope, "top-level subscription tenantId", err)
+	}
+	check := resourceCheck("I02", scope, "all referenced and target subscriptions have the same top-level tenantId")
+	if result.TenantID == "" {
+		check.Observed = "subscription response has no top-level tenantId; managedByTenants is not ownership"
+	}
+	return result.TenantID, check
+}
+
 func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Report, error) {
+	local := *c
+	local.readClients = &resourceClients{}
+	c = &local
 	tenant, report := c.subscriptionTenants(ctx, plan)
 	input := resourceCheck("I01", plan.Cluster.ID, "complete nonempty managedClusters resource ID")
 	if _, err := existingResourceID(plan.Cluster.ID, "Microsoft.ContainerService/managedClusters"); err != nil {
@@ -189,7 +204,34 @@ func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Repor
 	}
 	report = append(report, input)
 	facts := Facts{TenantID: tenant}
-	for _, item := range []struct {
+	var identities [2]Identity
+	var identityReports [2]Report
+	var cluster *armcontainerservice.ManagedCluster
+	var pools []*armcontainerservice.AgentPool
+	var skus []*armcompute.ResourceSKU
+	var clusterReport, storageReport, registryReport Report
+	var storage *armstorage.Account
+	tasks := []func(){func() {
+		cluster, pools, skus, clusterReport = c.readCluster(ctx, plan.Cluster)
+	}, func() {
+		if plan.Storage.Supplied {
+			storage, storageReport = c.readStorage(ctx, plan.Storage)
+		}
+	}, func() {
+		if plan.Registry.Supplied {
+			facts.RegistryABAC, registryReport = c.readRegistry(ctx, plan.Registry)
+		}
+	}}
+	for i, resource := range []Resource{plan.Hosting, plan.Workload} {
+		if resource.Supplied {
+			tasks = append(tasks, func() {
+				identity, check := c.readSuppliedIdentity(ctx, resource, tenant)
+				identities[i], identityReports[i] = identity, Report{check}
+			})
+		}
+	}
+	parallelReads(tasks...)
+	for i, item := range []struct {
 		resource Resource
 		identity *Identity
 	}{
@@ -198,9 +240,8 @@ func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Repor
 		if !item.resource.Supplied {
 			continue
 		}
-		identity, check := c.readSuppliedIdentity(ctx, item.resource, tenant)
-		*item.identity = identity
-		report = append(report, check)
+		*item.identity = identities[i]
+		report = append(report, identityReports[i]...)
 	}
 	planCheck := resourceCheck("I03", plan.AgentSubnet.ID, "resolved supported creation/reuse and companion topology")
 	if plan.Network != nil {
@@ -211,7 +252,6 @@ func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Repor
 			"standard network selection retained; Storage/ACR create/reuse resolved")
 	}
 	report = append(report, planCheck)
-	cluster, pools, skus, clusterReport := c.readCluster(ctx, plan.Cluster)
 	report = append(report, clusterReport...)
 	if cluster != nil {
 		kubelet, checks := aksResourceChecks(*cluster, pools, skus)
@@ -222,11 +262,8 @@ func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Repor
 			report = append(report, resourceCheck(fmt.Sprintf("A%02d", i), plan.Cluster.ID, "readable AKS metadata"))
 		}
 	}
-	var storage *armstorage.Account
 	if plan.Storage.Supplied {
-		var checks Report
-		storage, checks = c.readStorage(ctx, plan.Storage)
-		report = append(report, checks...)
+		report = append(report, storageReport...)
 		if storage != nil {
 			report = append(report, storageResourceChecks(*storage)...)
 		} else {
@@ -241,14 +278,12 @@ func (c *sdkResourceChecker) Check(ctx context.Context, plan Plan) (Facts, Repor
 		}
 	}
 	if plan.Registry.Supplied {
-		abac, checks := c.readRegistry(ctx, plan.Registry)
-		facts.RegistryABAC = abac
-		report = append(report, checks...)
+		report = append(report, registryReport...)
 	} else {
 		report = append(report, resourceResult(resourceCheck("C01", plan.Registry.Parent, "supplied ACR"),
 			NotApplicable, "registry will be created after preflight"))
 	}
-	report = append(report, c.networkChecks(ctx, plan, cluster, pools, storage)...)
+	report = append(report, c.networkChecks(ctx, plan, cluster, pools, skus, storage)...)
 	if err := ctx.Err(); err != nil {
 		return facts, report, err
 	}
@@ -276,31 +311,43 @@ func (c *sdkResourceChecker) readCluster(
 		state = resourceValue(response.Properties.ProvisioningState)
 	}
 	report := Report{resourceReadiness(resource.ID, resourceValue(response.ID), state, "managedClusters/read")}
-	poolClient, err := armcontainerservice.NewAgentPoolsClient(id.SubscriptionID, c.credential, c.options)
 	var pools []*armcontainerservice.AgentPool
-	if err == nil {
-		pager := poolClient.NewListPager(id.ResourceGroupName, id.Name, nil)
-		for pager.More() {
-			page, pageErr := pager.NextPage(ctx)
-			if pageErr != nil {
-				err = pageErr
-				break
-			}
-			pools = append(pools, page.Value...)
-		}
-	}
-	if err != nil {
+	var skus []*armcompute.ResourceSKU
+	var poolErr, skuErr error
+	parallelReads(func() {
+		pools, poolErr = c.readAgentPools(ctx, id)
+	}, func() {
+		skus, skuErr = c.readSKUs(ctx, id.SubscriptionID, resourceValue(response.Location))
+	})
+	if poolErr != nil {
 		report = append(report, readFailure("A10", resource.ID,
-			"Microsoft.ContainerService/managedClusters/agentPools/read", err))
-		// A partially enumerated pool set cannot establish the required pool configuration.
-		pools = nil
+			"Microsoft.ContainerService/managedClusters/agentPools/read", poolErr))
 	}
-	skus, skuErr := c.readSKUs(ctx, id.SubscriptionID, resourceValue(response.Location))
 	if skuErr != nil {
 		report = append(report, readFailure("A05", "/subscriptions/"+id.SubscriptionID,
 			"Microsoft.Compute/skus/read", skuErr))
 	}
 	return &response.ManagedCluster, pools, skus, report
+}
+
+func (c *sdkResourceChecker) readAgentPools(
+	ctx context.Context, id *arm.ResourceID,
+) ([]*armcontainerservice.AgentPool, error) {
+	client, err := armcontainerservice.NewAgentPoolsClient(id.SubscriptionID, c.credential, c.options)
+	if err != nil {
+		return nil, err
+	}
+	var pools []*armcontainerservice.AgentPool
+	pager := client.NewListPager(id.ResourceGroupName, id.Name, nil)
+	for pager.More() {
+		page, pageErr := pager.NextPage(ctx)
+		if pageErr != nil {
+			// Partial enumeration cannot establish the required pool configuration.
+			return nil, pageErr
+		}
+		pools = append(pools, page.Value...)
+	}
+	return pools, nil
 }
 
 func (c *sdkResourceChecker) readSKUs(
@@ -312,7 +359,7 @@ func (c *sdkResourceChecker) readSKUs(
 	}
 	filter := "location eq '" + strings.ReplaceAll(location, "'", "''") + "'"
 	pager := client.NewListPager(&armcompute.ResourceSKUsClientListOptions{Filter: &filter})
-	var result []*armcompute.ResourceSKU
+	result := make([]*armcompute.ResourceSKU, 0)
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {

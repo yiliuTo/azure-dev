@@ -20,7 +20,10 @@ func (c *sdkResourceChecker) readSuppliedIdentity(
 		check.Status, check.Observed, check.Cause = Fail, "invalid supplied identity resource ID", err
 		return Identity{}, check
 	}
-	client, err := armmsi.NewUserAssignedIdentitiesClient(id.SubscriptionID, c.credential, c.options)
+	client, err := c.clients().identities.get(strings.ToLower(id.SubscriptionID),
+		func() (*armmsi.UserAssignedIdentitiesClient, error) {
+			return armmsi.NewUserAssignedIdentitiesClient(id.SubscriptionID, c.credential, c.options)
+		})
 	if err != nil {
 		check.Cause = err
 		return Identity{}, check

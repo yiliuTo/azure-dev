@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
@@ -99,24 +100,59 @@ func delegatedSubnetCheck(
 
 func (c *sdkResourceChecker) networkChecks(
 	ctx context.Context, plan Plan, cluster *armcontainerservice.ManagedCluster,
-	pools []*armcontainerservice.AgentPool, storage *armstorage.Account,
+	pools []*armcontainerservice.AgentPool, skus []*armcompute.ResourceSKU, storage *armstorage.Account,
 ) Report {
-	var related []netip.Prefix
 	report := Report{}
 	checkSubnet := plan.AgentSubnet.ID != "" && plan.AgentSubnet.Supplied
 	var selected *armcontainerservice.AgentPool
-	if cluster != nil && checkSubnet {
+	if cluster != nil && checkSubnet && skus != nil {
 		// The SKU-aware choice is made from the same child resources as A06-A10.
-		id, err := existingResourceID(plan.Cluster.ID, "Microsoft.ContainerService/managedClusters")
-		if err == nil {
-			skus, err := c.readSKUs(ctx, id.SubscriptionID, resourceValue(cluster.Location))
-			if err == nil {
-				selected, _ = selectedAgentPool(*cluster, pools, skus)
-			}
-		}
+		// Nil SKUs mean enumeration failed; an empty successful enumeration is non-nil.
+		selected, _ = selectedAgentPool(*cluster, pools, skus)
 	}
+	var related []netip.Prefix
+	var nodeMetadataKnown bool
+	var nodeReport, parentReport, subnetReport Report
+	var parent *armnetwork.VirtualNetwork
+	var subnet *armnetwork.Subnet
+	if checkSubnet {
+		parallelReads(func() {
+			related, nodeMetadataKnown, nodeReport = c.readNodeSubnetPrefixes(ctx, plan, cluster, selected)
+		}, func() {
+			parent, parentReport = c.readParentNetwork(ctx, plan.AgentSubnet.ID)
+		}, func() {
+			subnet, subnetReport = c.readNetworkSubnet(ctx, plan.AgentSubnet.ID, "N02")
+		})
+	}
+	report = append(report, nodeReport...)
+	report = append(report, storageNetworkChecks(plan, storage)...)
+	if !checkSubnet {
+		report = append(report, resourceResult(resourceCheck("N02", plan.AgentSubnet.ID,
+			"existing standard network.agentSubnet selection"), NotApplicable,
+			"no existing customer Agent subnet selected; standard network configuration is unchanged"))
+		return report
+	}
+	report = append(report, parentReport...)
+	report = append(report, subnetReport...)
+	if subnet == nil {
+		return report
+	}
+	subnetCheck := delegatedSubnetCheck(subnet, parent, related)
+	if !nodeMetadataKnown && subnetCheck.Status != Fail {
+		subnetCheck.Status = Unverified
+		subnetCheck.Missing = "selected AKS pool Node subnet ARM CIDR metadata"
+	}
+	report = append(report, subnetCheck)
+	return report
+}
+
+func (c *sdkResourceChecker) readNodeSubnetPrefixes(
+	ctx context.Context, plan Plan, cluster *armcontainerservice.ManagedCluster, selected *armcontainerservice.AgentPool,
+) ([]netip.Prefix, bool, Report) {
+	var related []netip.Prefix
+	var report Report
 	nodeMetadataKnown := false
-	if checkSubnet && selected != nil && selected.Properties != nil {
+	if selected != nil && selected.Properties != nil {
 		subnetIDs, checks := c.nodeSubnetIDs(ctx, plan, cluster, selected)
 		report = append(report, checks...)
 		nodeMetadataKnown = len(subnetIDs) > 0
@@ -147,25 +183,5 @@ func (c *sdkResourceChecker) networkChecks(
 			}
 		}
 	}
-	report = append(report, storageNetworkChecks(plan, storage)...)
-	if !checkSubnet {
-		report = append(report, resourceResult(resourceCheck("N02", plan.AgentSubnet.ID,
-			"existing standard network.agentSubnet selection"), NotApplicable,
-			"no existing customer Agent subnet selected; standard network configuration is unchanged"))
-		return report
-	}
-	parent, checks := c.readParentNetwork(ctx, plan.AgentSubnet.ID)
-	report = append(report, checks...)
-	subnet, checks := c.readNetworkSubnet(ctx, plan.AgentSubnet.ID, "N02")
-	report = append(report, checks...)
-	if subnet == nil {
-		return report
-	}
-	subnetCheck := delegatedSubnetCheck(subnet, parent, related)
-	if !nodeMetadataKnown && subnetCheck.Status != Fail {
-		subnetCheck.Status = Unverified
-		subnetCheck.Missing = "selected AKS pool Node subnet ARM CIDR metadata"
-	}
-	report = append(report, subnetCheck)
-	return report
+	return related, nodeMetadataKnown, report
 }

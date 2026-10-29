@@ -90,8 +90,8 @@ func TestP06ScopesUseExistingResourcesAndParents(t *testing.T) {
 					}
 				}
 				assert.ElementsMatch(t, want, scopes)
-				require.Len(t, paths, 2*(len(want)+1),
-					"one assignment/definition pair per distinct P06 scope and another pair for P07")
+				require.Len(t, paths, len(want)+1,
+					"P06/P07 share one assignment list per scope and one common role definition")
 				for _, path := range paths {
 					assert.NotContains(t, path, plan.Workload.ID)
 					if !supplied {

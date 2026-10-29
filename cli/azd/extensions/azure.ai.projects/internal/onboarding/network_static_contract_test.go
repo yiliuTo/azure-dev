@@ -74,7 +74,7 @@ func TestN02OmittedSubnetDoesNotRequireLiveEvidenceOrPlan(t *testing.T) {
 		return base.Transport.Do(request)
 	})
 	checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(options)}
-	report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, nil)
+	report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, nil)
 	found := false
 	for _, check := range report {
 		switch check.ID {

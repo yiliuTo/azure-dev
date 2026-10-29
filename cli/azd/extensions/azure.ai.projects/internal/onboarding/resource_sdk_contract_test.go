@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -31,7 +33,7 @@ func TestDeferredTelemetryHasNoGateOrExclusiveNetworkReads(t *testing.T) {
 	})
 	checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(options)}
 	fixture := newResourceRuleContractFixture(t)
-	report := checker.networkChecks(t.Context(), plan, &fixture.Cluster, fixture.Pools, nil)
+	report := checker.networkChecks(t.Context(), plan, &fixture.Cluster, fixture.Pools, fixture.SKUs, nil)
 	require.NoError(t, report.Err())
 	assert.Zero(t, reads, "no S03 or N02 selection leaves no network reads for deferred telemetry")
 	for _, check := range report {
@@ -111,10 +113,13 @@ func TestResourceSDKUsesOwningTenantAcrossUniqueSubscriptions(t *testing.T) {
 			plan, err := BuildPlan(input)
 			require.NoError(t, err)
 			reads := map[string]int{}
+			var mu sync.Mutex
 			options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
 				require.Equal(t, http.MethodGet, request.Method)
 				assert.Equal(t, "2022-12-01", request.URL.Query().Get("api-version"))
+				mu.Lock()
 				reads[request.URL.Path]++
+				mu.Unlock()
 				tenant := "owner"
 				if strings.EqualFold(request.URL.Path, "/subscriptions/aks-sub") {
 					tenant = tc.otherTenant
@@ -182,7 +187,7 @@ func TestSelectedAgentSubnetHasNoI02ReadinessGate(t *testing.T) {
 				}},
 			}}
 			checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(f.options())}
-			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, nil)
+			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, nil)
 			require.NoError(t, report.Err())
 			var n02 Report
 			for _, check := range report {
@@ -204,9 +209,9 @@ func TestSelectedAgentSubnetHasNoI02ReadinessGate(t *testing.T) {
 func TestResourceSDKPreflightNeverRegistersProvidersOrReadsFutureIdentities(t *testing.T) {
 	plan, err := BuildPlan(contractPlanInput())
 	require.NoError(t, err)
-	var requests int
+	var requests atomic.Int32
 	options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
-		requests++
+		requests.Add(1)
 		assert.Equal(t, http.MethodGet, request.Method)
 		assert.NotContains(t, strings.ToLower(request.URL.Path), "/userassignedidentities/")
 		assert.NotContains(t, strings.ToLower(request.URL.Path), "/listkeys")
@@ -217,7 +222,7 @@ func TestResourceSDKPreflightNeverRegistersProvidersOrReadsFutureIdentities(t *t
 	checker := NewResourceChecker(contractCredential{}, options)
 	_, report, err := checker.Check(t.Context(), plan)
 	require.Error(t, err)
-	require.Positive(t, requests)
+	require.Positive(t, requests.Load())
 	require.Error(t, report.Err())
 	require.False(t, options.DisableRPRegistration, "the caller's client options must not be mutated")
 	var response *azcore.ResponseError
@@ -355,10 +360,13 @@ func TestSuppliedRegistryPreflightUsesSelectedARMConfiguration(t *testing.T) {
 			fixture := newResourceRuleContractFixture(t)
 			fixture.Cluster.ID = new(plan.Cluster.ID)
 			reads := map[string]int{}
+			var mu sync.Mutex
 			options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
 				require.Equal(t, http.MethodGet, request.Method)
 				path := request.URL.Path
+				mu.Lock()
 				reads[path]++
+				mu.Unlock()
 				var body any
 				switch {
 				case strings.Count(path, "/") == 2 && strings.HasPrefix(path, "/subscriptions/"):

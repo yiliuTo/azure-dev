@@ -5,6 +5,7 @@ package onboarding
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -76,15 +77,15 @@ func TestP09ComparesFinalGroupIDsAndDeduplicatesScopes(t *testing.T) {
 
 func p09ContractAuthorizer(t *testing.T, plan Plan, facts Facts, excludeScope, excludeAction string) (Report, error) {
 	t.Helper()
-	var currentScope string
 	options := contractARMOptions(func(r *http.Request) (*http.Response, error) {
 		require.Equal(t, http.MethodGet, r.Method)
 		var body string
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/roleAssignments"):
-			currentScope = strings.TrimSuffix(r.URL.Path, "/providers/Microsoft.Authorization/roleAssignments")
+			scope := strings.TrimSuffix(r.URL.Path, "/providers/Microsoft.Authorization/roleAssignments")
+			role := base64.RawURLEncoding.EncodeToString([]byte(scope))
 			body = fmt.Sprintf(`{"value":[{"properties":{"scope":%q,"principalId":"operator","principalType":"User",
-				"roleDefinitionId":"/providers/Microsoft.Authorization/roleDefinitions/custom"}}]}`, currentScope)
+				"roleDefinitionId":"/providers/Microsoft.Authorization/roleDefinitions/%s"}}]}`, scope, role)
 		case strings.Contains(r.URL.Path, "/roleDefinitions/"):
 			excluded := []string{
 				"Microsoft.CognitiveServices/accounts/read", "Microsoft.CognitiveServices/accounts/write",
@@ -92,7 +93,9 @@ func p09ContractAuthorizer(t *testing.T, plan Plan, facts Facts, excludeScope, e
 				"Microsoft.Network/privateEndpoints/*", "Microsoft.Network/privateDnsZones/*",
 				"Microsoft.Network/virtualNetworks/subnets/*", "Microsoft.CognitiveServices/accounts/managedNetworks/write",
 			}
-			if strings.EqualFold(currentScope, excludeScope) {
+			scope, err := base64.RawURLEncoding.DecodeString(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+			require.NoError(t, err)
+			if strings.EqualFold(string(scope), excludeScope) {
 				excluded = append(excluded, excludeAction)
 			}
 			raw, err := json.Marshal(excluded)

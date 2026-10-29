@@ -301,6 +301,15 @@ different subscriptions. The existing Agent subnet selected through standard
 `network.agentSubnet` is not an I02 referenced resource. Its independent N02
 basic subnet checks still apply.
 
+Within each read-only preflight pass, authorization checks share complete
+role-assignment enumerations by scope and filter, role definitions by full
+resource ID, and SDK clients. Checks still evaluate their own actions and
+conditions; P06 continues to require unconditional permission. Independent
+resource, network and authorization reads run in bounded worker groups, while
+reports retain their planned order and all failures. AKS and subnet checks use
+the same SKU enumeration. This evidence is not reused by later deployment,
+retry or cleanup operations.
+
 Recovery of an existing managed-identity registry connection whose GET response
 masks credentials also reads its current identity using the exact connection's
 `Microsoft.CognitiveServices/accounts/projects/connections/listSecrets/action`.

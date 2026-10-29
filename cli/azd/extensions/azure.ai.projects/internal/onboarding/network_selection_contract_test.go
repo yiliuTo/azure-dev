@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -20,6 +21,7 @@ import (
 )
 
 type networkARMContract struct {
+	mu      sync.Mutex
 	t       *testing.T
 	plan    Plan
 	fixture resourceRuleContractFixture
@@ -59,7 +61,9 @@ func newNetworkARMContract(t *testing.T) *networkARMContract {
 
 func (f *networkARMContract) options() *arm.ClientOptions {
 	return contractARMOptions(func(request *http.Request) (*http.Response, error) {
+		f.mu.Lock()
 		f.methods = append(f.methods, request.Method+" "+request.URL.Path)
+		f.mu.Unlock()
 		require.Equal(f.t, http.MethodGet, request.Method, "hosting subnet selection must never create network resources")
 		var body any
 		switch {
@@ -130,7 +134,7 @@ func TestStandardNetworkSelectionLimitsN02ToExistingAgentSubnet(t *testing.T) {
 				}}
 			}
 			checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(f.options())}
-			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, nil)
+			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, nil)
 			var n02 Report
 			for _, check := range report {
 				if check.ID == "N02" {
@@ -246,7 +250,7 @@ func TestHostingSubnetN02UsesOnlySelectedNodeCIDR(t *testing.T) {
 				return base.Transport.Do(request)
 			})
 			checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(options)}
-			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, nil)
+			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, nil)
 			var n02 Report
 			for _, check := range report {
 				assert.NotEqual(t, "N01", check.ID)
@@ -323,7 +327,7 @@ func TestN02BasicSubnetIgnoresAssociatedTopology(t *testing.T) {
 				f.errors[path] = http.StatusForbidden
 			}
 			report := f.checker().networkChecks(
-				t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.account)
+				t.Context(), f.base.plan, &f.base.fixture.Cluster, f.base.fixture.Pools, f.base.fixture.SKUs, f.account)
 			require.NoError(t, report.Err())
 			expected := NotApplicable
 			if network == "public" {
@@ -455,7 +459,7 @@ func TestUnreferencedHostingSubnetSkipsN02ButKeepsIndependentNetworkChecks(t *te
 				NetworkRuleSet:      &armstorage.NetworkRuleSet{DefaultAction: new(armstorage.DefaultActionAllow)},
 				PrimaryEndpoints:    &armstorage.Endpoints{Blob: new("https://storage.blob.core.windows.net/")},
 			}}
-			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, storage)
+			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, storage)
 			n02 := 0
 			for _, check := range report {
 				if check.ID == "N02" {

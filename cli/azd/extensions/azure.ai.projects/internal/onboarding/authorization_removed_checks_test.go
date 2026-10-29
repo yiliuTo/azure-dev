@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,13 +48,16 @@ func TestAuthorizerOmitsRemovedChecksAndTheirExclusiveRequests(t *testing.T) {
 			assert.Equal(t, !supplied, planned[id])
 		}
 		var scopes []string
+		var mu sync.Mutex
 		options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
 			require.Equal(t, http.MethodGet, request.Method)
 			assert.NotContains(t, request.URL.Path, "/permissions")
 			require.True(t, strings.HasSuffix(request.URL.Path, "/roleAssignments"),
 				"unreadable independent evidence must stop before extra requests")
 			suffix := "/providers/Microsoft.Authorization/roleAssignments"
+			mu.Lock()
 			scopes = append(scopes, strings.TrimSuffix(request.URL.Path, suffix))
+			mu.Unlock()
 			return contractARMResponse(request, http.StatusForbidden,
 				`{"error":{"code":"AuthorizationFailed"}}`), nil
 		})
@@ -89,6 +93,10 @@ func TestAuthorizerOmitsRemovedChecksAndTheirExclusiveRequests(t *testing.T) {
 		require.Len(t, report, len(plan.Operations)+extra+len(wantGrantScopes),
 			"P06 adds the distinct G01-G03 scopes; F01 only adds the new customer-registry branch")
 		require.Len(t, registryGrants, extra)
-		require.Len(t, scopes, len(report))
+		wantScopes := map[string]bool{}
+		for _, check := range report {
+			wantScopes[check.Scope] = true
+		}
+		require.Len(t, scopes, len(wantScopes), "failed reads are shared without suppressing independent check failures")
 	}
 }

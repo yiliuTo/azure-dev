@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -169,9 +170,9 @@ func TestReadPermissionInferenceIsNotMovedToAnotherAuthorizationCheck(t *testing
 	input.StorageID, input.RegistryID, input.AgentSubnetID = "", "", ""
 	plan, err := BuildPlan(input)
 	require.NoError(t, err)
-	var requests int
+	var requests atomic.Int32
 	options := contractARMOptions(func(r *http.Request) (*http.Response, error) {
-		requests++
+		requests.Add(1)
 		require.Equal(t, http.MethodGet, r.Method)
 		var body string
 		switch {
@@ -194,8 +195,12 @@ func TestReadPermissionInferenceIsNotMovedToAnotherAuthorizationCheck(t *testing
 		Facts{KubeletObjectID: "kubelet"})
 	require.NoError(t, err, "missing P08 read actions must not block other authorized operations")
 	require.Len(t, report, len(plan.Operations)+3)
-	assert.Equal(t, 2*len(report), requests,
-		"each basic action check reads only role assignments and definitions")
+	scopes := map[string]bool{}
+	for _, check := range report {
+		scopes[strings.ToLower(check.Scope)] = true
+	}
+	assert.Equal(t, len(scopes)+1, int(requests.Load()),
+		"each scope is listed once and the common full role definition is read once per pass")
 	seen := map[string]bool{}
 	for _, check := range report {
 		assert.NotEqual(t, "P08", check.ID)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -149,9 +150,12 @@ func TestManagedNodeSubnetEvidence(t *testing.T) {
 			}
 			base := f.options()
 			var calls []string
+			var mu sync.Mutex
 			options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
 				require.Equal(t, http.MethodGet, request.Method, "node-subnet discovery must remain read-only")
+				mu.Lock()
 				calls = append(calls, request.URL.Path)
+				mu.Unlock()
 				var body any
 				switch {
 				case strings.EqualFold(request.URL.Path, groupID):
@@ -205,7 +209,7 @@ func TestManagedNodeSubnetEvidence(t *testing.T) {
 				return contractARMResponse(request, 200, string(data)), nil
 			})
 			checker := &sdkResourceChecker{credential: contractCredential{}, options: onboardingARMOptions(options)}
-			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, nil)
+			report := checker.networkChecks(t.Context(), plan, &f.fixture.Cluster, f.fixture.Pools, f.fixture.SKUs, nil)
 			switch scenario {
 			case "valid", "case insensitive bindings", "paged", "multiple selected VMSS", "explicit subnet unchanged":
 				require.NoError(t, report.Err())

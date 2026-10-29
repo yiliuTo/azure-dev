@@ -5,6 +5,7 @@ package onboarding
 
 import (
 	"context"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
 )
@@ -16,7 +17,10 @@ func (c *sdkResourceChecker) readNetworkSubnet(ctx context.Context, raw, checkID
 		check.Cause = err
 		return nil, Report{check}
 	}
-	client, err := armnetwork.NewSubnetsClient(id.SubscriptionID, c.credential, c.options)
+	client, err := c.clients().subnets.get(strings.ToLower(id.SubscriptionID),
+		func() (*armnetwork.SubnetsClient, error) {
+			return armnetwork.NewSubnetsClient(id.SubscriptionID, c.credential, c.options)
+		})
 	if err != nil {
 		return nil, Report{readFailure(checkID, raw, "Microsoft.Network/virtualNetworks/subnets/read", err)}
 	}
@@ -32,7 +36,10 @@ func (c *sdkResourceChecker) readParentNetwork(ctx context.Context, raw string) 
 	if err != nil {
 		return nil, nil
 	}
-	client, err := armnetwork.NewVirtualNetworksClient(id.SubscriptionID, c.credential, c.options)
+	client, err := c.clients().networks.get(strings.ToLower(id.SubscriptionID),
+		func() (*armnetwork.VirtualNetworksClient, error) {
+			return armnetwork.NewVirtualNetworksClient(id.SubscriptionID, c.credential, c.options)
+		})
 	if err != nil {
 		return nil, Report{readFailure("N02", id.Parent.String(), "Microsoft.Network/virtualNetworks/read", err)}
 	}

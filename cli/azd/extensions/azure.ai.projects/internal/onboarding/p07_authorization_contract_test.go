@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -34,9 +35,12 @@ func p07Authorizer(
 	if assignments == nil {
 		assignments = []any{}
 	}
+	var mu sync.Mutex
 	options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
 		require.Equal(t, http.MethodGet, request.Method)
+		mu.Lock()
 		*paths = append(*paths, request.URL.Path)
+		mu.Unlock()
 		if status != http.StatusOK {
 			return contractARMResponse(request, status, `{"error":{"code":"AuthorizationFailed"}}`), nil
 		}
