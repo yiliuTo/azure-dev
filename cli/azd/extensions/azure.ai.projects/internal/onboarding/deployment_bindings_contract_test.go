@@ -94,8 +94,6 @@ func TestDeploymentStartJournalsOnlyResourceIntentsBeforeARM(t *testing.T) {
 	assert.Equal(t, id, state.Foundry.Attempts[0].ID)
 	assert.Equal(t, f.base.plan.DeploymentID, state.DeploymentID)
 	assert.Equal(t, f.spec.Deployment, state.Foundry.Spec.Deployment)
-	assert.Empty(t, state.Assignments, "future principal GUIDs are not fabricated")
-	assert.Empty(t, state.Foundry.ProjectPrincipalID)
 	require.Len(t, state.Resources, 4)
 	for step, record := range state.Resources {
 		assert.False(t, record.Complete)
@@ -132,13 +130,10 @@ func TestFailedARMGraphRecoveryNeedsNoOutputsOrPredictedGrantUUIDs(t *testing.T)
 	f.deploy(t)
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	state.Assignments = map[string]OwnedAssignment{}
-	state.Foundry.ProjectPrincipalID = ""
 	for key, record := range state.Resources {
 		record.Identity, record.Complete = Identity{}, false
 		state.Resources[key] = record
 	}
-	state.Foundry.Attempts[0].Evidence = nil
 	require.NoError(t, f.base.journal.Save(t.Context(), state))
 	for _, root := range f.roots {
 		properties := cleanupObject(t, root["properties"])
@@ -158,17 +153,16 @@ func TestFailedARMGraphRecoveryNeedsNoOutputsOrPredictedGrantUUIDs(t *testing.T)
 			delete(f.base.resources, id)
 		}
 	}
-	require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
+	resolved, err := ResolveRecoveryContext(t.Context(), f.base.plan, contractCredential{}, f.options, f.base.journal)
+	require.NoError(t, err)
+	require.NoError(t, f.lifecycle.Start(t.Context(), resolved, f.spec, resolved.DeploymentID))
 	recovered, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, "00000000-0000-0000-0000-000000000001", recovered.Resources["R04"].Identity.PrincipalID)
+	assert.Empty(t, recovered.Resources["R04"].Identity.PrincipalID)
 	assert.Empty(t, recovered.Resources["R05"].Identity.PrincipalID)
-	assert.Empty(t, recovered.Foundry.ProjectPrincipalID)
-	require.Len(t, recovered.Assignments, 3, "recover the two real G01 grants and actual kubelet grant")
-	for _, record := range recovered.Assignments {
-		assert.Contains(t, f.base.resources, strings.ToLower(record.ID))
-		assert.True(t, record.Complete)
-	}
+	require.Len(t, recovered.Foundry.Attempts, 2)
+	assert.True(t, recovered.Foundry.Attempts[0].Archived)
+	assert.Equal(t, "Failed", recovered.Foundry.Attempts[0].ProvisioningState)
 	assert.Empty(t, f.base.writes, "recovery is read-only even after a failed/partial graph")
 	assert.Empty(t, f.deletes)
 }
@@ -194,7 +188,6 @@ func TestRegistryEnvironmentOutputRetryPreservesOriginalOwnedLedger(t *testing.T
 	after, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, before.Resources["R03"], after.Resources["R03"])
-	assert.Equal(t, before.Assignments, after.Assignments)
 	assert.Equal(t, before.Foundry.Spec.RegistryID, after.Foundry.Spec.RegistryID)
 }
 

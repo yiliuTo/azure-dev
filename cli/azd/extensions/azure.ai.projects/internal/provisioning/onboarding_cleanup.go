@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 
 	"azure.ai.projects/internal/exterrors"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
-	"github.com/azure/azure-dev/cli/azd/pkg/grpcbroker"
 )
 
 func (p *FoundryProvisioningProvider) byoJournalValue(ctx context.Context) (string, error) {
@@ -38,97 +36,61 @@ func (p *FoundryProvisioningProvider) byoJournalValue(ctx context.Context) (stri
 	return "", nil
 }
 
-func (p *FoundryProvisioningProvider) destroyBYO(
-	ctx context.Context, options *azdext.ProvisioningDestroyOptions, progress grpcbroker.ProgressFunc,
-) (*azdext.ProvisioningDestroyResult, bool, error) {
+func (p *FoundryProvisioningProvider) byoDestroyState(ctx context.Context) (*onboarding.PreparationState, error) {
 	raw, err := p.byoJournalValue(ctx)
 	if err != nil {
-		return nil, true, p.byoLifecycleError(fmt.Errorf("read ownership journal before destroy: %w", err),
-			exterrors.OpBYOOwnedCleanup)
-	}
-	currentBYO := p.synthResult != nil && p.synthResult.Hosting != nil
-	if raw == "" && !currentBYO {
-		return nil, false, nil
-	}
-	fail := func(err error) (*azdext.ProvisioningDestroyResult, bool, error) {
-		return nil, true, p.byoLifecycleError(err, exterrors.OpBYOOwnedCleanup)
+		return nil, fmt.Errorf("read BYO retry state before resource-group deletion: %w", err)
 	}
 	if raw == "" {
-		return fail(fmt.Errorf("BYO-AKS ownership journal is absent; refusing both dependency and resource-group deletion"))
+		return nil, nil
 	}
 	var state onboarding.PreparationState
 	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return fail(fmt.Errorf("ownership journal is invalid; retain it for recovery: %w", err))
-	}
-	if state.AgentStateCleanupPending && state.Foundry == nil {
-		return fail(fmt.Errorf("pending agent state cleanup lacks exact Project evidence; retain the ownership journal"))
+		return nil, fmt.Errorf("decode BYO retry state before resource-group deletion: %w", err)
 	}
 	plan, err := onboarding.CleanupPlan(state)
 	if err != nil {
-		return fail(err)
+		return nil, err
 	}
-	if !options.GetForce() {
-		confirmed, err := p.confirmDestroyTarget(ctx,
-			"only journaled owned Foundry resources and grants; resource groups and supplied resources will be retained")
-		if err != nil {
-			return nil, true, err
-		}
-		if !confirmed {
-			return nil, true, exterrors.Cancelled("owned BYO-AKS cleanup cancelled")
-		}
+	if !strings.EqualFold(plan.SubscriptionID, p.subID) || !strings.EqualFold(plan.ResourceGroup, p.rgName) ||
+		plan.Environment != p.envName {
+		return nil, fmt.Errorf("BYO retry state belongs to another environment or resource group")
 	}
-	lifecycle := p.byoLifecycle
-	if lifecycle == nil {
-		target := *p
-		target.subID = plan.SubscriptionID
-		if p.azdClient != nil {
-			target.credential = nil
-		}
-		if err := target.ensureCredential(ctx); err != nil {
-			return fail(err)
-		}
-		lifecycle = onboarding.NewLifecycle(target.credential, p.armClientOptions, environmentJournal{p})
+	if state.AgentStateCleanupPending && (state.Foundry == nil || state.Foundry.ProjectEndpoint == "") {
+		return nil, fmt.Errorf("pending agent state cleanup lacks its persisted Project target")
 	}
+	return &state, nil
+}
+
+func (p *FoundryProvisioningProvider) finishBYODestroy(
+	ctx context.Context, state *onboarding.PreparationState,
+) (*azdext.ProvisioningDestroyResult, error) {
+	if state == nil {
+		return p.destroyResult(), nil
+	}
+	state.CleanupComplete = true
 	if state.Foundry != nil {
-		state.AgentStateCleanupPending = true
-		if err := (environmentJournal{p}).Save(ctx, state); err != nil {
-			return fail(fmt.Errorf("persist pending agent state cleanup before cloud teardown: %w", err))
+		state.Foundry.ProjectDeleted, state.Foundry.AccountDeleted = true, true
+	}
+	journal := environmentJournal{p}
+	if err := journal.Save(ctx, *state); err != nil {
+		return nil, p.byoLifecycleError(fmt.Errorf(
+			"persist resource-group deletion before local agent cleanup; retry azd down: %w", err),
+			exterrors.OpBYOOwnedCleanup)
+	}
+	if state.AgentStateCleanupPending {
+		if err := p.cleanupDeletedProjectAgentState(ctx, *state); err != nil {
+			return nil, p.byoLifecycleError(fmt.Errorf(
+				"resource group was deleted but local agent state cleanup failed; retry azd down: %w", err),
+				exterrors.OpBYOOwnedCleanup)
+		}
+		state.AgentStateCleanupPending = false
+		if err := journal.Save(ctx, *state); err != nil {
+			return nil, p.byoLifecycleError(fmt.Errorf(
+				"persist local agent cleanup completion; retry azd down: %w", err), exterrors.OpBYOOwnedCleanup)
 		}
 	}
-	if err := lifecycle.Cleanup(ctx, plan, options.GetPurge(), progress); err != nil {
-		return fail(err)
-	}
-	completed, err := (environmentJournal{p}).Load(ctx)
-	if err != nil {
-		return fail(fmt.Errorf("read persisted cloud cleanup completion: %w", err))
-	}
-	if !completed.CleanupComplete || completed.Version != state.Version ||
-		completed.DeploymentID != state.DeploymentID || completed.Environment != state.Environment ||
-		(completed.Foundry == nil) != (state.Foundry == nil) {
-		return fail(fmt.Errorf("cloud cleanup completion is unverified; agent state retained"))
-	}
-	if completed.Foundry != nil {
-		if state.Foundry == nil || !completed.Foundry.ProjectDeleted || !completed.Foundry.AccountDeleted ||
-			completed.Foundry.Spec.ProjectID != state.Foundry.Spec.ProjectID {
-			return fail(fmt.Errorf("exact Foundry Project deletion is unverified; agent state retained"))
-		}
-		if err := p.cleanupDeletedProjectAgentState(ctx, completed); err != nil {
-			return fail(fmt.Errorf("cloud resources were deleted but local agent state cleanup failed; "+
-				"retain the ownership journal and retry azd down: %w", err))
-		}
-		completed.AgentStateCleanupPending = false
-		if err := (environmentJournal{p}).Save(ctx, completed); err != nil {
-			return fail(fmt.Errorf("persist agent state cleanup completion; retry azd down: %w", err))
-		}
-	}
-	result := invalidatedEnvKeysResult()
-	_, registryOwned := state.Resources["R03"]
-	result.InvalidatedEnvKeys = slices.DeleteFunc(result.InvalidatedEnvKeys, func(key string) bool {
-		return key == envKeyResourceGroup || key == envKeyFoundryRG || key == envKeyFoundryRGOwner ||
-			key == envKeyBYOJournal || (!registryOwned &&
-			(key == "AZURE_CONTAINER_REGISTRY_RESOURCE_ID" || key == "AZURE_CONTAINER_REGISTRY_ENDPOINT"))
-	})
-	return result, true, nil
+	return p.destroyResult(), nil
 }
 
 func (p *FoundryProvisioningProvider) cleanupDeletedProjectAgentState(

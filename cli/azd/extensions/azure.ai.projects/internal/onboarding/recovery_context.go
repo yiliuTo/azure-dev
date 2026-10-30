@@ -5,6 +5,7 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -16,10 +17,11 @@ import (
 )
 
 // ResolveRecoveryContext validates old attempts before supplied-identity permission checks.
-// It is read-only, including in preview, and does not infer ownership from a tag alone.
+// It is read-only, including in preview, and retains the original resource selections.
 func ResolveRecoveryContext(
 	ctx context.Context, plan Plan, credential azcore.TokenCredential, options *arm.ClientOptions, journal Journal,
 ) (Plan, error) {
+	plan.Recovery = RecoveryContext{}
 	lifecycle := &ownedLifecycle{credential: credential, options: onboardingARMOptions(options), journal: journal}
 	state, err := lifecycle.load(ctx, plan)
 	if err != nil {
@@ -55,33 +57,9 @@ func ResolveRecoveryContext(
 	if err := lifecycle.verifyAttempts(ctx, plan, state.Foundry); err != nil {
 		return plan, err
 	}
-	if err := lifecycle.verifyResourceSources(ctx, plan, &state); err != nil {
-		return plan, err
-	}
-	succeeded := map[string]bool{}
-	if _, err := lifecycle.deploymentGrantTargets(ctx, plan, state.Foundry, succeeded); err != nil {
-		return plan, err
-	}
 	everSucceeded := false
 	for _, attempt := range state.Foundry.Attempts {
 		everSucceeded = everSucceeded || attempt.ProvisioningState == "Succeeded"
-	}
-	pending := func(key, scope string) bool {
-		if everSucceeded || state.ResourceProgress[key].PreparationComplete {
-			return false
-		}
-		for _, assignment := range state.Assignments {
-			if assignment.Complete && strings.EqualFold(assignment.Scope, scope) {
-				return false
-			}
-		}
-		for target := range succeeded {
-			if id, err := ParseID(target, "Microsoft.Authorization/roleAssignments"); err == nil &&
-				strings.EqualFold(id.Parent.String(), scope) {
-				return false
-			}
-		}
-		return true
 	}
 	if !plan.Workload.Supplied {
 		exists, err := lifecycle.existingWorkload(ctx, plan, state)
@@ -89,7 +67,14 @@ func ResolveRecoveryContext(
 			return plan, err
 		}
 		plan.Recovery.ExistingWorkload = exists
-		plan.Recovery.FederationPending = plan.Hosting.Supplied && exists && pending("workloadIdentity", plan.Workload.ID)
+		if plan.Hosting.Supplied && exists && !everSucceeded {
+			plan.Recovery.FederationPending, err = lifecycle.pendingDependencyGrant(
+				ctx, plan, plan.Workload.ID, "byo-federation-access",
+				data.HostingIdentity.PrincipalID, data.FederatedIdentityRoleDefinitionID)
+			if err != nil {
+				return plan, err
+			}
+		}
 	}
 	if !plan.Storage.Supplied {
 		client, err := armresources.NewClient(plan.SubscriptionID, credential, lifecycle.options)
@@ -108,10 +93,71 @@ func ResolveRecoveryContext(
 			plan.Operations = slices.DeleteFunc(slices.Clone(plan.Operations), func(operation Operation) bool {
 				return operation.CheckID == "P04" && operation.Action == "Microsoft.Storage/storageAccounts/write"
 			})
-			plan.Recovery.StorageGrantPending = plan.Workload.Supplied && pending("storageAccount", plan.Storage.ID)
+			if plan.Workload.Supplied && !everSucceeded {
+				plan.Recovery.StorageGrantPending, err = lifecycle.pendingDependencyGrant(
+					ctx, plan, plan.Storage.ID, "byo-storage-access", data.WorkloadIdentity.PrincipalID,
+					"/subscriptions/"+plan.SubscriptionID+"/providers/Microsoft.Authorization/roleDefinitions/"+
+						"ba92f5b4-2d11-453d-a403-e96b0029c9fe")
+				if err != nil {
+					return plan, err
+				}
+			}
 		}
 	}
 	return plan, nil
+}
+
+// Only an unfinished dependency grant needs a targeted read on partial retry.
+// Successful graphs and completed grants cannot defer a newly missing permission.
+func (l *ownedLifecycle) pendingDependencyGrant(
+	ctx context.Context, plan Plan, scope, name, principalID, roleID string,
+) (bool, error) {
+	target, err := arm.ParseResourceID(scope)
+	if err != nil {
+		return false, err
+	}
+	client, err := armresources.NewDeploymentsClient(target.SubscriptionID, l.credential, l.options)
+	if err != nil {
+		return false, err
+	}
+	found, err := client.Get(ctx, target.ResourceGroupName, name, nil)
+	if deploymentRecordNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read unfinished dependency grant deployment: %w", err)
+	}
+	expectedID := "/subscriptions/" + target.SubscriptionID + "/resourceGroups/" + target.ResourceGroupName +
+		"/providers/Microsoft.Resources/deployments/" + name
+	if !strings.EqualFold(authString(found.ID), expectedID) || found.Properties == nil {
+		return false, fmt.Errorf("dependency grant deployment target is unverified")
+	}
+	raw, err := json.Marshal(found.Properties.Parameters)
+	if err != nil {
+		return false, err
+	}
+	var parameters map[string]struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &parameters); err != nil {
+		return false, fmt.Errorf("decode dependency grant deployment parameters: %w", err)
+	}
+	for key, value := range map[string]string{
+		"deploymentId": plan.DeploymentID, "resourceName": target.Name,
+		"principalId": principalID, "roleDefinitionId": roleID,
+	} {
+		if value == "" || !strings.EqualFold(parameters[key].Value, value) {
+			return false, fmt.Errorf("dependency grant deployment parameter %s differs from the retry intent", key)
+		}
+	}
+	switch resourceValue(found.Properties.ProvisioningState) {
+	case "Succeeded":
+		return false, nil
+	case "Failed", "Canceled":
+		return true, nil
+	default:
+		return false, fmt.Errorf("dependency grant deployment is active or its state is unknown")
+	}
 }
 
 func (l *ownedLifecycle) existingWorkload(ctx context.Context, plan Plan, state PreparationState) (bool, error) {

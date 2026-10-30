@@ -7,6 +7,8 @@ import (
 	"context"
 
 	"azure.ai.projects/internal/onboarding"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 )
 
 // Gate contracts isolate deployment ownership; SDK lifecycle contracts inject NewLifecycle instead.
@@ -22,10 +24,6 @@ func (byoLifecycleContract) Start(context.Context, onboarding.Plan, onboarding.F
 	return nil
 }
 
-func (byoLifecycleContract) Observe(context.Context, onboarding.Plan) error {
-	return nil
-}
-
-func (byoLifecycleContract) Cleanup(context.Context, onboarding.Plan, bool, func(string)) error {
+func (byoLifecycleContract) Observe(context.Context, onboarding.Plan, armresources.DeploymentExtended) error {
 	return nil
 }

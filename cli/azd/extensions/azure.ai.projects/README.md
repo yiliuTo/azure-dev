@@ -310,17 +310,6 @@ reports retain their planned order and all failures. AKS and subnet checks use
 the same SKU enumeration. This evidence is not reused by later deployment,
 retry or cleanup operations.
 
-Recovery of an existing managed-identity registry connection whose GET response
-masks credentials also reads its current identity using the exact connection's
-`Microsoft.CognitiveServices/accounts/projects/connections/listSecrets/action`.
-This read-only POST does not update the resource. Its real response supplies
-permission evidence without a separate P08 role-assignment permission check;
-denied or incomplete responses stop retry before another deployment.
-During teardown, a matching account-level registry view requires the same current
-identity read at its exact account connection scope using
-`Microsoft.CognitiveServices/accounts/connections/listSecrets/action`.
-That read does not establish independent ownership of the account connection.
-
 **P06 G01-G03 grant authority** checks the operator's ordinary, unconditional
 `Microsoft.Authorization/roleAssignments/write` permission:
 
@@ -363,8 +352,7 @@ unrelated resources, and active or unknown old attempts cannot use this exceptio
 
 - Supplied ACR: existing applicable pull authorization passes without requiring
   operator grant-write authority. Deployment reuses the exact assignment, including
-  RG/subscription inheritance, without another G04 write. Customer grants remain
-  unowned; journaled owned grants retain their cleanup responsibility.
+  RG/subscription inheritance, without another G04 write.
 - Without existing pull authorization, inspect the operator's applicable role
   assignments and definitions at that ACR for
   `Microsoft.Authorization/roleAssignments/write` through `Actions/NotActions`.
@@ -485,8 +473,8 @@ remain independent.
 N02 is not rerun after resource creation. Supplied Storage and C01 checks remain
 read-only preflight requirements; there is no preparation-time network verifier.
 Existing standard subnet references are read-only.
-Older automatic-subnet journals are retained for exact owned cleanup and block
-new provisioning until that lifecycle is resolved. Retries cannot silently
+Older automatic-subnet journals block new provisioning until `azd down` resolves
+their resource group and local state. Retries cannot silently
 restore a removed hosting field or switch network selections on an existing account.
 
 After all preflight gates pass, provision submits **one subscription-scope ARM
@@ -527,8 +515,7 @@ retained. `namingToken` is the first ten lowercase hexadecimal characters of
 The Storage prefix is not padded when shorter than 14 characters. Hosting and
 workload identities are separate resources. Explicit Storage and identity ARM IDs
 take precedence and keep their original names. Retries retain exact journaled
-targets and source provenance; an active lifecycle cannot switch targets, and
-cleanup uses persisted resource IDs rather than recomputing names.
+targets and original supplied selections; an active lifecycle cannot switch targets.
 
 The default BYO registry name remains `azd{registryNamingToken}`.
 `registryNamingToken` is the first 16 lowercase hexadecimal characters of
@@ -565,151 +552,70 @@ ARM dependencies order configuration; they do not prove data-plane RBAC
 propagation or workload connectivity. Service errors remain failures rather than
 triggering a second client-side preparation/deployment loop.
 Storage does not need to be dedicated to this workflow. Preserve the environment
-value `AZD_FOUNDRY_BYO_AKS_PREPARATION`: its compatibility name now refers to the
-deployment-ownership record, not an independent resource-preparation executor.
-It retains exact deployment attempts, owned targets and cleanup progress, not
-credentials or proof of data-plane propagation. Its separate `resourceProgress`
-map has exactly `storageAccount`, `containerRegistry`, `hostingIdentity` and
+value `AZD_FOUNDRY_BYO_AKS_PREPARATION`: its compatibility name refers to the
+deployment retry record, not an independent resource-preparation executor.
+It retains resource selections, deployment attempts and local cleanup progress,
+not credentials or proof of data-plane propagation. Its `resourceProgress` map
+has exactly `storageAccount`, `containerRegistry`, `hostingIdentity` and
 `workloadIdentity`. Each entry records `resourceId`, original user-source
-`supplied`, current-round `preflightPassed` and `preparationComplete`. Missing
-evidence remains unconfirmed. Preflight always reruns, including after a
-previous pass; preview never saves progress. Progress is not an ownership ledger.
+`supplied` and current-round `preflightPassed`. Preflight always reruns, including
+after a previous pass; preview never saves progress.
 
-Completion requires actual resource configuration and the selected preparation
-operations: Storage plus workload access; hosting identity plus both AKS roles and
-hosting-to-workload access; workload identity plus federation and Storage access;
-ACR readiness/mode plus kubelet/project access and the project registry connection.
-Existence or an environment tag alone is insufficient. Control-plane readback does not
-prove RBAC propagation or data-plane reachability. Valid deployment intent and
-actual resources allow recovery after a successful cloud write and failed local
-save; missing grant evidence remains incomplete.
+After ARM reports success, the provider saves the returned deployment state,
+correlation, ARM hash and Project endpoint, then validates and publishes the
+deployment outputs. This completion step makes no additional ARM requests.
+ARM owns resource configuration and dependency ordering. Provision completion
+does not independently verify Storage, ACR, role propagation, registry connection
+credentials, private networking or data-plane reachability.
 
 Template binding preserves existing resource-group tags across retries while
-honoring explicit customer tag changes. The exact account target, environment,
-deployment scope and per-attempt provenance are persisted for recovery.
-Lifecycle ownership does not depend on a private owner token or resource tag.
-BYO on-disk Bicep must retain the standard deployment resource bindings;
-supported selections belong in configuration or parameter inputs. Altered
-templates are rejected before deployment. Each new attempt records a SHA-256
-digest of the submitted template content. Recovery and cleanup read the exact
-deployment's exported template and verify that digest, along with exact target
-parameters, correlation and terminal state. Template-level metadata and
-ARM declaration-type capitalization are normalized; resource configuration,
-including resource metadata, remains bound. The Bicep generator hash is not
-compared with ARM's independently calculated service hash.
-The independently observed ARM hash is retained after verification; changed or
-unreadable evidence blocks recovery. A planned account's absence alone is not
-sufficient evidence. Owned resources require recorded initial absence, exact
-successful Create evidence and the current resource's authoritative creation
-time within that deployment generation. Grants additionally bind their creation
-time, scope, principal, role and deployment-reference description. Matching tags
-do not permit adoption of a pre-existing or replaced resource.
-A failed private endpoint can be recognized only with its exact failed Create,
-recorded initial absence, authoritative birth within the verified generation,
-and matching account, subnet and network-interface topology. This exception does
-not establish ownership of other failed resources or grants.
+honoring explicit customer tag changes. BYO on-disk Bicep must retain the standard
+deployment resource bindings; supported selections belong in configuration or
+parameter inputs. Altered templates are rejected before deployment. The local
+record retains the submitted template digest and generator hash without exporting
+the deployed template. The ARM hash is retained separately.
 
-The root uses the provider's stable subscription deployment name. Before another
-submission can overwrite that record, the previous terminal generation is
-verified and its root, nested deployment and operation evidence is archived with
-an integrity digest in the environment journal. Archiving and the next pending
-intent are saved together before ARM submission. Archived generations are not
-reconstructed from subsequently overwritten nested deployment records. Active,
-unknown or unverifiable generations block retries. Explicit resource-group and
-location parameters must agree with the environment's resolved target.
-Observation, retry and teardown require an exact succeeded Project Create reached
-through exact Create operations in the verified deployment graph, plus the
-verified exact parent account. Each nested deployment's terminal state must match
-its parent operation; a failed nested deployment can still prove its successful
-descendants. Duplicate Read operations require a matching Create in that same
-parent generation. The project's ID, location, succeeded state,
-system-assigned identity and tenant must match; a changed recorded principal
-still blocks recovery and cascading deletion.
-When Connection GET masks managed-identity credentials, registry preparation
-requires the exact succeeded connection Create in the content-bound deployment
-graph, the verified project's actual system-assigned principal and verified
-parent account, and its exact owned registry pull grant read back from ARM.
-The connection must still name the expected registry endpoint and resource ID
-and explicitly exclude workspace-managed identity. A read-only `listSecrets`
-request must confirm the current ManagedIdentity client and registry IDs; the
-historical Create and pull grant do not substitute for that current identity.
-Explicit credential conflicts, user-assigned identity, conditional or changed
-grants, and unreadable evidence block completion and retry. Response bodies are
-not logged; only the required non-key managed-identity fields are decoded.
-If ARM rejects a nested deployment during provider preflight validation before
-registering it, recovery requires the exact failed parent Create operation and
-recognized not-found responses for both the nested record and its operations.
-That absent branch supplies no owned-grant evidence. Authorization failures,
-unknown errors and missing operations on an existing nested deployment still block
-recovery; successful sibling operations remain independently verifiable.
-Foundry failures retain nested deployment-operation errors and correlation IDs;
-unavailable diagnostic reads are reported separately from the original failure.
+The root uses the provider's stable subscription deployment name. Retry reads
+its current state, target parameters, hash and correlation before replacing a
+terminal attempt. Previous attempt identities are archived with the next pending
+intent before submission; nested graphs, resource birth times and per-resource
+deletion ownership are not collected. Active, unknown or mismatched attempts
+block retry. Existing-resource collision checks and original supplied selections
+remain enforced.
 
-`azd down` uses the persisted ownership journal even if the current hosting
-configuration changes. It never deletes the resource group. It first verifies
-terminal deployment evidence and inventories projects, connections, model
-deployments and account private endpoint connections. It explicitly deletes
-tracked models, the proven-owned Project registry connection and the owned
-Project before deleting the account. Empty successful connection DELETE responses
-are supported; every deletion requires a subsequent not-found read.
-A matching registry connection visible at account scope is never independently
-deleted: it must disappear after Project deletion. A remaining or unknown account
-connection blocks account deletion and preserves dependencies.
+For a failed partial deployment, retry references already-created Storage rather
+than rewriting it. A supplied identity can defer a missing grant only when the
+same unfinished intent creates its exact dependency. This recovery reads only
+the applicable federation or Storage grant deployment and validates its target,
+principal, role, deployment ID and terminal state. A completed grant, an earlier
+successful graph, an unreadable response or an unknown/active deployment cannot
+use that exception. Permission evidence is still checked afresh. Foundry failures
+retain nested deployment-operation diagnostics and correlation IDs; unavailable
+diagnostic reads are reported separately from the original failure.
 
-Owned private networking is removed before the account: DNS zone group, private
-endpoint, owned VNet links, then owned DNS zones. The private endpoint's
-RP-managed NIC must disappear with its endpoint; azd never directly deletes that
-NIC. Recovery of untagged network resources requires exact succeeded Creates in
-the content-bound deployment graph, root output-resource binding, and independent
-ARM `createdTime` within that deployment's execution interval (terminal timestamp
-minus duration through terminal timestamp). `changedTime` is not creation
-evidence. A DNS zone group is bound to its independently proven endpoint; its
-recorded `birthResourceId` explicitly identifies that endpoint, not an invented
-independent zone-group birth.
-Current endpoint/account/subnet/NIC and zone/link/record bindings must agree,
-including each zone's actual endpoint addresses. Complete child inventories and
-birth evidence are refreshed during teardown; foreign records or links,
-unreadable evidence and recreated resources stop deletion. Supplied DNS zones,
-links, VNets and subnets are retained. No resource-group deletion is used.
+**`azd down` deletes the entire explicit target resource group, just like ordinary
+Foundry provisioning. Every resource in that group is deleted, including supplied
+AKS, identities, Storage, ACR or networking located there.** Resources and role
+assignments at scopes outside that group are not selectively removed. Choose the
+target group accordingly. The ordinary confirmation/`--force`, resource-group
+safeguards, model-deployment removal and optional `--purge` flow apply. A BYO
+ownership inventory or deployment-history scan is not required for deletion.
 
-Teardown requires read access to exact account/Project children, deployment
-records/operations/exported templates, and the target RG's ARM resource inventory
-with `createdTime`, plus reads of relevant endpoint/NIC/DNS group/link/record
-resources. Delete rights are needed only for proven-owned targets; supplied
-resources and RP-managed NICs receive no DELETE. ARM authorizes each operation;
-permission failures retain progress rather than triggering broader deletion.
-Service-owned
-federated credentials must disappear before dependency grants are removed; azd
-does not delete those credentials itself. Cleanup then deletes only proven-owned
-assignments, identities, Storage, registry and historical owned subnet IDs. Supplied
-resources (including supplied UAMIs), unrelated supplied-identity federated
-credentials, reused customer grants and later-added resource-group resources are
-preserved. Unknown ownership, an active deployment, unexpected account children,
-or an in-use/changed subnet stops cleanup and retains the recoverable journal.
-Progress survives permission failures and interruption; retry `azd down` after
-resolving the reported condition. Successful cleanup invalidates resource progress;
-failed cleanup preserves the recovery journal.
-After confirmed owned Project/account and complete dependency cleanup, the
-provider explicitly calls the installed Agents extension's internal local cleanup
-command with the verified Project identity and deletion evidence. Agents removes
-saved remote context for every agent and version in that exact deleted Project,
-using its verified API endpoint and existing state locks. Other Projects and
-local contexts retain their saved bindings. Cloud teardown failure never invokes
-local cleanup. Local cleanup failure fails `azd down` and retains pending evidence;
-retrying `azd down` resumes it, and provisioning cannot replace that journal while
-local cleanup is pending. This boundary is provider-scoped: later infrastructure
-layers may fail after the deleted Project's context has been cleared. Matching
-Projects and Agents releases are required; core `postdown` dispatch is not used.
+The persisted environment and Project target are validated before cloud teardown.
+After resource-group deletion is confirmed, the provider calls the installed
+Agents extension's internal local cleanup command for the recorded Project
+endpoint. Agents removes saved remote contexts for every agent and version in
+that Project, retaining other Projects and local contexts. Cloud deletion failure
+does not invoke local cleanup. Local cleanup failure fails `azd down`, preserves
+pending state and blocks provisioning from replacing it; retrying `azd down`
+resumes cleanup even when the group is already absent. Successful teardown
+invalidates the retry record and deployment outputs. Matching Projects and Agents
+releases are required; core `postdown` dispatch is not used.
 
 Normal account deletion is soft deletion and can reserve the name for 48 hours.
-Only explicit `azd down --purge` requests irreversible purge; model deployments
-are removed first to avoid charges persisting through soft deletion. The regional
-deleted-account scope and location must match the persisted Account. Its
-CognitiveServices birth timestamp and the retained ARM inventory birth must fall
-within the same verified successful Account Create; missing or inconsistent
-evidence blocks purge. Journals
-from versions without authoritative Foundry lifecycle evidence are rejected
-rather than used to infer account absence or delete dependencies.
+Only explicit `azd down --purge` requests irreversible purge. As in the ordinary
+Foundry path, live accounts are enumerated before group deletion and model
+deployments are removed first.
 
 Foundry agent hosting configuration is fixed when the account is created. It
 cannot be added to an existing account or changed after creation, so

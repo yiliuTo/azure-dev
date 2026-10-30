@@ -1639,9 +1639,6 @@ func (p *FoundryProvisioningProvider) Destroy(
 	options *azdext.ProvisioningDestroyOptions,
 	progress grpcbroker.ProgressFunc,
 ) (*azdext.ProvisioningDestroyResult, error) {
-	if result, handled, err := p.destroyBYO(ctx, options, progress); handled {
-		return result, err
-	}
 	if p.brownfieldEndpoint != "" {
 		if p.existingProjectReuseOnly {
 			progress("Existing Foundry project is not owned by azd; leaving it in place")
@@ -1690,6 +1687,10 @@ func (p *FoundryProvisioningProvider) Destroy(
 			return nil, err
 		}
 	}
+	byoState, err := p.byoDestroyState(ctx)
+	if err != nil {
+		return nil, p.byoLifecycleError(err, exterrors.OpBYOOwnedCleanup)
+	}
 
 	if !options.GetForce() {
 		confirmed, err := p.confirmDestroy(ctx)
@@ -1702,6 +1703,14 @@ func (p *FoundryProvisioningProvider) Destroy(
 	}
 	if err := p.ensureCredential(ctx); err != nil {
 		return nil, err
+	}
+	if byoState != nil {
+		byoState.CleanupStarted = true
+		byoState.AgentStateCleanupPending = byoState.Foundry != nil && byoState.Foundry.ProjectEndpoint != ""
+		if err := (environmentJournal{p}).Save(ctx, *byoState); err != nil {
+			return nil, p.byoLifecycleError(fmt.Errorf(
+				"persist BYO teardown intent before resource-group deletion: %w", err), exterrors.OpBYOOwnedCleanup)
+		}
 	}
 	if p.brownfieldEndpoint != "" {
 		if err := p.deleteExistingProjectAcrConnection(ctx, progress); err != nil {
@@ -1750,7 +1759,7 @@ func (p *FoundryProvisioningProvider) Destroy(
 			// account from a prior incomplete cleanup is out of scope --
 			// the user can purge it manually via `az cognitiveservices
 			// account purge`.
-			return p.destroyResult(), nil
+			return p.finishBYODestroy(ctx, byoState)
 		}
 		return nil, exterrors.ServiceFromAzure(err, exterrors.OpResourceGroupDelete)
 	}
@@ -1768,7 +1777,7 @@ func (p *FoundryProvisioningProvider) Destroy(
 		}
 	}
 
-	return p.destroyResult(), nil
+	return p.finishBYODestroy(ctx, byoState)
 }
 
 func (p *FoundryProvisioningProvider) deleteExistingProjectAcrConnection(
@@ -2101,6 +2110,8 @@ func invalidatedEnvKeysResult() *azdext.ProvisioningDestroyResult {
 			"AZD_FOUNDRY_ACR_MODE",
 			"AZD_FOUNDRY_ACR_PULL_ASSIGNED",
 			envKeyFoundryRGOwner,
+			envKeyBYOJournal,
+			"AZD_BYO_AKS_OWNERSHIP",
 		},
 	}
 }

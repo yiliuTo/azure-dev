@@ -5,78 +5,15 @@ package onboarding
 
 import (
 	"encoding/json"
-	"net/http"
+
 	"strings"
 	"testing"
 
 	"azure.ai.projects/internal/synthesis"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestTemplateBindingUsesExportedContentNotGeneratorOrARMHashEquality(t *testing.T) {
-	raw, err := synthesis.ARMTemplate()
-	require.NoError(t, err)
-	var standard map[string]any
-	require.NoError(t, json.Unmarshal(raw, &standard))
-	digest, err := TemplateDigest(standard)
-	require.NoError(t, err)
-	for _, tc := range []struct {
-		name, digest string
-		mutate       func(map[string]any)
-		status       int
-		wantError    string
-	}{
-		{"new content digest", digest, nil, 200, ""},
-		{"new digest rejects changed content", digest, func(template map[string]any) {
-			template["outputs"] = map[string]any{}
-		}, 200, "actual template binding"},
-		{"export denied", digest, nil, 403, "read exact recorded deployment template"},
-		{"export missing", digest, nil, 404, "read exact recorded deployment template"},
-		{"export lacks template", digest, nil, 200, "template content is unavailable"},
-		{"generator metadata changes do not change content", digest, func(template map[string]any) {
-			delete(template, "metadata")
-		}, 200, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var template map[string]any
-			require.NoError(t, json.Unmarshal(raw, &template))
-			if tc.mutate != nil {
-				tc.mutate(template)
-			}
-			if tc.name == "export lacks template" {
-				template = nil
-			}
-			reads := 0
-			options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
-				reads++
-				require.Equal(t, http.MethodPost, request.Method, "export is a read-only POST, not a deployment write")
-				require.Equal(t, "/subscriptions/target/providers/Microsoft.Resources/deployments/exact/exportTemplate",
-					request.URL.Path)
-				require.Equal(t, "2021-04-01", request.URL.Query().Get("api-version"))
-				if tc.status != 200 {
-					body := `{"error":{"code":"AuthorizationFailed"}}`
-					return contractARMResponse(request, tc.status, body), nil
-				}
-				body, err := json.Marshal(map[string]any{"template": template})
-				require.NoError(t, err)
-				return contractARMResponse(request, http.StatusOK, string(body)), nil
-			})
-			client, err := armresources.NewDeploymentsClient("target", contractCredential{}, options)
-			require.NoError(t, err)
-			err = verifyAttemptTemplate(t.Context(), client, "exact",
-				FoundryAttempt{TemplateDigest: tc.digest})
-			if tc.wantError == "" {
-				require.NoError(t, err)
-			} else {
-				require.ErrorContains(t, err, tc.wantError)
-			}
-			assert.Equal(t, 1, reads)
-		})
-	}
-}
 
 func TestTemplateDigestRetainsResourceMetadata(t *testing.T) {
 	template := map[string]any{
@@ -186,7 +123,7 @@ func TestMissingContentDigestCannotRecoverOwnership(t *testing.T) {
 	encoded, err := json.Marshal(after)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(before), string(encoded), "read-only recovery must not rewrite the old hash or progress")
-	require.Error(t, f.lifecycle.Observe(t.Context(), f.base.plan))
+	require.Error(t, f.lifecycle.Observe(t.Context(), f.base.plan, f.result))
 	confirmed, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, hash, confirmed.Foundry.Attempts[0].TemplateHash, "preserve the old generator-version binding")

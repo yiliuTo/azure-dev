@@ -445,20 +445,3 @@ func TestStorageSkipDoesNotSkipBasicSubnetN02(t *testing.T) {
 	assert.Contains(t, f.reads, agent, "S03 skipping does not suppress required N02 subnet reads")
 	assert.NotContains(t, f.reads, pe, "Private Endpoint evidence is outside both checks")
 }
-
-func TestNewStorageObserveRetainsOwnershipOnly(t *testing.T) {
-	f := newCleanupARM(t, false, false)
-	f.deploy(t)
-	base := f.options.Transport
-	f.options.Transport = contractTransport(func(r *http.Request) (*http.Response, error) {
-		path := strings.ToLower(r.URL.Path)
-		assert.NotContains(t, path, "microsoft.network")
-		if strings.Contains(path, "microsoft.storage") {
-			storage := strings.ToLower(f.base.plan.Storage.ID)
-			assert.Contains(t, []string{storage, storage + "/providers/microsoft.authorization/roleassignments"}, path)
-		}
-		return base.Do(r)
-	})
-	f.lifecycle = NewLifecycle(contractCredential{}, f.options, f.base.journal)
-	require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
-}

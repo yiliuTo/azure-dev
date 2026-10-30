@@ -238,60 +238,6 @@ func TestP07ReadErrorsAndIncompleteEvidenceBlock(t *testing.T) {
 	require.Error(t, Report{check}.Err())
 }
 
-func TestP07CustomerInheritedGrantSurvivesDeploymentAndCleanup(t *testing.T) {
-	for _, tc := range []struct {
-		scope, role string
-		abac        bool
-	}{
-		{"rg", p07AcrPush, false},
-		{"subscription", registryRoleID(false), false},
-		{"rg", registryRoleID(true), true},
-	} {
-		t.Run(tc.scope+"/"+tc.role, func(t *testing.T) {
-			f := newCleanupARM(t, false, true)
-			facts := Facts{KubeletObjectID: f.spec.Deployment.KubeletObjectID, TenantID: "tenant", RegistryABAC: tc.abac}
-			f.spec.RegistryABAC = tc.abac
-			if tc.abac {
-				cleanupObject(t, f.base.resources[strings.ToLower(f.base.plan.Registry.ID)]["properties"])["roleAssignmentMode"] =
-					"AbacRepositoryPermissions"
-			}
-			scope := f.base.plan.Registry.Parent
-			if tc.scope == "subscription" {
-				registry, err := ParseID(f.base.plan.Registry.ID, "Microsoft.ContainerRegistry/registries")
-				require.NoError(t, err)
-				scope = "/subscriptions/" + registry.SubscriptionID
-			}
-			assignment := p07Assignment(scope, facts.KubeletObjectID, tc.role)
-			id := assignment["id"].(string)
-			f.base.resources[strings.ToLower(id)] = assignment
-			var paths []string
-			a := p07Authorizer(t, []any{assignment}, nil, &paths, http.StatusOK)
-			require.Equal(t, Pass, a.checkP07(t.Context(), f.base.plan, facts, callerIdentity{}, nil).Status)
-			baseOptions := f.base.options()
-			options := contractARMOptions(func(request *http.Request) (*http.Response, error) {
-				if strings.HasSuffix(request.URL.Path, "/roleAssignments") {
-					return a.options.Transport.Do(request)
-				}
-				return baseOptions.Transport.Do(request)
-			})
-			data, err := ResolveDeploymentBindings(t.Context(), contractCredential{}, options, f.base.plan, facts)
-			require.NoError(t, err)
-			require.Equal(t, id, data.KubeletRoleAssignmentID)
-			f.spec.Deployment = &data
-			f.deploy(t)
-			state, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			for step, grant := range state.Assignments {
-				assert.NotEqual(t, "G04", step)
-				assert.NotEqual(t, strings.ToLower(id), strings.ToLower(grant.ID))
-			}
-			require.NoError(t, f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
-			assert.Contains(t, f.base.resources, strings.ToLower(id))
-			assert.NotContains(t, f.deletes, id)
-		})
-	}
-}
-
 func TestP07OperatorExplicitTokenGroupsAtInheritedScope(t *testing.T) {
 	for _, group := range []string{"member-group", "nonmember-group"} {
 		t.Run(group, func(t *testing.T) {
@@ -310,49 +256,6 @@ func TestP07OperatorExplicitTokenGroupsAtInheritedScope(t *testing.T) {
 			} else {
 				assert.Equal(t, Fail, check.Status, check.Observed)
 			}
-		})
-	}
-}
-
-func TestP07OwnedGrantReuseRetainsRecoveryAndCleanup(t *testing.T) {
-	for _, recoverLedger := range []bool{false, true} {
-		t.Run(map[bool]string{false: "journaled", true: "recover prior attempt"}[recoverLedger], func(t *testing.T) {
-			f := newCleanupARM(t, false, true)
-			f.deploy(t)
-			state, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			facts := Facts{TenantID: "tenant", KubeletObjectID: f.spec.Deployment.KubeletObjectID}
-			var owned OwnedAssignment
-			for _, grant := range state.Assignments {
-				if strings.EqualFold(grant.Scope, f.base.plan.Registry.ID) &&
-					strings.EqualFold(grant.PrincipalID, facts.KubeletObjectID) {
-					owned = grant
-				}
-			}
-			require.NotEmpty(t, owned.ID)
-			require.True(t, owned.Complete)
-			if recoverLedger {
-				delete(state.Assignments, strings.ToLower(owned.ID))
-				require.NoError(t, f.base.journal.Save(t.Context(), state))
-			}
-			a := &scopedAuthorizer{credential: contractCredential{}, options: f.options}
-			check := a.checkP07(t.Context(), f.base.plan, facts, callerIdentity{}, errors.New("operator unavailable"))
-			require.Equal(t, Pass, check.Status, check.Observed)
-			data, err := ResolveDeploymentBindings(t.Context(), contractCredential{}, f.options, f.base.plan, facts)
-			require.NoError(t, err)
-			require.Equal(t, owned.ID, data.KubeletRoleAssignmentID)
-			f.spec.Deployment = &data
-			writeCount := len(f.base.graphGrantWrites)
-			f.deploy(t)
-			assert.NotContains(t, f.base.graphGrantWrites[writeCount:], owned.ID)
-			after, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, owned, after.Assignments[strings.ToLower(owned.ID)])
-			require.NoError(t, f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
-			assert.Contains(t, f.deletes, owned.ID)
-			after, err = f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			assert.True(t, after.Assignments[strings.ToLower(owned.ID)].Deleted)
 		})
 	}
 }

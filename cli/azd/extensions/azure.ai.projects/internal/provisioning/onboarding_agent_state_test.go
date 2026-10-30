@@ -8,45 +8,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"azure.ai.projects/internal/onboarding"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type agentCleanupLifecycle struct {
-	byoLifecycleContract
-	provider *FoundryProvisioningProvider
-	fail     bool
-}
-
-func (l *agentCleanupLifecycle) Cleanup(
-	ctx context.Context, _ onboarding.Plan, _ bool, _ func(string),
-) error {
-	if l.fail {
-		return errors.New("cloud cleanup failed")
-	}
-	journal := environmentJournal{l.provider}
-	state, err := journal.Load(ctx)
-	if err != nil {
-		return err
-	}
-	state.CleanupStarted, state.CleanupComplete = true, true
-	state.Foundry.ProjectDeleted, state.Foundry.AccountDeleted = true, true
-	return journal.Save(ctx, state)
-}
-
 // Exercises Destroy -> existing azd namespace dispatch -> production Agents binary.
-// Only the cloud lifecycle and the environment persistence service are fixtures.
+// Only ARM and environment persistence are fixtures.
 func TestBYOProviderAgentStateCleanupRealExtension(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and invokes the azd host and Agents extension")
@@ -102,11 +83,27 @@ func TestBYOProviderAgentStateCleanupRealExtension(t *testing.T) {
 		},
 	}
 	client := newResolveEnvTestClient(t, &resolveEnvStubEnvServer{}, &resolveEnvStubPromptServer{})
-	p := &FoundryProvisioningProvider{azdClient: client, projectPath: t.TempDir(), envName: "dev"}
+	cloudFailed := true
+	p := &FoundryProvisioningProvider{
+		azdClient: client, projectPath: t.TempDir(), envName: "dev",
+		subID: subscription, rgName: "rg", rgExplicit: true, credential: byoCredentialContract{},
+		armClientOptions: &arm.ClientOptions{ClientOptions: policy.ClientOptions{
+			Transport: byoHTTPContract(func(request *http.Request) (*http.Response, error) {
+				if request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/accounts") {
+					return contractLifecycleResponse(request, http.StatusOK, `{"value":[]}`), nil
+				}
+				require.Equal(t, http.MethodDelete, request.Method)
+				require.Equal(t, "/subscriptions/"+subscription+"/resourcegroups/rg", strings.ToLower(request.URL.Path))
+				if cloudFailed {
+					return contractLifecycleResponse(request, http.StatusForbidden,
+						`{"error":{"code":"AuthorizationFailed","message":"cloud cleanup failed"}}`), nil
+				}
+				return contractLifecycleResponse(request, http.StatusOK, ""), nil
+			}),
+		}},
+	}
 	journal := environmentJournal{p}
 	require.NoError(t, journal.Save(ctx, state))
-	lifecycle := &agentCleanupLifecycle{provider: p, fail: true}
-	p.byoLifecycle = lifecycle
 
 	const base = "acct.services.ai.azure.com/api/projects/project/agents/echo"
 	deleted := []string{base, base + "/versions/1/remote", base + "/versions/2/remote"}
@@ -138,7 +135,7 @@ func TestBYOProviderAgentStateCleanupRealExtension(t *testing.T) {
 		assert.Equal(t, original[key], actual)
 	}
 
-	lifecycle.fail = false
+	cloudFailed = false
 	badPath := paths[deleted[1]]
 	require.NoError(t, os.WriteFile(badPath, []byte("{"), 0o600))
 	result, err = p.Destroy(ctx, options, func(string) {})
@@ -157,7 +154,7 @@ func TestBYOProviderAgentStateCleanupRealExtension(t *testing.T) {
 		result, err = p.Destroy(ctx, options, func(string) {})
 		require.NoError(t, err)
 		require.NotNil(t, result)
-		assert.NotContains(t, result.InvalidatedEnvKeys, envKeyBYOJournal)
+		assert.Contains(t, result.InvalidatedEnvKeys, envKeyBYOJournal)
 		persisted, err := journal.Load(ctx)
 		require.NoError(t, err)
 		assert.False(t, persisted.AgentStateCleanupPending)

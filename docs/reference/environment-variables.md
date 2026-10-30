@@ -1,12 +1,13 @@
 # Environment Variables
 
-The experimental Projects BYO-AKS deployment-ownership record
+The experimental Projects BYO-AKS deployment retry record
 `AZD_FOUNDRY_BYO_AKS_PREPARATION` is persisted through the azd environment service,
 not read directly from the host shell. Preserve it for interrupted-operation
 recovery. Its compatibility name does not imply an independent write-capable
 preparation stage. Separate four-resource progress preserves original supplied
-provenance and confirmed preparation completion; it neither grants cleanup
-ownership nor replaces current-round preflight. Cloud `cleanupComplete` is
+selections and current-round preflight results, without post-ARM readiness gates.
+`azd down` deletes the entire explicit target resource group; resources at outside
+scopes are not selectively removed. Cloud `cleanupComplete` is
 independent of `agentStateCleanupPending`; pending local cleanup retains Project
 evidence and blocks provisioning until `azd down` completes that cleanup.
 See the [canonical extension-specific reference](../../cli/azd/docs/environment-variables.md#azureaiprojects).

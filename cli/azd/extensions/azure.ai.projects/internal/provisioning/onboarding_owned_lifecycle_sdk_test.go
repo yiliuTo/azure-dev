@@ -20,6 +20,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,8 +40,8 @@ func (l trackingBYOLifecycle) Start(
 	return nil
 }
 
-func (l trackingBYOLifecycle) Observe(context.Context, onboarding.Plan) error {
-	*l.events = append(*l.events, "readback")
+func (l trackingBYOLifecycle) Observe(context.Context, onboarding.Plan, armresources.DeploymentExtended) error {
+	*l.events = append(*l.events, "completion")
 	return nil
 }
 
@@ -152,8 +153,8 @@ func TestBYOProviderActualSDKSingleDeploymentCreateReuseAndNetworkSelections(t *
 					}
 					if choice != "none" && choice != "managed" {
 						assert.Equal(t, []string{
-							"resources", "authorization", "intent", "ARM", "readback",
-							"resources", "authorization", "intent", "ARM", "readback",
+							"resources", "authorization", "intent", "ARM", "completion",
+							"resources", "authorization", "intent", "ARM", "completion",
 						}, events)
 					}
 				})

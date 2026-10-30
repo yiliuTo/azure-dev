@@ -47,9 +47,6 @@ func RecordPreflight(ctx context.Context, plan Plan, report Report, journal Jour
 	}
 	progress := selectedProgress(plan)
 	for key, current := range progress {
-		if old, exists := state.ResourceProgress[key]; exists && !state.CleanupComplete {
-			current.PreparationComplete = old.PreparationComplete
-		}
 		applicable, passed := false, true
 		for _, check := range report {
 			if !check.Mandatory || check.Status == NotApplicable {

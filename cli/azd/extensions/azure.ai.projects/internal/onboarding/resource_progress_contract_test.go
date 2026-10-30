@@ -49,10 +49,8 @@ func TestResourceProgressRoundTripKeepsProvenanceAndCurrentPreflight(t *testing.
 	for key, entry := range state.ResourceProgress {
 		assert.False(t, entry.Supplied, key)
 		assert.True(t, entry.PreflightPassed, key)
-		assert.False(t, entry.PreparationComplete, key)
 	}
 	assert.Empty(t, state.Resources, "progress is not an owned cleanup ledger")
-	assert.Empty(t, state.Assignments)
 	report[0].Status = Fail
 	require.NoError(t, RecordPreflight(t.Context(), f.plan, report, f.journal))
 	state, err = f.journal.Load(t.Context())
@@ -74,7 +72,6 @@ func TestResourceProgressRoundTripKeepsProvenanceAndCurrentPreflight(t *testing.
 		"an owned registry's environment output does not change the original source")
 	var legacy PreparationState
 	require.NoError(t, json.Unmarshal([]byte(`{"version":2,"owner":"legacy"}`), &legacy))
-	assert.False(t, legacy.ResourceProgress["storageAccount"].PreparationComplete)
 	assert.False(t, legacy.ResourceProgress["hostingIdentity"].PreflightPassed)
 }
 
@@ -244,57 +241,6 @@ func TestSuppliedIdentityPermissionsAcceptInheritedEquivalentRoles(t *testing.T)
 	}
 }
 
-func TestPreparationAggregatesResourcesGrantsAndConnection(t *testing.T) {
-	for _, missing := range []string{"none", "G01", "G02", "G03", "G04", "F01", "connection"} {
-		t.Run(missing, func(t *testing.T) {
-			f := newCleanupARM(t, false, false)
-			require.NoError(t, f.submit(t))
-			if missing == "connection" {
-				delete(f.base.resources, strings.ToLower(f.spec.ProjectID+"/connections/"+f.base.plan.Registry.Name+"-conn"))
-			} else if missing != "none" {
-				state, err := f.base.journal.Load(t.Context())
-				require.NoError(t, err)
-				for _, grant := range grantRequests(f.base.plan, resourceProgressFacts(f),
-					Identity{PrincipalID: "00000000-0000-0000-0000-000000000001"},
-					Identity{PrincipalID: "00000000-0000-0000-0000-000000000002"}) {
-					if grant.checkID == missing && missing != "G04" {
-						deleteProgressGrant(t, f, grant.scope)
-						break
-					}
-				}
-				if missing == "G04" || missing == "F01" {
-					principal := f.spec.Deployment.KubeletObjectID
-					if missing == "F01" {
-						principal = "00000000-0000-0000-0000-000000000004"
-					}
-					for id, resource := range f.base.resources {
-						p, ok := resource["properties"].(map[string]any)
-						if ok && p["principalId"] == principal && p["scope"] == f.base.plan.Registry.ID {
-							delete(f.base.resources, id)
-						}
-					}
-				}
-				assert.NotEmpty(t, state.Resources["R02"].ID)
-			}
-			err := f.lifecycle.Observe(t.Context(), f.base.plan)
-			if missing == "none" {
-				require.NoError(t, err)
-			} else {
-				require.ErrorContains(t, err, "preparation evidence is incomplete")
-			}
-			state, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, missing != "G03", state.ResourceProgress["storageAccount"].PreparationComplete)
-			assert.Equal(t, missing != "G01" && missing != "G02",
-				state.ResourceProgress["hostingIdentity"].PreparationComplete)
-			assert.Equal(t, missing != "G02" && missing != "G03",
-				state.ResourceProgress["workloadIdentity"].PreparationComplete)
-			assert.Equal(t, missing != "G04" && missing != "F01" && missing != "connection",
-				state.ResourceProgress["containerRegistry"].PreparationComplete)
-		})
-	}
-}
-
 func TestProvidedIdentityFutureDependencyGrantRetryIsBounded(t *testing.T) {
 	for _, dependency := range []string{"Storage", "workload"} {
 		t.Run(dependency, func(t *testing.T) {
@@ -308,7 +254,7 @@ func TestProvidedIdentityFutureDependencyGrantRetryIsBounded(t *testing.T) {
 			f.deploymentState = "Failed"
 			f.afterMaterialize = func() { deleteProgressGrant(t, f, scope) }
 			require.Error(t, f.submit(t), "the ARM graph, not a write probe, reports the failed grant")
-			require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan))
+			require.NoError(t, f.lifecycle.Observe(t.Context(), f.base.plan, f.result))
 			before := append([]byte(nil), f.base.journal.data...)
 			resolved, err := ResolveRecoveryContext(
 				t.Context(), f.base.plan, contractCredential{}, f.options, f.base.journal)
@@ -342,9 +288,7 @@ func TestProvidedIdentityFutureDependencyGrantRetryIsBounded(t *testing.T) {
 			f.deploy(t)
 			state, err := f.base.journal.Load(t.Context())
 			require.NoError(t, err)
-			for key, entry := range state.ResourceProgress {
-				assert.True(t, entry.PreparationComplete, key)
-			}
+			assert.Equal(t, "Succeeded", state.Foundry.Attempts[len(state.Foundry.Attempts)-1].ProvisioningState)
 			deleteProgressGrant(t, f, scope)
 			resolved, err = ResolveRecoveryContext(t.Context(), resolved, contractCredential{}, f.options, f.base.journal)
 			require.NoError(t, err)
@@ -354,44 +298,21 @@ func TestProvidedIdentityFutureDependencyGrantRetryIsBounded(t *testing.T) {
 	}
 }
 
-func TestMissingPreparedResourceClearsProgressWithoutLosingReplacementProtection(t *testing.T) {
-	for _, step := range []string{"R02", "R04", "R05"} {
-		t.Run(step, func(t *testing.T) {
-			f := newCleanupARM(t, false, false)
-			f.deploy(t)
-			state, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			record := state.Resources[step]
-			require.True(t, record.Complete)
-			delete(f.base.resources, strings.ToLower(record.ID))
-			require.ErrorContains(t, f.lifecycle.Observe(t.Context(), f.base.plan), "preparation evidence is incomplete")
-			state, err = f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			assert.True(t, state.Resources[step].Complete, "historically confirmed ownership must not be downgraded")
-			key := map[string]string{"R02": "storageAccount", "R04": "hostingIdentity", "R05": "workloadIdentity"}[step]
-			assert.False(t, state.ResourceProgress[key].PreparationComplete)
-			_, err = f.lifecycle.Check(t.Context(), f.base.plan, f.spec)
-			require.ErrorContains(t, err, "disappeared")
-		})
-	}
-}
-
 func TestCloudSuccessLocalObservationFailureRecoversAllProgress(t *testing.T) {
 	f := newCleanupARM(t, false, true, true, true)
 	require.NoError(t, f.submit(t))
 	f.base.journal.fail = true
-	require.ErrorContains(t, f.lifecycle.Observe(t.Context(), f.base.plan), "journal unavailable")
+	require.ErrorContains(t, f.lifecycle.Observe(t.Context(), f.base.plan, f.result), "journal unavailable")
 	f.base.journal.fail = false
 	resolved, err := ResolveRecoveryContext(t.Context(), f.base.plan, contractCredential{}, f.options, f.base.journal)
 	require.NoError(t, err)
 	a := &scopedAuthorizer{credential: contractCredential{}, options: f.options}
 	require.NoError(t, a.suppliedIdentityChecks(t.Context(), resolved, resourceProgressFacts(f)).Err())
-	require.NoError(t, f.lifecycle.Observe(t.Context(), resolved))
+	require.NoError(t, f.lifecycle.Observe(t.Context(), resolved, f.result))
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	for key, entry := range state.ResourceProgress {
-		assert.True(t, entry.PreparationComplete, key)
-	}
+	assert.Equal(t, "Succeeded", state.Foundry.Attempts[0].ProvisioningState)
+	assert.NotEmpty(t, state.Foundry.ProjectEndpoint)
 	assert.NotContains(t, state.Resources, "R04")
 	assert.NotContains(t, state.Resources, "R05")
 }
@@ -399,10 +320,10 @@ func TestCloudSuccessLocalObservationFailureRecoversAllProgress(t *testing.T) {
 func TestPendingAgentStateCleanupPreservesEvidenceBeforeProvisioning(t *testing.T) {
 	f := newCleanupARM(t, false, false)
 	f.deploy(t)
-	require.NoError(t, f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
-	require.True(t, state.CleanupComplete)
+	state.CleanupStarted, state.CleanupComplete = true, true
+	state.Foundry.ProjectDeleted, state.Foundry.AccountDeleted = true, true
 	state.AgentStateCleanupPending = true
 	require.NoError(t, f.base.journal.Save(t.Context(), state))
 	before := append([]byte(nil), f.base.journal.data...)
@@ -442,39 +363,5 @@ func TestRecoveryDiscoveryRejectsActiveAndUnknownAttemptsBeforeIdentityChecks(t 
 			assert.Equal(t, before, f.base.journal.data)
 			assert.Empty(t, f.deletes)
 		})
-	}
-}
-
-func TestSuppliedIdentitiesAndUnrelatedFICSurviveOwnedCleanup(t *testing.T) {
-	for _, suppliedHosting := range []bool{false, true} {
-		for _, suppliedWorkload := range []bool{false, true} {
-			f := newCleanupARM(t, true, true, suppliedHosting, suppliedWorkload)
-			preserved := map[string][]byte{}
-			for _, resource := range []Resource{f.base.plan.Hosting, f.base.plan.Workload} {
-				if !resource.Supplied {
-					continue
-				}
-				id := strings.ToLower(resource.ID)
-				body, err := json.Marshal(f.base.resources[id])
-				require.NoError(t, err)
-				preserved[id] = body
-				ficID := id + "/federatedidentitycredentials/customer-unrelated"
-				f.base.resources[ficID] = map[string]any{"id": ficID}
-				preserved[ficID], err = json.Marshal(f.base.resources[ficID])
-				require.NoError(t, err)
-			}
-			f.deploy(t)
-			require.NoError(t, f.lifecycle.Cleanup(t.Context(), f.base.plan, false, nil))
-			state, err := f.base.journal.Load(t.Context())
-			require.NoError(t, err)
-			assert.True(t, state.CleanupComplete)
-			assert.Empty(t, state.ResourceProgress)
-			for id, expected := range preserved {
-				actual, err := json.Marshal(f.base.resources[id])
-				require.NoError(t, err)
-				assert.JSONEq(t, string(expected), string(actual))
-				assert.NotContains(t, f.deletes, id)
-			}
-		}
 	}
 }

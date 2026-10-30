@@ -16,14 +16,13 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 )
 
-// FoundrySpec binds the standard deployment to exact owned targets, not inferred names during deletion.
+// FoundrySpec retains the effective resource selections for another deployment attempt.
 type FoundrySpec struct {
 	AccountID      string          `json:"accountId"`
 	ProjectID      string          `json:"projectId"`
 	RegistryID     string          `json:"registryId"`
 	RegistryABAC   bool            `json:"registryABAC"`
 	Location       string          `json:"location"`
-	ModelNames     []string        `json:"modelNames"`
 	TemplateHash   string          `json:"templateHash,omitempty"`
 	TemplateDigest string          `json:"templateDigest,omitempty"`
 	Deployment     *DeploymentData `json:"deployment,omitempty"`
@@ -31,38 +30,31 @@ type FoundrySpec struct {
 
 // FoundryAttempt is persisted before submitting one generation of the stable ARM deployment.
 type FoundryAttempt struct {
-	ID                string           `json:"id"`
-	CorrelationID     string           `json:"correlationId,omitempty"`
-	Terminal          bool             `json:"terminal"`
-	TemplateHash      string           `json:"templateHash,omitempty"`
-	TemplateDigest    string           `json:"templateDigest,omitempty"`
-	ARMTemplateHash   string           `json:"armTemplateHash,omitempty"`
-	ProvisioningState string           `json:"provisioningState,omitempty"`
-	Evidence          *AttemptEvidence `json:"evidence,omitempty"`
-	Archived          bool             `json:"archived,omitempty"`
+	ID                string `json:"id"`
+	CorrelationID     string `json:"correlationId,omitempty"`
+	Terminal          bool   `json:"terminal"`
+	TemplateHash      string `json:"templateHash,omitempty"`
+	TemplateDigest    string `json:"templateDigest,omitempty"`
+	ARMTemplateHash   string `json:"armTemplateHash,omitempty"`
+	ProvisioningState string `json:"provisioningState,omitempty"`
+	Archived          bool   `json:"archived,omitempty"`
 }
 
-// FoundryState preserves control-plane ownership and teardown progress across interruptions.
+// FoundryState preserves deployment bindings and local cleanup progress across interruptions.
 type FoundryState struct {
-	Spec                 FoundrySpec          `json:"spec"`
-	Attempts             []FoundryAttempt     `json:"attempts"`
-	ProjectPrincipalID   string               `json:"projectPrincipalId,omitempty"`
-	ProjectEndpoint      string               `json:"projectEndpoint,omitempty"`
-	ModelsDeleted        map[string]bool      `json:"modelsDeleted,omitempty"`
-	ConnectionDeleted    bool                 `json:"connectionDeleted,omitempty"`
-	ProjectDeleteStarted bool                 `json:"projectDeleteStarted,omitempty"`
-	ProjectDeleted       bool                 `json:"projectDeleted,omitempty"`
-	Network              *FoundryNetworkState `json:"network,omitempty"`
-	AccountDeleted       bool                 `json:"accountDeleted"`
-	Purged               bool                 `json:"purged"`
+	Spec            FoundrySpec      `json:"spec"`
+	Attempts        []FoundryAttempt `json:"attempts"`
+	ProjectEndpoint string           `json:"projectEndpoint,omitempty"`
+	ProjectDeleted  bool             `json:"projectDeleted,omitempty"`
+	AccountDeleted  bool             `json:"accountDeleted"`
+	Purged          bool             `json:"purged"`
 }
 
-// Lifecycle journals one ARM graph and observes exact ownership for cleanup.
+// Lifecycle retains deployment intent and ARM results for interrupted provisioning.
 type Lifecycle interface {
 	Check(context.Context, Plan, FoundrySpec) (Report, error)
 	Start(context.Context, Plan, FoundrySpec, string) error
-	Observe(context.Context, Plan) error
-	Cleanup(context.Context, Plan, bool, func(string)) error
+	Observe(context.Context, Plan, armresources.DeploymentExtended) error
 }
 
 type ownedLifecycle struct {
@@ -71,7 +63,7 @@ type ownedLifecycle struct {
 	journal    Journal
 }
 
-// NewLifecycle uses read-only ARM observation before exact journaled cleanup.
+// NewLifecycle binds deployment attempts to the environment's persisted resource selections.
 func NewLifecycle(credential azcore.TokenCredential, options *arm.ClientOptions, journal Journal) Lifecycle {
 	return &ownedLifecycle{credential: credential, options: onboardingARMOptions(options), journal: journal}
 }
@@ -96,17 +88,24 @@ func CleanupPlan(state PreparationState) (Plan, error) {
 	}
 	if state.Foundry != nil {
 		account, err := ParseID(state.Foundry.Spec.AccountID, "Microsoft.CognitiveServices/accounts")
-		if err != nil {
-			return Plan{}, fmt.Errorf("persisted account target is invalid: %w", err)
+		if err != nil || !strings.EqualFold(account.SubscriptionID, plan.SubscriptionID) ||
+			!strings.EqualFold(account.ResourceGroupName, plan.ResourceGroup) {
+			return Plan{}, fmt.Errorf("persisted account target does not belong to the resource group")
+		}
+		project, err := ParseID(state.Foundry.Spec.ProjectID, "Microsoft.CognitiveServices/accounts/projects")
+		if err != nil || !strings.EqualFold(project.Parent.String(), account.String()) {
+			return Plan{}, fmt.Errorf("persisted Project target does not belong to the account")
+		}
+		if state.Foundry.ProjectEndpoint != "" {
+			if err := recordProjectEndpoint(&state, state.Foundry.ProjectEndpoint); err != nil {
+				return Plan{}, err
+			}
 		}
 		plan.Account = Resource{ID: state.Foundry.Spec.AccountID, Name: account.Name, Parent: account.Parent.String()}
 	}
 	if _, err := ParseID("/subscriptions/"+plan.SubscriptionID+"/resourceGroups/"+plan.ResourceGroup,
 		"Microsoft.Resources/resourceGroups"); err != nil {
 		return Plan{}, fmt.Errorf("persisted cleanup target is invalid: %w", err)
-	}
-	if err := validateCleanupLedger(plan, state); err != nil {
-		return Plan{}, err
 	}
 	return plan, nil
 }
@@ -131,8 +130,8 @@ func (l *ownedLifecycle) load(ctx context.Context, plan Plan) (PreparationState,
 		!strings.EqualFold(state.Location, plan.Location) || state.Location == "") {
 		return state, fmt.Errorf("journaled target scope/location is missing or differs from the environment")
 	}
-	if state.DeploymentID == "" && (state.Foundry != nil || len(state.Resources) > 0 || len(state.Assignments) > 0 ||
-		len(state.ResourceProgress) > 0 || len(state.Sources) > 0) {
+	if state.DeploymentID == "" && (state.Foundry != nil || len(state.Resources) > 0 ||
+		len(state.ResourceProgress) > 0) {
 		return state, fmt.Errorf("owned lifecycle journal has entries without an owner")
 	}
 	return state, nil
@@ -153,11 +152,6 @@ func validateFoundrySpec(plan Plan, spec FoundrySpec) error {
 	}
 	if _, err := ParseID(spec.RegistryID, "Microsoft.ContainerRegistry/registries"); err != nil {
 		return fmt.Errorf("Foundry lifecycle registry is invalid: %w", err)
-	}
-	for _, name := range spec.ModelNames {
-		if name == "" || strings.ContainsAny(name, "/\\?#%") {
-			return fmt.Errorf("Foundry model deployment name is invalid")
-		}
 	}
 	return nil
 }
@@ -204,7 +198,7 @@ func (l *ownedLifecycle) Check(ctx context.Context, plan Plan, spec FoundrySpec)
 		return fail(err)
 	}
 	if !state.CleanupComplete && state.DeploymentID != "" && state.Foundry == nil &&
-		(len(state.Resources) > 0 || len(state.Assignments) > 0) {
+		len(state.Resources) > 0 {
 		return fail(fmt.Errorf("legacy dependency ownership remains; retain the journal and complete azd down before deployment"))
 	}
 	if state.CleanupStarted && !state.CleanupComplete {
@@ -223,9 +217,6 @@ func (l *ownedLifecycle) Check(ctx context.Context, plan Plan, spec FoundrySpec)
 			return fail(fmt.Errorf("Foundry selections differ from the active ownership journal"))
 		}
 		if err := l.verifyAttempts(ctx, plan, state.Foundry); err != nil {
-			return fail(err)
-		}
-		if err := l.verifyResourceSources(ctx, plan, &state); err != nil {
 			return fail(err)
 		}
 	}
@@ -292,7 +283,7 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 		return fmt.Errorf("Foundry attempt requires no pending cleanup")
 	}
 	if state.DeploymentID != "" && state.Foundry == nil && !state.CleanupComplete &&
-		(len(state.Resources) > 0 || len(state.Assignments) > 0) {
+		len(state.Resources) > 0 {
 		return fmt.Errorf("legacy dependency ownership remains; complete owned cleanup before starting a new deployment")
 	}
 	if !state.CleanupComplete && state.Foundry != nil &&
@@ -315,12 +306,7 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	}
 	if state.CleanupComplete {
 		state.Resources = map[string]OwnedResource{}
-		state.Assignments = map[string]OwnedAssignment{}
 		state.Network = nil
-		state.Sources = nil
-	}
-	if err := l.recordInitialSources(ctx, plan, &state, spec); err != nil {
-		return err
 	}
 	state.Version = preparationJournalVersion
 	state.DeploymentID, state.Environment, state.SubscriptionID = plan.DeploymentID, plan.Environment, plan.SubscriptionID
@@ -333,9 +319,6 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 	}
 	if state.Resources == nil {
 		state.Resources = map[string]OwnedResource{}
-	}
-	if state.Assignments == nil {
-		state.Assignments = map[string]OwnedAssignment{}
 	}
 	for step, resource := range deploymentResources(plan) {
 		if resource.Supplied {
@@ -362,20 +345,9 @@ func (l *ownedLifecycle) Start(ctx context.Context, plan Plan, spec FoundrySpec,
 		if err := l.verifyAttempts(ctx, plan, state.Foundry); err != nil {
 			return err
 		}
-		if err := l.observeDeployment(ctx, plan, &state); err != nil {
-			return err
-		}
 		for index := range state.Foundry.Attempts {
 			attempt := &state.Foundry.Attempts[index]
-			if attempt.Evidence == nil {
-				return fmt.Errorf("previous ARM attempt lacks immutable provenance; refusing stable-root replacement")
-			}
 			attempt.Archived = true
-		}
-	}
-	for _, name := range spec.ModelNames {
-		if !slices.ContainsFunc(state.Foundry.Spec.ModelNames, func(old string) bool { return strings.EqualFold(old, name) }) {
-			state.Foundry.Spec.ModelNames = append(state.Foundry.Spec.ModelNames, name)
 		}
 	}
 	for _, attempt := range state.Foundry.Attempts {
@@ -409,16 +381,12 @@ func (l *ownedLifecycle) verifyAttempts(ctx context.Context, plan Plan, foundry 
 			return fmt.Errorf("recorded deployment's actual template binding is unverified")
 		}
 		if attempt.Archived {
-			if err := validateAttemptEvidence(*attempt); err != nil {
-				return err
-			}
-			if err := validateArchivedTarget(plan, foundry.Spec, *attempt); err != nil {
-				return err
-			}
-			if seen[attempt.CorrelationID] {
+			if attempt.CorrelationID != "" && seen[attempt.CorrelationID] {
 				return fmt.Errorf("duplicate archived deployment generation")
 			}
-			seen[attempt.CorrelationID] = true
+			if attempt.CorrelationID != "" {
+				seen[attempt.CorrelationID] = true
+			}
 			continue
 		}
 		client, err := armresources.NewDeploymentsClient(id.SubscriptionID, l.credential, l.options)
@@ -427,7 +395,7 @@ func (l *ownedLifecycle) verifyAttempts(ctx context.Context, plan Plan, foundry 
 		}
 		observed, err := client.GetAtSubscriptionScope(ctx, id.Name, nil)
 		if err != nil {
-			return fmt.Errorf("recorded deployment is unknown; refusing dependency deletion or another deployment: %w", err)
+			return fmt.Errorf("read previous ARM deployment before retry: %w", err)
 		}
 		properties := observed.Properties
 		if !strings.EqualFold(authString(observed.ID), attempt.ID) || properties == nil {
@@ -439,9 +407,6 @@ func (l *ownedLifecycle) verifyAttempts(ctx context.Context, plan Plan, foundry 
 		actualHash := authString(properties.TemplateHash)
 		if actualHash == "" || attempt.ARMTemplateHash != "" && actualHash != attempt.ARMTemplateHash {
 			return fmt.Errorf("recorded deployment's actual template binding is unverified or changed")
-		}
-		if err := verifyAttemptTemplate(ctx, client, id.Name, *attempt); err != nil {
-			return err
 		}
 		var parameters map[string]struct {
 			Value string `json:"value"`
@@ -496,19 +461,6 @@ func (l *ownedLifecycle) verifyAttempts(ctx context.Context, plan Plan, foundry 
 		default:
 			return fmt.Errorf("recorded deployment is still active; wait for it to terminate before proceeding")
 		}
-		if err := l.captureAttemptEvidence(ctx, attempt, properties); err != nil {
-			return err
-		}
-		current, err := client.GetAtSubscriptionScope(ctx, id.Name, nil)
-		if err != nil {
-			return fmt.Errorf("recheck root deployment generation after provenance capture: %w", err)
-		}
-		expectedProperties, _ := json.Marshal(properties)
-		actualProperties, _ := json.Marshal(current.Properties)
-		if !strings.EqualFold(authString(current.ID), attempt.ID) ||
-			string(expectedProperties) != string(actualProperties) {
-			return fmt.Errorf("root deployment generation changed during provenance capture")
-		}
 		seen[correlation] = true
 	}
 	return nil
@@ -527,7 +479,7 @@ func subscriptionDeploymentID(value, subscription string) (*arm.ResourceID, erro
 	return id, nil
 }
 
-func (l *ownedLifecycle) Observe(ctx context.Context, plan Plan) error {
+func (l *ownedLifecycle) Observe(ctx context.Context, plan Plan, result armresources.DeploymentExtended) error {
 	state, err := l.load(ctx, plan)
 	if err != nil {
 		return err
@@ -535,23 +487,52 @@ func (l *ownedLifecycle) Observe(ctx context.Context, plan Plan) error {
 	if state.Foundry == nil {
 		return fmt.Errorf("Foundry lifecycle intent is missing")
 	}
-	if err := l.verifyAttempts(ctx, plan, state.Foundry); err != nil {
-		return err
+	if len(state.Foundry.Attempts) == 0 || result.Properties == nil || result.Properties.ProvisioningState == nil {
+		return fmt.Errorf("ARM deployment result is missing its attempt or state")
 	}
-	if err := l.observeDeployment(ctx, plan, &state); err != nil {
-		return err
+	attempt := &state.Foundry.Attempts[len(state.Foundry.Attempts)-1]
+	if !strings.EqualFold(attempt.ID, plan.DeploymentID) ||
+		result.ID != nil && !strings.EqualFold(*result.ID, attempt.ID) {
+		return fmt.Errorf("ARM deployment result differs from the submitted target")
 	}
-	if err := l.journal.Save(ctx, state); err != nil {
-		return err
+	if attempt.TemplateHash == "" || attempt.TemplateDigest == "" {
+		return fmt.Errorf("submitted deployment template binding is missing")
 	}
-	if len(state.Foundry.Attempts) > 0 &&
-		state.Foundry.Attempts[len(state.Foundry.Attempts)-1].ProvisioningState == "Succeeded" {
-		for _, key := range []string{"storageAccount", "containerRegistry", "hostingIdentity", "workloadIdentity"} {
-			if !state.ResourceProgress[key].PreparationComplete {
-				return fmt.Errorf(
-					"ARM deployment succeeded but %s preparation evidence is incomplete; retain the journal and retry", key)
-			}
+	correlation := authString(result.Properties.CorrelationID)
+	if correlation == "" || attempt.CorrelationID != "" && attempt.CorrelationID != correlation {
+		return fmt.Errorf("ARM deployment result correlation is missing or changed")
+	}
+	for _, previous := range state.Foundry.Attempts[:len(state.Foundry.Attempts)-1] {
+		if previous.CorrelationID == correlation {
+			return fmt.Errorf("ARM deployment result correlation belongs to an earlier attempt")
 		}
 	}
-	return nil
+	status := string(*result.Properties.ProvisioningState)
+	switch status {
+	case "Succeeded", "Failed", "Canceled":
+		attempt.Terminal = true
+	default:
+		return fmt.Errorf("ARM deployment result is not terminal: %s", status)
+	}
+	attempt.CorrelationID = correlation
+	attempt.ProvisioningState = status
+	attempt.ARMTemplateHash = authString(result.Properties.TemplateHash)
+	if status == "Succeeded" {
+		raw, err := json.Marshal(result.Properties.Outputs)
+		if err != nil {
+			return fmt.Errorf("encode deployment outputs for retry state: %w", err)
+		}
+		var outputs struct {
+			ProjectEndpoint struct {
+				Value string `json:"value"`
+			} `json:"FOUNDRY_PROJECT_ENDPOINT"`
+		}
+		if err := json.Unmarshal(raw, &outputs); err != nil {
+			return fmt.Errorf("decode Project endpoint from deployment outputs: %w", err)
+		}
+		if err := recordProjectEndpoint(&state, outputs.ProjectEndpoint.Value); err != nil {
+			return err
+		}
+	}
+	return l.journal.Save(ctx, state)
 }

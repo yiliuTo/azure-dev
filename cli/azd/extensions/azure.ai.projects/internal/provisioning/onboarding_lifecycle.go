@@ -47,21 +47,6 @@ func byoFoundrySpec(plan onboarding.Plan, source *templateSource, abac bool) (on
 		RegistryID: plan.Registry.ID, RegistryABAC: abac, Location: plan.Location,
 		TemplateHash: hash, TemplateDigest: digest,
 	}
-	if raw := byoParameterValue(source, "deployments"); raw != nil {
-		data, err := json.Marshal(raw)
-		if err != nil {
-			return spec, err
-		}
-		var deployments []struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(data, &deployments); err != nil {
-			return spec, fmt.Errorf("read exact model deployment lifecycle targets: %w", err)
-		}
-		for _, deployment := range deployments {
-			spec.ModelNames = append(spec.ModelNames, deployment.Name)
-		}
-	}
 	return spec, nil
 }
 
@@ -141,7 +126,7 @@ func (p *FoundryProvisioningProvider) deployBYO(
 	if err != nil {
 		return nil, p.deploymentFailure(ctx, err)
 	}
-	if err := lifecycle.Observe(ctx, plan); err != nil {
+	if err := lifecycle.Observe(ctx, plan, response.DeploymentExtended); err != nil {
 		return nil, p.byoLifecycleError(err, exterrors.OpArmDeploymentCreate)
 	}
 	outputs := deploymentOutputs(response.Properties)

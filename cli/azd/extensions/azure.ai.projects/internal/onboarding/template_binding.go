@@ -4,14 +4,11 @@
 package onboarding
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
-
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 )
 
 // TemplateDigest binds the actual template content independently of Bicep and ARM service hash algorithms.
@@ -93,21 +90,4 @@ func templateDeclaration(value any) any {
 		}
 	}
 	return result
-}
-
-func verifyAttemptTemplate(
-	ctx context.Context, client *armresources.DeploymentsClient, name string, attempt FoundryAttempt,
-) error {
-	exported, err := client.ExportTemplateAtSubscriptionScope(ctx, name, nil)
-	if err != nil {
-		return fmt.Errorf("read exact recorded deployment template binding: %w", err)
-	}
-	actual, err := TemplateDigest(exported.Template)
-	if err != nil {
-		return err
-	}
-	if actual != attempt.TemplateDigest {
-		return fmt.Errorf("recorded deployment's actual template binding is unverified or changed")
-	}
-	return nil
 }

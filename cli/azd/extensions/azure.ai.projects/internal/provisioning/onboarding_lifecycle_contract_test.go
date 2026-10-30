@@ -124,8 +124,6 @@ func TestBYOSelectedOperationsFollowEffectiveOnDiskInputs(t *testing.T) {
 	}
 	require.NoError(t, p.planBYO(t.Context(), func(string) {}, false))
 	assert.True(t, checked)
-	assert.Equal(t, []string{"selected-model"}, p.byoSpec.ModelNames,
-		"removing model permission inference does not remove the actual deployment")
 }
 
 func TestBYOPlannedGroupTagsPreserveObservedAndExplicitChoices(t *testing.T) {

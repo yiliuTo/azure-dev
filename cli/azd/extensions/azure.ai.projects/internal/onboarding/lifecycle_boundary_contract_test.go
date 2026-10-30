@@ -34,19 +34,10 @@ func lifecycleBoundaryLedger() PreparationState {
 			"R04": {ID: parent + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/hosting", Complete: true},
 			"R05": {ID: parent + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/workload", Complete: true},
 		},
-		Assignments: map[string]OwnedAssignment{
-			"project-access": {
-				ID:    registry + "/providers/Microsoft.Authorization/roleAssignments/33333333-3333-3333-3333-333333333333",
-				Scope: registry, PrincipalID: "44444444-4444-4444-4444-444444444444",
-				RoleID: "/subscriptions/" + registrySubscription +
-					"/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d",
-				Complete: true,
-			},
-		},
 		Foundry: &FoundryState{
 			Spec: FoundrySpec{
 				AccountID: account.ID, ProjectID: account.ID + "/projects/project",
-				RegistryID: registry, Location: plan.Location, ModelNames: []string{"model-a"},
+				RegistryID: registry, Location: plan.Location,
 				Deployment: &DeploymentData{},
 			},
 			Attempts: []FoundryAttempt{{
@@ -72,10 +63,6 @@ func TestCleanupPlanPreservesExactPersistedScopeAndHistory(t *testing.T) {
 					record.Deleted = key != "R01"
 					state.Resources[key] = record
 				}
-				for key, record := range state.Assignments {
-					record.Deleted = true
-					state.Assignments[key] = record
-				}
 			}
 			before, err := json.Marshal(state)
 			require.NoError(t, err)
@@ -89,7 +76,7 @@ func TestCleanupPlanPreservesExactPersistedScopeAndHistory(t *testing.T) {
 			assert.Equal(t, state.Location, plan.Location)
 			after, err := json.Marshal(state)
 			require.NoError(t, err)
-			assert.Equal(t, before, after, "resolving cleanup must not discard grants, attempts or deletion tombstones")
+			assert.Equal(t, before, after, "resolving cleanup must not discard retry or local cleanup state")
 		})
 	}
 }
@@ -108,43 +95,9 @@ func TestCleanupPlanRejectsAmbiguousPersistedOwnership(t *testing.T) {
 		{"missing group", func(s *PreparationState) { s.ResourceGroup = "" }},
 		{"missing location", func(s *PreparationState) { s.Location = "" }},
 		{"invalid target group", func(s *PreparationState) { s.ResourceGroup = "owned-rg/providers/foreign/type" }},
-		{"foreign owned resource", func(s *PreparationState) {
-			record := s.Resources["R04"]
-			record.ID = strings.Replace(record.ID, s.SubscriptionID, "55555555-5555-5555-5555-555555555555", 1)
-			s.Resources["R04"] = record
-		}},
-		{"unknown resource step", func(s *PreparationState) { s.Resources["R99"] = s.Resources["R04"] }},
-		{"wrong resource type", func(s *PreparationState) { s.Resources["R02"] = s.Resources["R04"] }},
-		{"assignment scope mismatch", func(s *PreparationState) {
-			record := s.Assignments["project-access"]
-			record.Scope += "-other"
-			s.Assignments["project-access"] = record
-		}},
-		{"assignment missing principal", func(s *PreparationState) {
-			record := s.Assignments["project-access"]
-			record.PrincipalID = ""
-			s.Assignments["project-access"] = record
-		}},
-		{"assignment missing role", func(s *PreparationState) {
-			record := s.Assignments["project-access"]
-			record.RoleID = ""
-			s.Assignments["project-access"] = record
-		}},
-		{"subnet without topology", func(s *PreparationState) {
-			s.Resources["R06Subnet"] = OwnedResource{
-				ID: "/subscriptions/" + s.SubscriptionID + "/resourceGroups/network-rg/" +
-					"providers/Microsoft.Network/virtualNetworks/nodes/subnets/agents",
-			}
-		}},
 		{"account target mismatch", func(s *PreparationState) { s.Foundry.Spec.AccountID += "-other" }},
 		{"project parent mismatch", func(s *PreparationState) {
 			s.Foundry.Spec.ProjectID = strings.Replace(s.Foundry.Spec.ProjectID, "/cog-", "/other-", 1)
-		}},
-		{"account location mismatch", func(s *PreparationState) { s.Foundry.Spec.Location = "westus" }},
-		{"model name contains child path", func(s *PreparationState) { s.Foundry.Spec.ModelNames = []string{"model/child"} }},
-		{"model name contains query", func(s *PreparationState) { s.Foundry.Spec.ModelNames = []string{"model?value"} }},
-		{"model name contains encoded separator", func(s *PreparationState) {
-			s.Foundry.Spec.ModelNames = []string{"model%2fchild"}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,20 +133,17 @@ func TestLifecycleAttemptIntentIsDurableBeforeARM(t *testing.T) {
 	state, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	spec := f.spec
-	spec.ModelNames = []string{"owned-model", "model-b"}
 	id := f.base.plan.DeploymentID
 	require.NoError(t, f.lifecycle.Start(t.Context(), f.base.plan, spec, id))
 	saved, err := f.base.journal.Load(t.Context())
 	require.NoError(t, err)
 	require.Len(t, saved.Foundry.Attempts, 2)
 	assert.True(t, saved.Foundry.Attempts[0].Archived)
-	assert.Equal(t, state.Foundry.Attempts[0].Evidence, saved.Foundry.Attempts[0].Evidence)
+	assert.Equal(t, state.Foundry.Attempts[0].CorrelationID, saved.Foundry.Attempts[0].CorrelationID)
 	assert.Equal(t, FoundryAttempt{ID: id, TemplateHash: spec.TemplateHash, TemplateDigest: spec.TemplateDigest},
 		saved.Foundry.Attempts[1],
 		"a new intent must not inherit a terminal state or correlation from an earlier attempt")
-	assert.Equal(t, []string{"owned-model", "model-b"}, saved.Foundry.Spec.ModelNames)
 	assert.Equal(t, state.Resources, saved.Resources)
-	assert.Equal(t, state.Assignments, saved.Assignments)
 }
 
 func TestLifecycleAttemptRejectsAmbiguousJournalWithoutSaving(t *testing.T) {
