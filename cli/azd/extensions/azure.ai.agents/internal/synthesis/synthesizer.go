@@ -259,7 +259,10 @@ func Synthesize(in Input) (*Result, error) {
 	if hosting != nil {
 		params["agentHosting"] = agentHostingParameter{
 			Enabled: true, HostingType: "ManagedCluster", Name: "default",
-			ClusterResourceID: hosting.ClusterResourceID,
+			ClusterResourceID:                   hosting.ClusterResourceID,
+			StorageAccountResourceID:            hosting.StorageAccountResourceID,
+			HostingManagementIdentityResourceID: hosting.HostingManagementIdentityResourceID,
+			WorkloadIdentityResourceID:          hosting.WorkloadIdentityResourceID,
 		}
 	}
 

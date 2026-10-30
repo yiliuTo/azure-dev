@@ -11,7 +11,7 @@ Six capabilities are off by default. Each one is turned on separately.
 | `agents.long_running` | Starting background Responses invocations with `--long-running` / `--no-wait` | `AZD_ALPHA_ENABLE_AGENTS_LONG_RUNNING` |
 | `agents.a2a` | A2A init selection, explicit wire versions, and the 1.0 message default; existing A2A 0.3 invocation remains available without opt-in | `AZD_ALPHA_ENABLE_AGENTS_A2A` |
 | `agents.memory_snapshot` | Hosted agent memory snapshot opt-in | `AZD_ALPHA_ENABLE_AGENTS_MEMORY_SNAPSHOT` |
-| `agents.byo_aks` | [Existing AKS hosting with default supporting resources](../azure.ai.projects/README.md#existing-aks-hosting) | `AZD_ALPHA_ENABLE_AGENTS_BYO_AKS` |
+| `agents.byo_aks` | [Existing AKS hosting with default or supplied supporting resources](../azure.ai.projects/README.md#existing-aks-hosting) | `AZD_ALPHA_ENABLE_AGENTS_BYO_AKS` |
 
 Set the desired variable in your shell or CI before running azd:
 
@@ -1716,7 +1716,7 @@ deployment.
 
 Foundry project services can be provisioned as network-secured, VNet-bound accounts by adding a `network:` block to the `host: azure.ai.project` service in `azure.yaml`. The `azure.ai.projects` extension owns that service and the `microsoft.foundry` provider; this extension still authors the block during agent init. See [Private networking for `host: azure.ai.project`](docs/private-networking.md) for the schema reference, BYO-image requirements, and VNet deployment cheatsheet.
 
-For an existing AKS cluster, set `agentHosting.clusterResourceId` on that project service. [Existing AKS hosting](../azure.ai.projects/README.md#existing-aks-hosting) describes the default Storage, separate managed identities, single native registry, required permissions, and lifecycle limitations. Foundry networking is optional and configured independently through `network:`. This mode does not accept supplied supporting resources or Terraform eject.
+For an existing AKS cluster, set `agentHosting.clusterResourceId` on that project service. Storage and the two managed identities can each be supplied independently; omitted resources retain their default creation/update path. [Existing AKS hosting](../azure.ai.projects/README.md#existing-aks-hosting) describes the input fields, read-only preflight, single native registry, required permissions, and teardown limitations. Foundry networking is optional and configured independently through `network:`. Supplied registries and Terraform eject are not supported.
 
 ## Local Development
 

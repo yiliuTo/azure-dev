@@ -86,6 +86,13 @@ Extensions declare their capabilities in `extension.yaml`:
 | `provisioning-provider` | Add custom infrastructure provisioning support |
 | `metadata` | Provide metadata about commands and capabilities |
 
+The first-party `microsoft.foundry` provisioning provider supports existing AKS hosting
+with independently supplied Storage and hosting/workload identities. Read-only supporting-resource
+and authorization preflight gates deployment and ARM what-if; omitted resources retain their
+normal ARM creation/update path and the registry remains azd-created. See
+[Existing AKS hosting](../../cli/azd/extensions/azure.ai.projects/README.md#existing-aks-hosting)
+for the preview opt-in, checks, current-state retry semantics, and resource-group teardown scope.
+
 ## Available gRPC Services
 
 Extensions can access these azd services via gRPC:

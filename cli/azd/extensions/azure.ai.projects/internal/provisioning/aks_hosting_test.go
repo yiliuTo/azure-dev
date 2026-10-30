@@ -255,7 +255,7 @@ func TestBYOPrepareOnlySuppliesDeclaredHostBindings(t *testing.T) {
 	require.True(t, ok)
 	delete(definitions, "kubeletObjectId")
 	delete(definitions, "federatedIdentityRoleDefinitionId")
-	require.NoError(t, p.prepareBYO(t.Context(), source))
+	require.NoError(t, p.prepareBYO(t.Context(), source, func(string) {}))
 	assert.NotContains(t, source.parameters, "kubeletObjectId")
 	assert.NotContains(t, source.parameters, "federatedIdentityRoleDefinitionId")
 	assert.Len(t, fake.requests, 3, "preparation only reads host bindings and the resource group")
@@ -267,7 +267,7 @@ func TestBYORejectsLocalConflictsBeforeAuthentication(t *testing.T) {
 		value         any
 	}{
 		{"includeAcr", "requires includeAcr=true", false},
-		{"agentHosting", `unknown field "storageAccountResourceId"`,
+		{"agentHosting", "conflict with azure.yaml",
 			map[string]any{"enabled": true, "storageAccountResourceId": "supplied"}},
 		{"agentHosting", "conflict with azure.yaml", map[string]any{
 			"enabled": true, "hostingType": "ManagedCluster", "name": "default",
@@ -280,7 +280,7 @@ func TestBYORejectsLocalConflictsBeforeAuthentication(t *testing.T) {
 			source, err := p.resolveTemplate(t.Context(), func(string) {})
 			require.NoError(t, err)
 			source.parameters[test.key] = map[string]any{"value": test.value}
-			require.ErrorContains(t, p.prepareBYO(t.Context(), source), test.expected)
+			require.ErrorContains(t, p.prepareBYO(t.Context(), source, func(string) {}), test.expected)
 			assert.Empty(t, fake.requests)
 		})
 	}
@@ -290,7 +290,7 @@ func TestBYOInitializeRejectsInvalidInputsBeforePromptsOrPersistence(t *testing.
 	for _, onDisk := range []bool{false, true} {
 		root := t.TempDir()
 		config := "services:\n  project:\n    host: azure.ai.project\n" +
-			"    agentHosting: {clusterResourceId: " + offlineClusterID + ", storageAccountResourceId: ''}\n"
+			"    agentHosting: {clusterResourceId: " + offlineClusterID + ", storageAccountResourceId: []}\n"
 		path := filepath.Join(root, "azure.yaml")
 		require.NoError(t, os.WriteFile(path, []byte(config), 0o600))
 		if onDisk {
@@ -301,7 +301,7 @@ func TestBYOInitializeRejectsInvalidInputsBeforePromptsOrPersistence(t *testing.
 		prompt := &resolveEnvStubPromptServer{}
 		p := &FoundryProvisioningProvider{azdClient: newResolveEnvTestClient(t, env, prompt)}
 		err := p.Initialize(t.Context(), root, &azdext.ProvisioningOptions{Provider: FoundryProviderName})
-		require.ErrorContains(t, err, "storageAccountResourceId: unsupported property")
+		require.ErrorContains(t, err, "storageAccountResourceId: expected a nonempty resource ID")
 		assert.Empty(t, env.set)
 		assert.Zero(t, prompt.subscriptionN)
 		assert.Zero(t, prompt.locationN)

@@ -7,8 +7,8 @@ import "embed"
 
 // Re-generate main.arm.json from main.bicep. Run via `go generate ./...`
 // from the extension root after editing any *.bicep file under templates/.
-// The compiled ARM JSON is embedded so the provisioning provider never
-// needs a bicep CLI at user runtime.
+// Deployment uses embedded ARM JSON. Supplied-resource preflight may use
+// azd-managed Bicep to evaluate unchanged default resource names.
 //
 //go:generate bicep build templates/main.bicep --outfile templates/main.arm.json
 //go:generate bicep build templates/existing-project.bicep --outfile templates/existing-project.arm.json

@@ -170,7 +170,7 @@ The generated account, project and model deployment resources use API `2025-06-0
 
 The provider checks the opt-in before prompting or persisting environment values, including for on-disk Bicep. It also checks before authentication or AKS reads in provision and preview. Agents init/adoption, preprovision/predeploy, and infrastructure eject enforce the same opt-in. A disabled preview returns `feature_not_enabled` with the variable to set.
 
-Provision and preview inspect the effective `agentHosting` value after parameter merging, including template defaults when no value is supplied. Enabled hosting requires the opt-in and a matching `agentHosting.clusterResourceId` declaration in `azure.yaml`; removing the YAML declaration does not bypass validation. The hosting value must be a locally readable literal object, not an ARM expression. Invalid combinations are rejected before submitting ARM requests.
+Provision and preview inspect the effective `agentHosting` value after parameter merging, including template defaults when no value is supplied. Enabled hosting requires the opt-in and matching cluster and supporting-resource selections in `azure.yaml`; removing the YAML declaration does not bypass validation. The hosting value must be a locally readable literal object, not an ARM expression. Locally checkable invalid combinations are rejected before authentication.
 
 Set `agentHosting.clusterResourceId` on the `azure.ai.project` service to use an existing AKS cluster when creating a **new** Foundry account and project:
 
@@ -197,17 +197,35 @@ The default resource graph creates:
 
 The account receives a `ManagedCluster` / `default` hosting configuration. Its data-plane access follows the optional `network` configuration. **Storage and ACR use public authenticated endpoints**, so the cluster must be able to reach them. Registry creation uses API `2023-07-01` and relies on the default registry RBAC mode. The deploying principal needs read access to the existing AKS cluster, built-in role definitions and target resource group, creation rights for the new resources, and role-assignment write rights at the cluster, workload identity, Storage and registry scopes. Configuring private networking additionally requires the corresponding network permissions.
 
-Only the existing cluster is selectable: supplied Storage accounts, hosting/workload identities, and registries are not supported. An existing `endpoint:` cannot receive hosting. `${VAR}` inputs resolve from the active azd environment; a cluster ID is not a Kubernetes context name.
+Storage and the two identities can each be supplied independently using complete ARM resource IDs:
 
-`azd provision --preview` resolves the host bindings and returns the standard ARM what-if changes without creating resources. `azd provision` uses the same ARM deployment path as a project without AKS hosting. The Bicep template derives the supporting resource names and creates them with the required grants. Successful provisioning returns the standard Project ID, endpoint and registry outputs used by `azd deploy`.
+```yaml
+agentHosting:
+  clusterResourceId: ${AKS_CLUSTER_ID}
+  storageAccountResourceId: ${STORAGE_ACCOUNT_ID}
+  hostingManagementIdentityResourceId: ${HOSTING_IDENTITY_ID}
+  workloadIdentityResourceId: ${WORKLOAD_IDENTITY_ID}
+```
 
-`azd down` uses the standard Foundry teardown path, including its confirmation and `--force` behavior. It deletes model deployments and the target resource group with all resources inside it, including pre-existing resources; cleanup is not limited to resources created by the ARM deployment. An existing AKS cluster or network in the target resource group is deleted along with the group. Resources in other resource groups are outside this group-deletion scope. Infrastructure layers retain the standard Foundry resource-group ownership checks.
+Omit any supporting-resource field to retain its default creation/update path. A supplied resource is referenced without a Storage or identity PUT, reconfiguration, or owner tag. Hosting-management and workload identities must be distinct. The Container Registry remains native and azd-created; a supplied registry is not supported. An existing `endpoint:` cannot receive hosting. `${VAR}` inputs resolve from the active azd environment, including in `$ref` service definitions; a cluster ID is not a Kubernetes context name.
 
-Embedded provisioning and Bicep eject are supported through `microsoft.foundry`; Terraform eject is rejected before changing files. On-disk Bicep templates and parameter files remain editable. Keep the AKS hosting, network and registry inputs consistent with the declared hosting configuration.
+When any supporting-resource ID is supplied, provision and preview run read-only preflight before ARM deployment or what-if. Mandatory failures and unverified evidence block both operations. Checks cover resource existence and identity metadata, the owning tenant of the target and referenced subscriptions, applicable scopes, supplied-identity grants, and deploying-principal permissions. These checks do not add AKS or account-network readiness validation.
+
+Supplied Storage must have a successful provisioning state, StorageV2 kind, Hot tier, HNS explicitly disabled, HTTPS-only transport, TLS 1.2 or later, Shared Key disabled, and anonymous Blob access disabled. Missing security properties use the Storage API's documented defaults. Zone redundancy is recommended but does not block provisioning. The network check requires a valid HTTPS Blob endpoint and explicit network settings: public access with an allow-default firewall passes the static baseline, not a connectivity test. Restricted/private network connectivity is skipped with a warning and does not block provisioning.
+
+A supplied hosting-management identity needs Reader and Kubernetes Extension Contributor on the cluster, plus federation-management access when the workload identity already exists. A supplied workload identity needs Storage Blob Data Contributor when Storage already exists. Applicable inherited or provably equivalent unconditional permissions are accepted; missing or unsupported evidence blocks provisioning. If the dependency does not yet exist, preflight checks the deployer's creation and unconditional role-assignment permissions and ARM creates the dependency and grant. ARM creates the federation or Storage grant when either corresponding resource selection is omitted; two explicit endpoints require existing grants.
+
+Preflight uses current Azure state, not a persisted deployment journal. An existing target missing a required supplied-identity grant can block a retry, including after an interrupted deployment. Omitted Storage retains the deterministic `st<resourceToken>` name and ordinary ARM creation/update path even if it already exists; current existence does not convert it into a supplied reference or establish ownership.
+
+`azd provision --preview` resolves the host bindings, runs applicable preflight, and returns standard ARM what-if changes without creating resources. `azd provision` uses the normal ARM deployment path. Successful provisioning returns the standard Project ID, endpoint and registry outputs used by `azd deploy`.
+
+`azd down` uses the standard Foundry teardown path, including its confirmation and `--force` behavior. It deletes model deployments and the target resource group with all resources inside it, including pre-existing resources; cleanup is not limited to resources created by the ARM deployment. An existing AKS cluster, network, supplied Storage, or supplied identity in the target resource group is deleted along with the group. Resources in other resource groups are outside this group-deletion scope. Infrastructure layers retain the standard Foundry resource-group ownership checks.
+
+Embedded provisioning and Bicep eject are supported through `microsoft.foundry`; Terraform eject is rejected before changing files. The all-default supporting-resource path permits editable on-disk Bicep. Supplied-resource preflight requires the standard deployment graph so resource names and permission scopes match deployment; supported parameters, including `resourceTokenSalt`, remain configurable. When omitted resources need concrete default names, preflight evaluates the existing naming formula with azd-managed Bicep.
 
 BYO AKS reuses an existing target resource group without updating its location or tags. If the group does not exist and the parameters file explicitly sets `createResourceGroup=false`, provision and preview fail before deployment or ARM what-if rather than creating the group. Omit the parameter to select creation or reuse automatically.
 
-The provider supplies `kubeletObjectId` and `federatedIdentityRoleDefinitionId` when the template declares them. If a parameters file explicitly supplies either binding, its value must match the provider-resolved value, ignoring case. Empty or non-string values and conflicting bindings are rejected before deployment or ARM what-if. Omit these parameters to let the provider resolve them automatically; other parameters retain their normal user-supplied precedence.
+The provider supplies `kubeletObjectId`, `federatedIdentityRoleDefinitionId`, and verified `hostingPrincipalId` / `workloadPrincipalId` bindings for supplied identities when the template declares them. Explicit bindings must be nonempty strings matching the resolved values, ignoring case. A principal binding without its corresponding supplied identity is rejected. Omit these parameters to let the provider resolve them automatically; other parameters retain their normal user-supplied precedence.
 
 ### Infrastructure layers
 

@@ -1231,7 +1231,7 @@ func (p *FoundryProvisioningProvider) Deploy(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.prepareBYO(ctx, src); err != nil {
+	if err := p.prepareBYO(ctx, src, progress); err != nil {
 		return nil, err
 	}
 
@@ -1524,7 +1524,7 @@ func (p *FoundryProvisioningProvider) Preview(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.prepareBYO(ctx, src); err != nil {
+	if err := p.prepareBYO(ctx, src, progress); err != nil {
 		return nil, err
 	}
 
