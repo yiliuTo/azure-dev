@@ -7,18 +7,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"azure.ai.projects/internal/exterrors"
+	"azure.ai.projects/internal/onboarding"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
+	"github.com/azure/azure-dev/cli/azd/pkg/grpcbroker"
 	"github.com/google/uuid"
 )
 
-func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *templateSource) error {
+func (p *FoundryProvisioningProvider) prepareBYO(
+	ctx context.Context, source *templateSource, progress grpcbroker.ProgressFunc,
+) error {
 	configured := p.synthResult != nil && p.synthResult.Hosting != nil
 	value, err := byoHostingParameter(source)
 	if err != nil {
@@ -83,7 +87,7 @@ func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *te
 		{hosting.WorkloadIdentityResourceID, "Microsoft.ManagedIdentity/userAssignedIdentities"},
 	} {
 		if selection.id != "" {
-			if _, err := parseBYOResourceID(selection.id, selection.kind); err != nil {
+			if _, err := onboarding.ParseID(selection.id, selection.kind); err != nil {
 				return err
 			}
 		}
@@ -104,13 +108,13 @@ func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *te
 				return fmt.Errorf("effective %s must be a literal string, nonempty except resourceTokenSalt", name)
 			}
 		}
-		resourceGroup, ok := byoParameterValue(source, "resourceGroupName").(string)
-		if !ok || strings.TrimSpace(resourceGroup) == "" {
-			return fmt.Errorf("effective resourceGroupName must be a nonempty string")
-		}
-		if p.subID == "" || strings.ContainsAny(p.subID+resourceGroup, "/\\?#%@:\x00 \t\r\n") {
-			return fmt.Errorf("target subscription and resource group must identify a valid ARM scope")
-		}
+	}
+	resourceGroup, ok := byoParameterValue(source, "resourceGroupName").(string)
+	if !ok || strings.TrimSpace(resourceGroup) == "" {
+		return fmt.Errorf("effective resourceGroupName must be a nonempty string")
+	}
+	if hasSupplied && (p.subID == "" || strings.ContainsAny(p.subID+resourceGroup, "/\\?#%@:\x00 \t\r\n")) {
+		return fmt.Errorf("I03: target subscription and resource group must identify a valid ARM scope")
 	}
 	suppliedBindings := map[string]string{}
 	for name, parameter := range source.parameters {
@@ -148,28 +152,34 @@ func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *te
 	if err := p.ensureCredential(ctx); err != nil {
 		return err
 	}
-	kubeletObjectID, federationRoleID, err := p.resolveBYOHostBindings(
-		ctx, hosting.ClusterResourceID, hosting.WorkloadIdentityResourceID, includeAcr)
+	plan, err := p.byoResourcePlan(ctx, source, hasSupplied)
+	if err != nil {
+		return err
+	}
+	pipeline := onboarding.Pipeline{
+		Resources: onboarding.NewResourceChecker(p.credential, p.armClientOptions),
+		Access:    onboarding.NewAuthorizer(p.credential, p.armClientOptions),
+	}
+	facts, report, preflightErr := pipeline.Preflight(ctx, plan)
+	if err := writeBYOPreflight(report, preflightErr, progress); err != nil {
+		return err
+	}
+	bindRegistry := includeAcr || plan.Registry.ID != "" || plan.Registry.Missing != ""
+	kubeletObjectID, federationRoleID, err := p.resolveBYOHostBindings(ctx, plan, facts, bindRegistry)
 	if err != nil {
 		return err
 	}
 	resolvedBindings := map[string]string{
 		"federatedIdentityRoleDefinitionId": federationRoleID,
 	}
-	if includeAcr {
+	if bindRegistry {
 		resolvedBindings["kubeletObjectId"] = kubeletObjectID
 	}
-	for _, identity := range []struct{ id, binding string }{
-		{hosting.HostingManagementIdentityResourceID, "hostingPrincipalId"},
-		{hosting.WorkloadIdentityResourceID, "workloadPrincipalId"},
-	} {
-		if identity.id != "" {
-			principal, err := p.readBYOIdentityPrincipal(ctx, identity.id)
-			if err != nil {
-				return err
-			}
-			resolvedBindings[identity.binding] = principal
-		}
+	if hosting.HostingManagementIdentityResourceID != "" {
+		resolvedBindings["hostingPrincipalId"] = facts.HostingIdentity.PrincipalID
+	}
+	if hosting.WorkloadIdentityResourceID != "" {
+		resolvedBindings["workloadPrincipalId"] = facts.WorkloadIdentity.PrincipalID
 	}
 	for name, expected := range resolvedBindings {
 		if value, supplied := suppliedBindings[strings.ToLower(name)]; supplied && !strings.EqualFold(value, expected) {
@@ -178,14 +188,11 @@ func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *te
 				fmt.Sprintf("remove %s from the parameters file so microsoft.foundry can resolve it automatically", name))
 		}
 	}
-	hostBindings := map[string]any{}
-	if hasSupplied {
-		hostBindings["agentHosting"] = map[string]any{"value": hosting}
-	}
+	bindings := map[string]any{"agentHosting": map[string]any{"value": hosting}}
 	for name, value := range resolvedBindings {
-		hostBindings[name] = map[string]any{"value": value}
+		bindings[name] = map[string]any{"value": value}
 	}
-	hostBindings = parametersDeclaredByTemplate(hostBindings, source.armTemplate)
+	hostBindings := parametersDeclaredByTemplate(bindings, source.armTemplate)
 	for name := range source.parameters {
 		for binding := range hostBindings {
 			if strings.EqualFold(name, binding) {
@@ -197,6 +204,99 @@ func (p *FoundryProvisioningProvider) prepareBYO(ctx context.Context, source *te
 	return nil
 }
 
+func (p *FoundryProvisioningProvider) byoResourcePlan(
+	ctx context.Context, source *templateSource, hasSupplied bool,
+) (onboarding.Plan, error) {
+	if !hasSupplied {
+		return p.identifyBYOTemplatePlan(ctx, source)
+	}
+	selection := p.synthResult.Hosting
+	group := byoParameterValue(source, "resourceGroupName").(string)
+	_, groupExists, err := p.lookupResourceGroupState(ctx, group)
+	if err != nil {
+		return onboarding.Plan{}, err
+	}
+	defaults := byoSupportingNames{}
+	includeAcr, _ := byoParameterValue(source, "includeAcr").(bool)
+	if selection.StorageAccountResourceID == "" || selection.HostingManagementIdentityResourceID == "" ||
+		selection.WorkloadIdentityResourceID == "" || includeAcr {
+		defaults, err = p.resolveBYOSupportingNames(ctx, source, groupExists)
+		if err != nil {
+			return onboarding.Plan{}, err
+		}
+	}
+	registryID := ""
+	if includeAcr {
+		registryID = defaults.RegistryID
+	}
+	plan, err := onboarding.BuildPlan(onboarding.Input{
+		SubscriptionID: p.subID, ResourceGroup: group, GroupExists: groupExists,
+		ClusterID: selection.ClusterResourceID, StorageID: selection.StorageAccountResourceID,
+		HostingIdentityID:  selection.HostingManagementIdentityResourceID,
+		WorkloadIdentityID: selection.WorkloadIdentityResourceID,
+		DefaultStorageID:   defaults.StorageID, DefaultHostingID: defaults.HostingID, DefaultWorkloadID: defaults.WorkloadID,
+		DefaultRegistryID: registryID,
+	})
+	if err != nil {
+		return onboarding.Plan{}, err
+	}
+	selected, err := byoDeploymentSelection(source)
+	if err != nil {
+		return onboarding.Plan{}, err
+	}
+	plan, err = onboarding.WithDeploymentOperations(plan, selected)
+	if err != nil {
+		return onboarding.Plan{}, err
+	}
+	return plan, err
+}
+
+func byoDeploymentSelection(source *templateSource) (onboarding.DeploymentSelection, error) {
+	selection := onboarding.DeploymentSelection{}
+	var network onboarding.LegacyNetwork
+	for key, out := range map[string]*bool{
+		"enableNetworkIsolation": &network.Enabled, "createAgentSubnet": &network.CreateAgentSubnet,
+		"createPESubnet": &network.CreatePESubnet, "useManagedEgress": &network.ManagedEgress,
+	} {
+		if raw := byoParameterValue(source, key); raw != nil {
+			value, ok := raw.(bool)
+			if !ok {
+				return selection, fmt.Errorf("I03: effective %s must be a boolean", key)
+			}
+			*out = value
+		}
+	}
+	for key, out := range map[string]*string{
+		"vnetId": &network.VNetID, "agentSubnetName": &network.AgentSubnetName, "peSubnetName": &network.PESubnetName,
+		"peSubnetPrefix":       &network.PESubnetPrefix,
+		"managedIsolationMode": &network.IsolationMode, "dnsZonesResourceGroup": &network.DNSResourceGroup,
+		"dnsZonesSubscription": &network.DNSSubscription,
+	} {
+		if raw := byoParameterValue(source, key); raw != nil {
+			value, ok := raw.(string)
+			if !ok {
+				return selection, fmt.Errorf("I03: effective %s must be a string", key)
+			}
+			*out = value
+		}
+	}
+	if network.Enabled {
+		selection.Network = &network
+	}
+	return selection, nil
+}
+
+func writeBYOPreflight(report onboarding.Report, preflightErr error, progress grpcbroker.ProgressFunc) error {
+	var output strings.Builder
+	if err := report.Write(&output); err != nil {
+		return errors.Join(preflightErr, err)
+	}
+	if output.Len() > 0 {
+		progress(output.String())
+	}
+	return preflightErr
+}
+
 func byoARMOptions(options *arm.ClientOptions) *arm.ClientOptions {
 	var result arm.ClientOptions
 	if options != nil {
@@ -206,58 +306,38 @@ func byoARMOptions(options *arm.ClientOptions) *arm.ClientOptions {
 	return &result
 }
 
-func parseBYOResourceID(value, kind string) (*arm.ResourceID, error) {
-	if !strings.HasPrefix(strings.ToLower(value), "/subscriptions/") ||
-		strings.ContainsAny(value, "?#%\\@:\x00 \t\r\n") || strings.Contains(value, "//") {
-		return nil, fmt.Errorf("expected a complete %s resource ID without URL components", kind)
-	}
-	id, err := arm.ParseResourceID(value)
-	if err != nil {
-		return nil, fmt.Errorf("invalid %s resource ID: %w", kind, err)
-	}
-	if id.SubscriptionID == "" || id.ResourceGroupName == "" || id.Name == "" ||
-		!strings.EqualFold(id.ResourceType.String(), kind) || len(strings.Split(value, "/")) != 9 {
-		return nil, fmt.Errorf("expected a complete %s resource ID", kind)
-	}
-	return id, nil
-}
-
 func (p *FoundryProvisioningProvider) resolveBYOHostBindings(
-	ctx context.Context, clusterID, workloadID string, includeAcr bool,
+	ctx context.Context, plan onboarding.Plan, facts onboarding.Facts, includeAcr bool,
 ) (string, string, error) {
-	id, err := parseBYOResourceID(clusterID, "Microsoft.ContainerService/managedClusters")
-	if err != nil {
-		return "", "", err
-	}
 	options := byoARMOptions(p.armClientOptions)
 	var kubeletObjectID string
 	if includeAcr {
-		clusters, err := armcontainerservice.NewManagedClustersClient(id.SubscriptionID, p.credential, options)
-		if err != nil {
-			return "", "", fmt.Errorf("create AKS client: %w", err)
+		if plan.Cluster.Missing != "" {
+			return "", "", fmt.Errorf("cannot resolve deployment binding kubeletObjectId: actual clusterResourceId "+
+				"is unknown (%s); this binding is required by the registry pull assignment, not only preflight",
+				plan.Cluster.Missing)
 		}
-		cluster, err := clusters.Get(ctx, id.ResourceGroupName, id.Name, nil)
-		if err != nil {
-			return "", "", fmt.Errorf("read AKS kubelet identity: %w", err)
-		}
-		if cluster.Properties == nil || cluster.Properties.IdentityProfile["kubeletidentity"] == nil ||
-			cluster.Properties.IdentityProfile["kubeletidentity"].ObjectID == nil {
+		kubeletObjectID = facts.KubeletObjectID
+		if kubeletObjectID == "" {
 			return "", "", fmt.Errorf("BYO AKS requires a kubelet principal object ID for registry access")
 		}
-		kubeletObjectID = *cluster.Properties.IdentityProfile["kubeletidentity"].ObjectID
 		if _, err := uuid.Parse(kubeletObjectID); err != nil {
 			return "", "", fmt.Errorf("AKS kubelet principal object ID must be a GUID: %w", err)
 		}
 	}
 	const roleName = "Managed Identity Federated Identity Credential Contributor"
-	roleSubscription := p.subID
-	if workloadID != "" {
-		workload, err := parseBYOResourceID(workloadID, "Microsoft.ManagedIdentity/userAssignedIdentities")
-		if err != nil {
-			return "", "", err
-		}
-		roleSubscription = workload.SubscriptionID
+	workloadScope := plan.Workload.ID
+	if workloadScope == "" {
+		workloadScope = plan.Workload.Parent
 	}
+	workload, err := arm.ParseResourceID(workloadScope)
+	if err != nil || workload.SubscriptionID == "" {
+		return "", "", fmt.Errorf("cannot resolve deployment binding federatedIdentityRoleDefinitionId: actual "+
+			"workload identity subscription is unknown (%s); "+
+			"this binding is required by federationGrant, not only preflight",
+			plan.Workload.Missing)
+	}
+	roleSubscription := workload.SubscriptionID
 	roles, err := armauthorization.NewRoleDefinitionsClient(p.credential, options)
 	if err != nil {
 		return "", "", fmt.Errorf("create role definitions client: %w", err)

@@ -87,10 +87,13 @@ Extensions declare their capabilities in `extension.yaml`:
 | `metadata` | Provide metadata about commands and capabilities |
 
 The first-party `microsoft.foundry` provisioning provider supports existing AKS hosting
-with independently supplied Storage and hosting/workload identities. Omitted resources
-retain their normal ARM creation/update path and the registry remains azd-created. See
+with independently supplied Storage and hosting/workload identities. Read-only AKS,
+selected Agent-subnet, supporting-resource and authorization preflight gates deployment and
+ARM what-if for default and supplied-resource plans. Editable default templates use their actual
+compiled resource plan; unresolved dependencies warn and skip only the affected checks.
+Omitted resources retain their normal ARM creation/update path and the registry remains azd-created. See
 [Existing AKS hosting](../../cli/azd/extensions/azure.ai.projects/README.md#existing-aks-hosting)
-for deployment bindings, existing grant requirements, and resource-group teardown scope.
+for the preview opt-in, checks, current-state retry semantics, and resource-group teardown scope.
 
 ## Available gRPC Services
 
