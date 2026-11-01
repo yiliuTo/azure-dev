@@ -769,6 +769,13 @@ func foundryServiceEndpointAtRoot(
 		}
 		values = resolved
 	}
+	var node yaml.Node
+	if err := node.Encode(values); err != nil {
+		return "", err
+	}
+	if err := synthesis.ValidateAgentHostingInputs(node, svcName); err != nil {
+		return "", err
+	}
 	data, err := yaml.Marshal(values)
 	if err != nil {
 		return "", err
@@ -1212,7 +1219,7 @@ func (p *FoundryProvisioningProvider) Deploy(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.prepareBYO(ctx, src); err != nil {
+	if err := p.prepareBYO(ctx, src, progress); err != nil {
 		return nil, err
 	}
 
@@ -1506,7 +1513,7 @@ func (p *FoundryProvisioningProvider) Preview(
 	if err != nil {
 		return nil, err
 	}
-	if err := p.prepareBYO(ctx, src); err != nil {
+	if err := p.prepareBYO(ctx, src, progress); err != nil {
 		return nil, err
 	}
 
@@ -2415,24 +2422,24 @@ func resolveLayerResourceGroupOwnership(
 }
 
 func (p *FoundryProvisioningProvider) resourceGroupExists(ctx context.Context) (bool, error) {
-	_, found, err := p.lookupResourceGroupState(ctx)
+	_, found, err := p.lookupResourceGroupState(ctx, p.rgName)
 	return found, err
 }
 
 func (p *FoundryProvisioningProvider) lookupResourceGroupState(
-	ctx context.Context,
+	ctx context.Context, resourceGroup string,
 ) (map[string]*string, bool, error) {
 	if p.resourceGroupState != nil {
 		return p.resourceGroupState(ctx)
 	}
-	factory, err := armresources.NewClientFactory(p.subID, p.credential, nil)
+	factory, err := armresources.NewClientFactory(p.subID, p.credential, p.armClientOptions)
 	if err != nil {
 		return nil, false, exterrors.Internal(
 			exterrors.CodeAzdClientFailed,
 			fmt.Sprintf("create armresources client for resource-group existence check: %s", err),
 		)
 	}
-	resp, err := factory.NewResourceGroupsClient().Get(ctx, p.rgName, nil)
+	resp, err := factory.NewResourceGroupsClient().Get(ctx, resourceGroup, nil)
 	if err == nil {
 		return resp.Tags, true, nil
 	}
@@ -2448,7 +2455,7 @@ func (p *FoundryProvisioningProvider) persistCreatedResourceGroupOwnership(ctx c
 	if err := p.ensureCredential(recoveryCtx); err != nil {
 		return err
 	}
-	tags, found, err := p.lookupResourceGroupState(recoveryCtx)
+	tags, found, err := p.lookupResourceGroupState(recoveryCtx, p.rgName)
 	if err != nil {
 		return err
 	}
